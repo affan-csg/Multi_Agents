@@ -44,14 +44,36 @@ const columns = [
   }),
   columnHelper.accessor("ats_provider", {
     header: "ATS",
-    cell: (info) => <AtsBadge provider={info.getValue()} />,
+    cell: (info) => {
+      const row = info.row.original;
+      if (!info.getValue() && row.hiring_signal === "unknown") {
+        return (
+          <span className="cell-muted" title="Every ATS/careers-page detection method was exhausted for this company -- not confirmed as having no ATS.">
+            unknown
+          </span>
+        );
+      }
+      return <AtsBadge provider={info.getValue()} />;
+    },
   }),
   columnHelper.accessor((r) => metric(r, "req_count") ?? 0, {
     id: "req_count",
     header: "Open roles",
     cell: (info) => {
       const v = info.getValue();
-      return typeof v === "number" && v > 0 ? v : <span className="cell-muted">—</span>;
+      const row = info.row.original;
+      if (typeof v === "number" && v > 0) return v;
+      if (row.hiring_signal === "unknown") {
+        return (
+          <span
+            className="cell-muted"
+            title="Job discovery was exhausted for this company (no ATS, careers page, or search result found) -- this is NOT a confirmed zero, we simply don't know."
+          >
+            unknown
+          </span>
+        );
+      }
+      return <span className="cell-muted" title="Confirmed: a job board or careers page was read and had zero open reqs.">0</span>;
     },
   }),
   columnHelper.accessor("score", {

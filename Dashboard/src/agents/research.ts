@@ -123,6 +123,15 @@ export interface ScoredCompany {
   region: string | null;
   ats_provider: string | null;
   ats_token: string | null;
+  /** How this company's job signal was found -- see Research_Agent's
+   *  jobs_discovery.py: 'ats' | 'careers_page' | 'web_search' | 'unknown'. */
+  job_discovery_method?: "ats" | "careers_page" | "web_search" | "unknown" | null;
+  /** 'confirmed' | 'unknown' -- whether metrics.req_count == 0 means a
+   *  board/careers page was actually read and found empty, or every
+   *  discovery method was exhausted without reading anything at all.
+   *  'unknown' must never be displayed or treated the same as a confirmed
+   *  zero -- see Research_Agent's models.HiringSignal. */
+  hiring_signal?: "confirmed" | "unknown" | null;
 }
 
 export interface CompanyDetail {
@@ -229,7 +238,17 @@ export interface Analytics {
   providers: Array<{ provider: string; count: number }>;
   dimensions: Array<{ dimension: string; avg: number }>;
   score_distribution: Array<{ bucket: string; count: number }>;
-  scatter: Array<{ domain: string; reqs: number; score: number; tier: string; median_age: number | null }>;
+  scatter: Array<{
+    domain: string;
+    reqs: number;
+    score: number;
+    tier: string;
+    median_age: number | null;
+    /** 'confirmed' | 'unknown' -- see ScoredCompany.hiring_signal. A point
+     *  at reqs=0 with 'unknown' was never actually confirmed as having zero
+     *  openings; job discovery was simply exhausted for that company. */
+    hiring_signal?: "confirmed" | "unknown" | null;
+  }>;
 }
 
 export interface SuppressedCompany {

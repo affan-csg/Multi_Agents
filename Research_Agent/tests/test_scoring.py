@@ -166,6 +166,71 @@ def test_unknown_headcount_is_capped_not_inflated(cfg):
     assert any("unavailable" in str(r) for r in unknown.reasons)
 
 
+# --- hiring signal ---------------------------------------------------------
+# The bug these guard against: `_hiring_need` used to score `len(postings)`
+# directly, so a company whose job discovery was completely exhausted
+# (hiring_signal="unknown") scored identically to one with a confirmed-empty
+# ATS board (hiring_signal="confirmed") -- both landed as "0 open reqs",
+# a confirmed zero. See scoring.py's module docstring and models.HiringSignal.
+
+def test_unknown_hiring_signal_is_not_scored_as_confirmed_zero(cfg):
+    confirmed_empty = evaluate(cfg, company(hiring_signal="confirmed"), [], NOW)
+    unknown = evaluate(cfg, company(hiring_signal="unknown"), [], NOW)
+
+    # A confirmed empty board is real evidence -- "Hiring Need" scores it
+    # (and can legitimately score it at/near zero). An unknown signal must
+    # never end up WORSE than a confirmed zero -- ignorance cannot outscore
+    # OR underscore evidence; it is simply excluded.
+    assert unknown.dimensions["Hiring Need"] >= confirmed_empty.dimensions["Hiring Need"]
+
+    # The unknown case must mark strictly more of the 100-point budget
+    # unscorable than the confirmed-empty case (three extra Hiring Need
+    # components -- req count, practice-area relevance, reqs-per-100-emp --
+    # newly excluded instead of silently scored as a confirmed zero).
+    def _unscorable(result):
+        for r in result.reasons:
+            if r.dimension == "Data Completeness":
+                return float(r.detail.split(" of 100")[0])
+        return 0.0
+
+    assert _unscorable(unknown) > _unscorable(confirmed_empty)
+    # Hiring Need is entirely skipped for the unknown case (all three of its
+    # components require a real req count) -- it contributes no reasons of
+    # its own, but disappears entirely from the completeness math rather
+    # than scoring 0 confirmed points.
+    assert not any(r.dimension == "Hiring Need" for r in unknown.reasons)
+
+
+def test_unknown_hiring_signal_does_not_beat_real_hiring_activity(cfg):
+    reqs = [req("Data Engineer", age_days=10, i=n) for n in range(6)]
+    active = evaluate(cfg, company(hiring_signal="confirmed"), reqs, NOW)
+    unknown = evaluate(cfg, company(hiring_signal="unknown"), [], NOW)
+
+    # Ignorance must never inflate a score above a company we have real,
+    # positive hiring evidence for.
+    assert unknown.dimensions["Hiring Need"] < active.dimensions["Hiring Need"]
+
+
+def test_confirmed_zero_reqs_still_scores_as_real_signal(cfg):
+    # Explicitly guards the other direction: fixing "unknown" must not
+    # accidentally make a genuinely empty, confirmed board stop scoring --
+    # Hiring Need must still be an evaluated (not skipped) dimension, even
+    # though every component nets 0 points for a real, empty board.
+    res = evaluate(cfg, company(hiring_signal="confirmed"), [], NOW)
+    assert res.dimensions["Hiring Need"] == 0.0
+    assert res.metrics["data_completeness"]["Hiring Need"] > 0.0
+
+
+def test_hiring_signal_none_or_missing_treated_like_confirmed(cfg):
+    # A company scored before this field existed, or one where the caller
+    # simply never set it, must not be treated as "unknown" by default --
+    # only an explicit "unknown" should skip the dimension. This keeps old
+    # score rows and any caller that forgets to set the field scoring
+    # exactly as they did before this fix.
+    res = evaluate(cfg, company(hiring_signal=None), [], NOW)
+    assert res.metrics["data_completeness"]["Hiring Need"] > 0.0
+
+
 def test_every_point_is_explained(cfg):
     reqs = [req("Data Engineer", age_days=70, i=n) for n in range(10)]
     res = evaluate(cfg, company(), reqs, NOW)

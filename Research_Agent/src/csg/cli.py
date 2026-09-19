@@ -213,6 +213,20 @@ def _print_auto_qualify_result(stats: discover_mod.DiscoveryStats) -> None:
                       f"(campaign {stats.outreach.get('campaign_id') or '-'})")
 
 
+def _reqs_cell(r: dict) -> str:
+    """Render a score row's open-req count for a CLI table, distinguishing a
+    confirmed-empty board (plain "0") from a company whose job signal is
+    unknown (job discovery exhausted -- "0?", never a bare "0" that reads as
+    confirmed). See models.py's HiringSignal / scoring.py's module docstring
+    -- this is the CLI's equivalent of the Dashboard's hiring-signal badge."""
+    n = r.get("metrics", {}).get("req_count", "")
+    if n in ("", None):
+        return ""
+    if n == 0 and r.get("hiring_signal") == "unknown":
+        return "0?"
+    return str(n)
+
+
 def _top_prospects(conn, run_id: str, region: str, limit: int = 100) -> list[dict]:
     """Ranked prospect table -- the run's actual deliverable, printed for the
     operator. discover_mod.run_discovery does its own, identical ranking
@@ -236,7 +250,6 @@ def _top_prospects(conn, run_id: str, region: str, limit: int = 100) -> list[dic
 
     colors = {"A": "bold green", "B": "cyan", "C": "yellow", "D": "dim"}
     for idx, r in enumerate(ranked, 1):
-        m = r.get("metrics", {})
         t.add_row(
             str(idx),
             f"[{colors.get(r['tier'], 'dim')}]{r['tier']}[/]",
@@ -245,12 +258,14 @@ def _top_prospects(conn, run_id: str, region: str, limit: int = 100) -> list[dic
             (r.get("name") or "")[:28],
             str(provenance_value(r.get("employee_count")) or "-"),
             str(provenance_value(r.get("revenue")) or "-"),
-            str(m.get("req_count", "")),
+            _reqs_cell(r),
         )
     console.print(t)
     console.print(f"\n[bold green]Discovery complete.[/bold green]  "
                   f"Contacts: [bold]csg contacts --run {run_id}[/bold]   "
-                  f"Inspect: [bold]csg show <domain>[/bold]\n")
+                  f"Inspect: [bold]csg show <domain>[/bold]\n"
+                  f"[dim]Reqs \"0?\" = job signal unknown (no board/careers page found), "
+                  f"not a confirmed zero.[/dim]\n")
     return ranked
 
 
@@ -291,7 +306,7 @@ def report(
             f"[{colors[r['tier']]}]{r['tier']}[/]",
             f"{r['score']:.0f}",
             r["domain"],
-            str(m.get("req_count", "")),
+            _reqs_cell(r),
             str(m.get("relevant_reqs", "")),
             f"{med:.0f}d" if isinstance(med, (int, float)) else "-",
             ", ".join(m.get("top_practice_areas") or [])[:34],
@@ -299,7 +314,8 @@ def report(
                      ("Hiring Need", "Fill Pain", "Firmographic Fit", "Buying Signals")),
         )
     console.print(t)
-    console.print(f"[dim]{len(rows)} shown. HN/FP/FF/BS = the four dimension scores.[/dim]")
+    console.print(f"[dim]{len(rows)} shown. HN/FP/FF/BS = the four dimension scores. "
+                  f"Reqs \"0?\" = job signal unknown, not a confirmed zero.[/dim]")
     conn.close()
 
 

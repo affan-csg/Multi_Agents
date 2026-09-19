@@ -35,6 +35,7 @@ SCORE_ROW = {
     "funding": {"value": "$40M Series B", "source": "gemini", "method": "reported",
                 "confidence": "high"},
     "ats_provider": "greenhouse", "ats_token": "acme",
+    "hiring_signal": "confirmed", "job_discovery_method": "ats",
 }
 
 
@@ -152,3 +153,37 @@ def test_jsonl_outreach_ready_true_with_email_only_contact(stub, tmp_path, monke
     assert p["outreach_ready"] is True
     assert p["has_linkedin_contact"] is False
     assert len(p["contacts"]) == 1
+
+
+# --- hiring signal ---------------------------------------------------------
+# Regression cover for exactly the bug class this file's docstring calls
+# out: hiring_signal/job_discovery_method were added to Company/scoring but
+# never made it into the Outreach handoff contract (Prospect), so a
+# zero-open-reqs prospect with an unknown job signal was indistinguishable
+# from one confirmed to have no openings once it reached Outreach.
+
+def test_csv_carries_hiring_signal(stub, tmp_path):
+    row = _csv_row(export.to_csv(stub, "t1", path=tmp_path / "p.csv"))
+    assert row["hiring_signal"] == "confirmed"
+    assert row["job_discovery_method"] == "ats"
+
+
+def test_jsonl_carries_hiring_signal(stub, tmp_path):
+    path = export.to_jsonl(stub, "t1", path=tmp_path / "p.jsonl")
+    p = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert p["hiring_signal"] == "confirmed"
+    assert p["job_discovery_method"] == "ats"
+
+
+def test_jsonl_carries_unknown_hiring_signal_distinctly(stub, tmp_path, monkeypatch):
+    """The exact Inmar-style case: zero postings AND hiring_signal=unknown
+    must round-trip as 'unknown', never silently become 'confirmed' or be
+    dropped."""
+    unknown_row = dict(SCORE_ROW, hiring_signal="unknown", job_discovery_method="unknown")
+    monkeypatch.setattr(db, "get_scores", lambda c, r: [unknown_row])
+    monkeypatch.setattr(db, "get_postings", lambda c, d: [])
+    path = export.to_jsonl(stub, "t1", path=tmp_path / "p.jsonl")
+    p = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert p["hiring_signal"] == "unknown"
+    assert p["job_discovery_method"] == "unknown"
+    assert p["open_reqs"] == []

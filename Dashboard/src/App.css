@@ -1062,6 +1062,14 @@ textarea:focus {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+input:disabled,
+select:disabled,
+textarea:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: var(--surface-sunken);
+}
+
 .filter-fieldset {
   border: none;
   padding: 0;
@@ -3171,7 +3179,7 @@ button.ghost:hover:not(:disabled) {
   transition: border-color 0.15s var(--ease), background 0.15s var(--ease);
 }
 
-.region-card:hover {
+.region-card:hover:not(:disabled) {
   border-color: var(--border-strong);
 }
 

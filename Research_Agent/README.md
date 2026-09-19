@@ -249,12 +249,20 @@ drifts out of sync with what the agent actually searches for.
 pytest
 ```
 
-220 tests, no network and no LLM calls (HTTP boundaries are mocked with
+231 tests, no network and no LLM calls (HTTP boundaries are mocked with
 `httpx.MockTransport` or a fake fetcher/DB, not real calls) — the
 deterministic core and every provider integration is fully covered:
 
 - [test_scoring.py](tests/test_scoring.py) — scoring, tiering, financial
-  strength, and the missing-data policy.
+  strength, and the missing-data policy, including that a company whose job
+  discovery was fully exhausted (`hiring_signal="unknown"`) is never scored
+  as a confirmed-empty ATS board (`hiring_signal="confirmed"`) on the Hiring
+  Need dimension — see [src/csg/scoring.py](src/csg/scoring.py)'s module
+  docstring and [src/csg/models.py](src/csg/models.py)'s `HiringSignal`.
+- [test_qualify.py](tests/test_qualify.py) — the `csg qualify` LLM prompt
+  context, including that `hiring_signal` is always included (defaulting to
+  `"unknown"` if absent) so the qualification LLM never asserts a company
+  isn't hiring based on a data gap rather than a confirmed empty board.
 - [test_delivery.py](tests/test_delivery.py) — US/LATAM/Pakistan delivery-fit
   classification.
 - [test_regions.py](tests/test_regions.py) — region resolution and
@@ -264,7 +272,9 @@ deterministic core and every provider integration is fully covered:
   structural audit that fails the moment a new model field is left out of
   the persistence or export path.
 - [test_export.py](tests/test_export.py) — the CSV and JSONL handoff
-  contracts, including the `outreach_ready`/`has_linkedin_contact` flags.
+  contracts, including the `outreach_ready`/`has_linkedin_contact` flags and
+  that `hiring_signal`/`job_discovery_method` survive into both the CSV and
+  the `Prospect` JSONL handed to the Outreach Agent.
 - [test_contacts.py](tests/test_contacts.py) — Hunter.io response parsing;
   locks in that every saved contact has a verified email.
 - [test_gemini_keys.py](tests/test_gemini_keys.py) — multi-key failover:
@@ -358,6 +368,15 @@ run against the live project.
   [src/csg/ats/\_\_init\_\_.py](src/csg/ats/__init__.py)'s module docstring
   for the full picture, including which providers are deliberately excluded
   from token-probing because their API can't reliably say "not found."
+  A company that falls into one of these gaps (or has a fully JS-rendered
+  site with no static signal at all) is never scored, exported, qualified,
+  or displayed as "confirmed zero openings" — every layer (scoring,
+  CSV/JSONL export, `csg qualify`'s LLM context, the CLI, the Dashboard, and
+  the Outreach hand-off) carries `hiring_signal` (`"confirmed"` |
+  `"unknown"`) end-to-end specifically so this distinction survives instead
+  of collapsing into an ambiguous zero. See
+  [src/csg/jobs_discovery.py](src/csg/jobs_discovery.py)'s module docstring
+  for the full ATS → careers-page → web-search → UNKNOWN fallback chain.
 - **No automated end-to-end test.** A full run makes real HTTP calls to live
   career-site ATS boards and, for `qualify`/discovery/enrichment, real LLM
   API calls — see [WORKFLOW.md](WORKFLOW.md) before wiring one up. Playwright

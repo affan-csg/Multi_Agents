@@ -195,6 +195,15 @@ class Prospect(BaseModel):
     explanation: list[str]
     metrics: dict[str, Any]
     open_reqs: list[dict[str, Any]] = Field(default_factory=list)
+    # Whether `open_reqs` being empty means "confirmed no current openings"
+    # or "every discovery method was exhausted without reading anything" --
+    # see HiringSignal's docstring. Carried through to Outreach so a prospect
+    # with zero reqs is never silently read there as "not hiring" when the
+    # truth is "we don't know" (e.g. by qualify.py or personalize.py wording
+    # an email around it, or a human skipping a company that just has an
+    # undetectable careers site).
+    hiring_signal: Optional[HiringSignal] = None
+    job_discovery_method: Optional[JobDiscoveryMethod] = None
     researched_at: datetime
 
     # --- firmographics (v2) -------------------------------------------------

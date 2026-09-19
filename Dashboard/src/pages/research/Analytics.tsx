@@ -253,11 +253,13 @@ export function Analytics({ runId, runs }: Props) {
                 content={({ active, payload }) => {
                   if (!active || !payload?.length) return null;
                   const p = payload[0].payload as AnalyticsData["scatter"][number];
+                  const reqsLabel =
+                    p.reqs === 0 && p.hiring_signal === "unknown" ? "open roles unknown" : `${p.reqs} open roles`;
                   return (
                     <div style={{ ...tooltipStyle, padding: "9px 12px" }}>
                       <div style={{ fontWeight: 650, marginBottom: 3 }}>{p.domain}</div>
                       <div style={{ color: "#636b7e" }}>
-                        Score {p.score.toFixed(0)} · Tier {p.tier} · {p.reqs} open roles
+                        Score {p.score.toFixed(0)} · Tier {p.tier} · {reqsLabel}
                       </div>
                     </div>
                   );

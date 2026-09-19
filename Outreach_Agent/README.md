@@ -219,16 +219,18 @@ code changes needed to adjust it:
 pytest
 ```
 
-56 tests, no network (a fake in-memory PostgREST fixture in
+62 tests, no network (a fake in-memory PostgREST fixture in
 [tests/conftest.py](tests/conftest.py) stands in for Supabase):
 
 - [test_ingest.py](tests/test_ingest.py) — importing prospects from
   Research's API response shape; that a tier-matching company with no
   contact is excluded from both import and campaign selection outright
-  (never padded into a `limit` slot, never given a `needs_review` item); and
-  the one remaining `pending` vs. `needs_review` gate at campaign creation
+  (never padded into a `limit` slot, never given a `needs_review` item); the
+  one remaining `pending` vs. `needs_review` gate at campaign creation
   (draft genuinely personalized), which only ever holds an already-contactable
-  prospect for review, never excludes it.
+  prospect for review, never excludes it; and that `hiring_signal` survives
+  the Research → Outreach handoff onto `ImportedProspect` (`"confirmed"` |
+  `"unknown"`, see the Research Agent's `models.HiringSignal`).
 - [test_personalize.py](tests/test_personalize.py) — the full tiered
   personalization strategy: `pain_summary`/`recommended_angle` (qualify
   output) → other cached research data (industry/description/open
@@ -236,8 +238,11 @@ pytest
   web-search-augmented LLM call across three independent backends
   (Gemini+`google_search` → Groq+Tavily → Anthropic+`web_search`) → static
   template — including that each tier is skipped once an earlier one
-  already succeeds, and that `use_web_search` defaults to `False` so
-  campaign creation never triggers a live search on its own.
+  already succeeds, that `use_web_search` defaults to `False` so campaign
+  creation never triggers a live search on its own, and that the
+  `{{open_reqs}}` prompt placeholder never reads an empty req list as
+  "confirmed not hiring" when `hiring_signal == "unknown"` (see
+  `personalize._render_open_reqs`).
 - [test_groq_tavily_fallback.py](tests/test_groq_tavily_fallback.py) — the
   HTTP-level mechanics of the Groq+Tavily backend in isolation: Tavily
   search results feeding Groq's draft, and clean fallback (`None` or the

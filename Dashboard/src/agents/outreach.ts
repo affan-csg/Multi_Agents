@@ -43,6 +43,13 @@ export interface ImportedProspect {
   pain_summary: string | null;
   recommended_angle: string | null;
   open_reqs: Array<Record<string, unknown>>;
+  /** 'confirmed' | 'unknown' | null -- whether `open_reqs` being empty means
+   *  Research actually read this company's job board/careers page and found
+   *  nothing (confirmed), or every discovery method failed and the real
+   *  count is simply unknown (see Research_Agent's models.HiringSignal).
+   *  Never read an empty `open_reqs` as "not hiring" when this is
+   *  'unknown'. */
+  hiring_signal: "confirmed" | "unknown" | null;
   contact_email: string | null;
   contact_name: string | null;
   contact_position: string | null;

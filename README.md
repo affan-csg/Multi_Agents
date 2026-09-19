@@ -75,7 +75,13 @@ project — see each one's own README:
    (A/B/C/D). `csg qualify` is a separate, optional LLM pass that adds a
    `pain_summary`/`recommended_angle` on top of a tier — it can lag behind or
    fail independently of scoring, which is why Outreach never treats it as
-   the only usable signal (see next point).
+   the only usable signal (see next point). Zero open reqs is scored,
+   exported, and displayed as a real "no current hiring need" signal only
+   when a job board/careers page was actually read and found empty
+   (`hiring_signal="confirmed"`) — a company whose ATS/careers page couldn't
+   be found at all (e.g. a fully JS-rendered site) is tracked as
+   `hiring_signal="unknown"` instead, and is never scored, qualified, or
+   displayed as a confirmed zero.
 3. **Hand off** (automatic or manual) — Tier A/B companies with a contact are
    imported into Outreach, either by hand or automatically right after
    Research finishes qualifying + finding contacts for a run.
@@ -99,8 +105,8 @@ fixture stands in for Supabase — see each project's `tests/conftest.py`),
 so no live database or API keys are needed to run them:
 
 ```
-cd Research_Agent && pytest    # 220 passed
-cd Outreach_Agent  && pytest   # 56 passed
+cd Research_Agent && pytest    # 231 passed
+cd Outreach_Agent  && pytest   # 62 passed
 ```
 
 The Dashboard has no test suite; its guard rail is the TypeScript compiler:

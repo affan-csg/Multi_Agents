@@ -41,6 +41,14 @@ class ImportedProspect(BaseModel):
     pain_summary: Optional[str] = None
     recommended_angle: Optional[str] = None
     open_reqs: list[dict[str, Any]] = Field(default_factory=list)
+    # 'confirmed' | 'unknown' | None -- whether `open_reqs` being empty means
+    # Research actually read a job board/careers page and found nothing, or
+    # every discovery method failed and the true count is simply unknown
+    # (see Research_Agent's models.HiringSignal). None only for prospects
+    # predating this field or the synthetic test fixtures. Personalization
+    # must never word an email (or a human reviewing it) around "they have no
+    # open roles" when this is "unknown" -- see personalize.py.
+    hiring_signal: Optional[Literal["confirmed", "unknown"]] = None
 
     # Best contact only -- one person per company, chosen by
     # ingest._best_contact (verification status, then seniority, then

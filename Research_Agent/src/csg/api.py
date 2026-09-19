@@ -886,6 +886,13 @@ def _aggregate_analytics(rows: list[dict[str, Any]], run_id: str) -> dict[str, A
                 "score": r["score"],
                 "tier": r["tier"],
                 "median_age": metrics.get("median_age_days"),
+                # A reqs==0 point plotted here is ambiguous on its own -- a
+                # confirmed empty board and an exhausted/undetectable job
+                # signal both land at x=0. hiring_signal lets the chart (or
+                # anyone reading this payload) tell them apart rather than
+                # reading every x=0 dot as "confirmed no openings". See
+                # models.HiringSignal / scoring.py's module docstring.
+                "hiring_signal": r.get("hiring_signal"),
             })
 
     top_industries = sorted(

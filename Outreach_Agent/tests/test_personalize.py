@@ -14,7 +14,7 @@ import pytest
 
 from outreach.config import load_config
 from outreach.models import ImportedProspect
-from outreach.personalize import DraftedMessage, draft_message
+from outreach.personalize import DraftedMessage, _render_open_reqs, draft_message
 
 
 @pytest.fixture(autouse=True)
@@ -262,3 +262,44 @@ def test_redraft_prefers_cached_research_over_web_search(monkeypatch):
     draft = draft_message(cfg, prospect, use_web_search=True)
     assert draft.personalized_from == "research_data"
     assert search_calls == []
+
+
+# --- hiring-signal wording (open_reqs placeholder) --------------------------
+# Regression cover: an empty open_reqs list must never be rendered into a
+# prompt as flatly "(no open roles listed)" when hiring_signal is "unknown"
+# -- that phrasing reads as "confirmed not hiring" to an LLM, which is not
+# what "we never found their careers site/ATS" means. See
+# Research_Agent's models.HiringSignal / scoring.py's module docstring for
+# the same distinction enforced upstream.
+
+def test_render_open_reqs_confirmed_empty_says_no_roles_listed():
+    prospect = ImportedProspect(
+        research_domain="acme.com", name="Acme", hiring_signal="confirmed", open_reqs=[],
+    )
+    assert _render_open_reqs(prospect, 3) == "- (no open roles listed)"
+
+
+def test_render_open_reqs_unknown_signal_does_not_claim_no_roles():
+    prospect = ImportedProspect(
+        research_domain="acme.com", name="Acme", hiring_signal="unknown", open_reqs=[],
+    )
+    rendered = _render_open_reqs(prospect, 3)
+    assert "no open roles listed" not in rendered
+    assert "not assume" in rendered or "unavailable" in rendered
+
+
+def test_render_open_reqs_missing_signal_defaults_to_confirmed_wording():
+    """No hiring_signal at all (e.g. the synthetic test-campaign fixtures, or
+    a prospect imported before this field existed) must not be treated as
+    'unknown' by default -- only an explicit 'unknown' changes the wording."""
+    prospect = ImportedProspect(research_domain="acme.com", name="Acme", open_reqs=[])
+    assert _render_open_reqs(prospect, 3) == "- (no open roles listed)"
+
+
+def test_render_open_reqs_lists_real_reqs_regardless_of_signal():
+    prospect = ImportedProspect(
+        research_domain="acme.com", name="Acme", hiring_signal="unknown",
+        open_reqs=[{"title": "Backend Engineer", "location": "Remote"}],
+    )
+    rendered = _render_open_reqs(prospect, 3)
+    assert rendered == "- Backend Engineer (Remote)"

@@ -163,6 +163,7 @@ export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: P
               value={label}
               onChange={(e) => setLabel(e.target.value)}
               placeholder="e.g. Georgia Q4"
+              disabled={running}
             />
             <p className="hint" style={{ marginTop: 8 }}>
               Optional — lets you find this run later in Companies, Saved lists, Contacts, and Analytics.
@@ -178,6 +179,7 @@ export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: P
                   type="button"
                   className={`region-card${r.key === activeRegion ? " region-card--active" : ""}`}
                   onClick={() => setRegion(r.key)}
+                  disabled={running}
                 >
                   <span className="region-card-radio" aria-hidden="true" />
                   <span className="region-card-label">{r.label}</span>
@@ -205,6 +207,7 @@ export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: P
                 type="number"
                 min={1}
                 placeholder="100"
+                disabled={running}
               />
             </div>
             <div className="field-group">
@@ -216,6 +219,7 @@ export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: P
                 type="number"
                 min={0}
                 placeholder="25"
+                disabled={running}
               />
               <p className="hint" style={{ marginTop: 8 }}>
                 Every Tier A/B company is automatically qualified with AI and looked up on

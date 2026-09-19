@@ -35,6 +35,8 @@ Do not invent information that is not present. Do not add funding news, company 
 
 If the available data is insufficient to identify a meaningful hiring pain, say so clearly rather than filling the summary with generic staffing assumptions.
 
+The input includes a `hiring_signal` field: `"confirmed"` means a job board or careers page was actually checked and the requisition count/list reflects reality, including if that count is zero. `"unknown"` means every discovery method failed to find the company's job board or careers page at all — an empty `open_reqs_sample` in that case tells you nothing about whether they are hiring, only that we could not check. **Never state or imply that a company is "not hiring," "has no open roles," or "shows no current hiring activity" when `hiring_signal` is `"unknown"`** — describe the gap honestly instead (e.g. "no job-posting data was available for this company") rather than treating absence of data as evidence of no hiring need.
+
 ### 2. recommended_angle
 
 Write **1–3 sentences** identifying the single most evidence-based outreach angle for CSG.

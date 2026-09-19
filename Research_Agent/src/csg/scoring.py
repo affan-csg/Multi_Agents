@@ -10,6 +10,16 @@ rather than scored zero. The dimension is then rescaled over the components that
 were available -- but the rescale is capped (MAX_RESCALE) so a company we know
 little about cannot reach the same ceiling as one we know well. Unknown data
 lowers the achievable score; it never inflates it.
+
+This applies to hiring/open-req data as its own case, not just missing
+firmographics: `company.hiring_signal` ("confirmed" | "unknown", see
+models.py and jobs_discovery.py) records whether zero postings means a
+board/careers page was actually read and found empty (confirmed -- a real
+"no current hiring need" signal, scored as such), or every discovery method
+was exhausted without reading anything at all (unknown -- the true count
+could be zero or nonzero; see `_hiring_need`). Scoring must never treat
+"unknown" as "confirmed zero": doing so would rank a company we never
+actually got a look at below one we know for a fact has no open reqs.
 """
 
 from __future__ import annotations
@@ -175,17 +185,38 @@ def _hiring_need(cfg: Config, company: Company, postings: list[JobPosting],
     d = _Dimension("Hiring Need", cfg.weights["hiring_need"])
 
     n = len(postings)
-    pts = _band(s["req_count_bands"], n)
-    d.add(pts, 24, f"{n} open reqs")
+
+    # Zero postings means two very different things and this dimension must
+    # never conflate them: a confirmed empty ATS/careers-page board (a real
+    # "no current hiring need" signal, scored as such) vs. every discovery
+    # method being exhausted without reading anything at all
+    # (hiring_signal == "unknown" -- see models.py's HiringSignal / this
+    # module's docstring). Scoring the latter as a confirmed zero would rank
+    # a company we simply never got a look at below one we genuinely know has
+    # no open reqs, which is exactly the bug this guards against. Any nonzero
+    # postings count is real evidence either way, so only the n == 0 +
+    # unknown combination is special-cased.
+    job_signal_unknown = n == 0 and company.hiring_signal == "unknown"
+
+    if job_signal_unknown:
+        d.skip("open req count (job discovery exhausted -- signal unknown, not confirmed zero)")
+    else:
+        pts = _band(s["req_count_bands"], n)
+        d.add(pts, 24, f"{n} open reqs")
 
     share = m["relevant_share"]
     max_share = float(s["relevant_share_max"])
-    d.add(share * max_share, max_share,
-          f"{m['relevant_reqs']}/{n} reqs ({share:.0%}) in enabled practice areas "
-          f"[{', '.join(m['top_practice_areas']) or 'none'}]")
+    if job_signal_unknown:
+        d.skip("practice-area relevance (no reqs read -- signal unknown)")
+    else:
+        d.add(share * max_share, max_share,
+              f"{m['relevant_reqs']}/{n} reqs ({share:.0%}) in enabled practice areas "
+              f"[{', '.join(m['top_practice_areas']) or 'none'}]")
 
     emp = company.employees
-    if emp:
+    if job_signal_unknown:
+        d.skip("reqs-per-100-employees (no reqs read -- signal unknown)")
+    elif emp:
         per100 = n / emp * 100
         m["reqs_per_100_emp"] = round(per100, 2)
         d.add(_band(s["reqs_per_100_emp_bands"], per100), 6,

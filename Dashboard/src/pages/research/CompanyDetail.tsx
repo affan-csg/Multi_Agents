@@ -65,7 +65,17 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
               </span>
             )}
             {company.industry && <span className="meta-chip">{company.industry}</span>}
-            <AtsBadge provider={company.ats_provider} />
+            {!company.ats_provider && company.hiring_signal === "unknown" ? (
+              <span
+                className="meta-chip"
+                title="Every ATS/careers-page detection method was exhausted for this company (e.g. a fully JS-rendered site) -- not confirmed as having no ATS or no jobs."
+              >
+                <Icon name="chart" size={14} />
+                ATS unknown
+              </span>
+            ) : (
+              <AtsBadge provider={company.ats_provider} />
+            )}
             {detail.outreach_ready && (
               <span className="meta-chip" title="Has a verified contact email — ready for Outreach">
                 <Icon name="send" size={14} />
@@ -291,7 +301,14 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
         </div>
 
         {postings.length === 0 ? (
-          <EmptyState icon="briefcase" message="No open requisitions found." />
+          company.hiring_signal === "unknown" ? (
+            <EmptyState
+              icon="briefcase"
+              message="Job data unavailable — every ATS/careers-page/search method was exhausted for this company. This is NOT a confirmed zero; their actual hiring status is unknown."
+            />
+          ) : (
+            <EmptyState icon="briefcase" message="No open requisitions found (confirmed — a job board or careers page was checked)." />
+          )
         ) : (
           <div className="table-scroll">
             <table className="mini-table">

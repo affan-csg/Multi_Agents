@@ -52,6 +52,15 @@ class _Qualification(BaseModel):
 
 
 def _build_context(row: dict[str, Any], postings: list[dict[str, Any]]) -> dict[str, Any]:
+    # hiring_signal is included explicitly (not just left inside `metrics`,
+    # which doesn't even carry it) so the prompt can tell the LLM the
+    # difference between "confirmed: this company has no open reqs right
+    # now" and "unknown: every discovery method was exhausted, we simply
+    # never found their careers site/ATS" -- see models.py's HiringSignal
+    # and scoring.py's module docstring. Without this, an empty
+    # open_reqs_sample reads identically either way and the model can easily
+    # write a pain_summary/recommended_angle that confidently asserts "not
+    # currently hiring", which is only true in the confirmed case.
     return {
         "domain": row["domain"],
         "name": row.get("name"),
@@ -63,6 +72,7 @@ def _build_context(row: dict[str, Any], postings: list[dict[str, Any]]) -> dict[
         "explanation": row["explanation"],
         "metrics": {k: v for k, v in row["metrics"].items() if k != "top_titles"},
         "open_reqs_sample": postings,
+        "hiring_signal": row.get("hiring_signal") or "unknown",
     }
 
 

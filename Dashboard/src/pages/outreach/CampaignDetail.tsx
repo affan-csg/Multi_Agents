@@ -781,7 +781,7 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
                 </>
               )}
 
-              {prospect?.open_reqs && prospect.open_reqs.length > 0 && (
+              {prospect?.open_reqs && prospect.open_reqs.length > 0 ? (
                 <>
                   <h3 className="drawer-section-title">Open roles cited</h3>
                   <ul className="drawer-list">
@@ -790,7 +790,14 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
                     ))}
                   </ul>
                 </>
-              )}
+              ) : prospect?.hiring_signal === "unknown" ? (
+                <>
+                  <h3 className="drawer-section-title">Open roles cited</h3>
+                  <p className="hint" title="Research could not find this company's job board or careers page -- this is not evidence they aren't hiring.">
+                    Job posting data unavailable for this company (not confirmed as zero openings).
+                  </p>
+                </>
+              ) : null}
 
               <div className="drawer-section-head">
                 <h3 className="drawer-section-title">

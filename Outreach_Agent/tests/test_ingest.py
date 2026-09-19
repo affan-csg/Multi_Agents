@@ -225,3 +225,31 @@ def test_to_imported_prospect_uses_best_contact_not_first():
     prospect = ingest._to_imported_prospect(detail, "run1")
     assert prospect.contact_email == "exec@acme.com"
     assert prospect.contact_name == "Exec Person"
+
+
+def test_to_imported_prospect_carries_hiring_signal():
+    """Regression: hiring_signal must survive the Research -> Outreach
+    handoff so an empty open_reqs list is never silently read here as
+    'confirmed no openings' -- see Research_Agent's models.HiringSignal and
+    personalize.py's _render_open_reqs."""
+    detail = {
+        "company": {"domain": "acme.com", "name": "Acme", "hiring_signal": "unknown"},
+        "score": {"tier": "B", "score": 40},
+        "qualification": {},
+        "postings": [],
+        "contacts": [{"email": "jane@acme.com"}],
+    }
+    prospect = ingest._to_imported_prospect(detail, "run1")
+    assert prospect.hiring_signal == "unknown"
+
+
+def test_to_imported_prospect_confirmed_hiring_signal():
+    detail = {
+        "company": {"domain": "acme.com", "name": "Acme", "hiring_signal": "confirmed"},
+        "score": {"tier": "B", "score": 40},
+        "qualification": {},
+        "postings": [],
+        "contacts": [{"email": "jane@acme.com"}],
+    }
+    prospect = ingest._to_imported_prospect(detail, "run1")
+    assert prospect.hiring_signal == "confirmed"

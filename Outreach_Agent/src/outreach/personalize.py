@@ -77,12 +77,26 @@ class DraftedMessage:
 
 
 def _render_open_reqs(prospect: ImportedProspect, max_reqs: int) -> str:
+    """Render the open-req list for an LLM prompt. When there are none, the
+    placeholder text must not read as "confirmed not hiring" unless it
+    actually is -- `hiring_signal == "unknown"` means Research never
+    successfully read this company's job board/careers page at all, so an
+    empty list here is an absence of data, not evidence of no hiring need
+    (see Research_Agent's models.HiringSignal). Every prompt that includes
+    this (outreach_email.md, outreach_email_from_research.md,
+    outreach_email_web_search.md) instructs the model accordingly -- this
+    placeholder is what makes that distinction visible to it in the first
+    place."""
     lines = []
     for req in (prospect.open_reqs or [])[:max_reqs]:
         title = req.get("title") or "Open role"
         location = req.get("location")
         lines.append(f"- {title}" + (f" ({location})" if location else ""))
-    return "\n".join(lines) or "- (no open roles listed)"
+    if lines:
+        return "\n".join(lines)
+    if prospect.hiring_signal == "unknown":
+        return "- (no job posting data available for this company -- do not assume they are not hiring)"
+    return "- (no open roles listed)"
 
 
 def _fallback_template(prospect: ImportedProspect, signature: str) -> DraftedMessage:

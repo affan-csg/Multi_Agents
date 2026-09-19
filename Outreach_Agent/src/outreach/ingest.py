@@ -71,6 +71,7 @@ def _to_imported_prospect(detail: dict[str, Any], run_id: str) -> ImportedProspe
         pain_summary=qualification.get("pain_summary"),
         recommended_angle=qualification.get("recommended_angle"),
         open_reqs=(detail.get("postings") or [])[:10],
+        hiring_signal=company.get("hiring_signal"),
         contact_email=best_contact.get("email"),
         contact_name=" ".join(
             x for x in (best_contact.get("first_name"), best_contact.get("last_name")) if x
