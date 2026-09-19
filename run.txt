@@ -1,0 +1,6 @@
+cd Dashboard
+npm run dev
+cd Outreach_Agent  
+python -m uvicorn outreach.api:app --app-dir src --reload --port 8001
+cd Research_Agent
+python -m uvicorn csg.api:app --app-dir src --reload --port 8000

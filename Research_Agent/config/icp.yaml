@@ -1,0 +1,273 @@
+# =============================================================================
+# CSG ICP PROFILE  --  Career Source Group, LLC
+# =============================================================================
+# SOURCED, not guessed: pulled 2026-09-08 from CSG's own marketing site source
+# (C:\dev\connect-hug-repo), specifically:
+#   src/content/staffing.ts      -- the 9 staffing practice areas + market copy
+#   src/content/pages.ts         -- specialtyOptions, home/about copy, clients
+#   src/content/pods.ts          -- pod compositions, non-tech ops line
+#   src/routes/who-we-serve.tsx  -- startups / SMB / enterprise segments
+#
+# CSG is a US-headquartered (Alpharetta, GA) tech-and-AI-specialized staffing
+# and talent delivery firm -- NOT a general staffing agency. It places
+# specialists and pods across nine technical practices in three engagement
+# models (Contract, Contract-to-Hire, Direct Hire at a 10% fee), delivered
+# from three regions (US onshore, LATAM nearshore, Pakistan offshore).
+# Reference clients named on-site: Verifone, GoodRco, Snapdocs, Lilt.
+#
+# Still NOT sourced (no explicit numeric target on-site) and marked [INFERRED]
+# below: the specific size/headcount sweet spot. The site explicitly serves
+# startups through enterprises with no stated floor, so size is now a soft
+# signal only -- no hard disqualification on headcount in either direction.
+#
+# Revision 2026-09-18: folded in an explicit "Growth Signals" sub-component
+# (funding/expansion/new-office language) inside buying_signals -- see that
+# section below. Every soft-signal criterion (size, revenue, funding,
+# industry) remains an intentional non-disqualifier, spelled out at each
+# section. This used to be split into two selectable profiles
+# ("default"/"broad_signal"); that split has been removed -- this is now the
+# only ICP profile, this file is the only source of it.
+#
+# Discovery is unaffected by any of this -- discovery stays broad/unfiltered
+# per company quality (see web_search.py's build_discovery_prompts); only
+# scoring/tiering reads from this file.
+# =============================================================================
+
+profile: csg_tech_staffing
+version: 2
+
+# --- Target company band --------------------------------------------------
+# Explicitly a soft signal, never a disqualifier: hard_min/hard_max are left
+# at their effectively-no-floor/no-ceiling values on purpose, so no company
+# is dropped for being "too small" or "too large" -- only firmographic_fit's
+# sweet-band bonus below treats size as a ranking signal. See
+# scoring.disqualify(), which only fires on hard_min/hard_max, never on
+# sweet_min/sweet_max.
+size:
+  hard_min: 1               # no floor -- startups are always in scope
+  hard_max: 1000000          # no ceiling -- enterprises are always in scope
+  sweet_min: 30             # [INFERRED] full sweet-band points inside this range
+  sweet_max: 3000
+  disqualify_when_unknown: false   # unknown headcount is never punished
+
+# --- Geography ------------------------------------------------------------
+geo:
+  country: US
+  states: []                       # empty = no state restriction
+  require_us_presence: true        # all-foreign req footprint -> disqualify
+
+  # Rollout order: Georgia -> East Coast -> Midwest -> West Coast. `active`
+  # is the default region for a run when none is picked explicitly; advance
+  # it (or pick a region per run) as coverage expands.
+  search_regions:
+    active: GA
+    available:
+      GA:
+        label: Georgia
+        states: [GA]
+        hubs: [Atlanta, Alpharetta, Savannah, Augusta]
+      East Coast:
+        label: US East Coast
+        states: [NY, NJ, MA, CT, PA, MD, VA, NC, SC, FL, DC, DE, RI, NH, ME, VT]
+        hubs: [New York, Boston, Charlotte, Raleigh, Washington DC, Miami, Philadelphia]
+      Midwest:
+        label: US Midwest
+        states: [IL, OH, MI, IN, WI, MN, MO, IA, KS, NE, ND, SD]
+        hubs: [Chicago, Columbus, Detroit, Indianapolis, Minneapolis, Kansas City]
+      West Coast:
+        label: US West Coast
+        states: [CA, WA, OR, NV, AZ]
+        hubs: [San Francisco, Seattle, Los Angeles, San Diego, Portland, Phoenix]
+
+# --- Target industries ------------------------------------------------------
+# Explicitly empty: tech AND non-tech both in scope, no industry restriction
+# (the industry_match component is then marked UNAVAILABLE rather than
+# scored zero -- see scoring.py's missing-data policy).
+target_industries: []
+
+# --- Practice areas / role families ----------------------------------------
+# CSG's 9 staffing practices, technical and non-technical. SOURCED from
+# staffingRoles[] in src/content/staffing.ts and specialtyOptions in
+# src/content/pages.ts. A req matches a practice if any pattern appears in
+# its title (word-boundary aware, case-insensitive). weight boosts a
+# practice's contribution to the Hiring Need "relevant share" component --
+# CSG's own copy singles out AI/ML and MLOps as the highest-value.
+practice_areas:
+  ai_ml:
+    enabled: true
+    weight: 1.3
+    patterns: [ai engineer, ml engineer, "\\bai/ml\\b", machine learning engineer,
+               "machine learning", applied scientist, research scientist, llm engineer,
+               "\\bllm\\b", generative ai, computer vision engineer, nlp engineer,
+               "\\bnlp\\b", deep learning engineer, ai researcher, prompt engineer]
+  mlops:
+    enabled: true
+    weight: 1.3
+    patterns: ["\\bmlops\\b", ml platform engineer, ml infrastructure, model serving,
+               ml systems engineer, machine learning infrastructure]
+  data_engineering:
+    enabled: true
+    weight: 1.1
+    patterns: [data engineer, data scientist, analytics engineer, data analyst,
+               "\\betl\\b", data pipeline engineer, big data engineer, data platform engineer]
+  devops:
+    enabled: true
+    weight: 1.0
+    patterns: [devops engineer, "\\bsre\\b", site reliability engineer, infrastructure engineer,
+               release engineer, build engineer, "ci/cd engineer"]
+  devsecops_platform:
+    enabled: true
+    weight: 1.1
+    patterns: [devsecops, platform engineer, internal developer platform, security engineer,
+               "\\bappsec\\b", application security engineer]
+  cloud:
+    enabled: true
+    weight: 1.0
+    patterns: [cloud engineer, cloud architect, "\\baws\\b engineer", "\\bazure\\b engineer",
+               "\\bgcp\\b engineer, solutions architect", infrastructure architect,
+               cloud infrastructure]
+  software_dev:
+    enabled: true
+    weight: 0.9
+    patterns: [software engineer, software developer, full stack, back end engineer,
+               backend engineer, front end engineer, frontend engineer, mobile developer,
+               ios developer, android developer, web developer, application developer,
+               "\\bqa engineer\\b", quality assurance engineer, sdet, test engineer,
+               integration engineer]
+  product_pm_ba_qa:
+    enabled: true
+    weight: 0.9
+    patterns: [product manager, technical product manager, project manager, "\\bit\\b project manager",
+               scrum master, business analyst, delivery manager, program manager,
+               product owner, agile coach]
+  cybersecurity_grc:
+    enabled: true
+    weight: 1.1
+    patterns: [cybersecurity, "\\bgrc\\b", security analyst, "compliance", "\\bsoc2\\b",
+               "\\biso27001\\b", risk analyst, "\\bciso\\b", security architect,
+               incident response, penetration tester, "\\bgdpr\\b", "\\bhipaa\\b compliance"]
+  # Secondary practice: CSG's pod content lists this as a real but lower-priority
+  # line ("Non-Tech Operations Pod: customer success, revenue ops, finance and
+  # accounting ops, back-office"). Lower weight -- it's not the core AI/tech book.
+  non_tech_ops:
+    enabled: true
+    weight: 0.5
+    patterns: [customer success manager, revenue operations, "\\brevops\\b", finance operations,
+               accounting operations, back office, order management, billing operations,
+               customer support, desktop support, user support, administrative]
+
+# --- Financial Thresholds -------------------------------------------------
+# Explicitly a soft "prefer" signal, not a disqualifier: revenue below the
+# sweet minimum gets partial credit scaled to how close it is (see
+# scoring._financial_strength), never zero, and an unknown figure is skipped
+# entirely rather than punished.
+financials:
+  revenue_sweet_min: 10000000  # prefer $10M+ -- full revenue credit at/above this
+  funding_preferred: true      # prefer well-funded -- any funding on record scores
+  revenue_points: 6            # of the 10-point Financial Strength dimension
+  funding_points: 4
+
+# --- Disqualifiers (hard zero, evaluated before scoring) ------------------
+# About excluding non-prospects (competitors, agencies, no-US-presence, zero
+# relevant reqs) -- not about size or revenue, which stay soft signals above.
+disqualifiers:
+  # Competitor detection: CSG cannot sell staffing to a staffing firm.
+  competitor_name_patterns:
+    [staffing, recruiting, recruitment, recruiters, talent solutions,
+     talent partners, talent group, workforce solutions, employment agency,
+     executive search, search group, search partners, headhunt, personnel,
+     temp agency, "\\brpo\\b", "\\bpeo\\b", employer of record, staffing agency,
+     manpower, workforce management,
+     # CSG-specific: named direct competitors in tech-staffing / global talent
+     # delivery (same AI/data/cloud/devops niche + nearshore/offshore model).
+     toptal, turing, andela, crossover, deel, remote.com, gun.io, "x-team",
+     motion recruitment, actalent, teksystems, revature]
+  # A company whose own reqs are mostly recruiter roles is almost always an agency.
+  competitor_recruiter_req_share: 0.40
+  recruiter_title_patterns: [recruiter, recruiting, talent acquisition, sourcer,
+                             staffing consultant, staffing specialist]
+  min_relevant_reqs: 1        # zero reqs in enabled practice areas -> disqualify
+
+# --- Scoring weights (must total 100) -------------------------------------
+weights:
+  hiring_need: 35
+  fill_pain: 20
+  firmographic_fit: 15
+  financial_strength: 10
+  buying_signals: 10
+  csg_delivery_fit: 10
+
+scoring:
+  hiring_need:
+    # [min_reqs, max_reqs, points] -- component max 24
+    req_count_bands: [[1, 2, 4], [3, 5, 10], [6, 12, 18], [13, 30, 24], [31, 99999, 22]]
+    relevant_share_max: 10     # share of reqs in enabled practice areas * this
+    # [min, max, points] -- component max 6, skipped when headcount unknown
+    reqs_per_100_emp_bands: [[8, 99999, 6], [4, 8, 4], [2, 4, 2]]
+  fill_pain:
+    # median req age in days -> points, component max 16
+    median_age_bands: [[0, 20, 2], [21, 45, 8], [46, 90, 15], [91, 99999, 16]]
+    stale_share_days: 45       # reqs older than this count as stale
+    stale_share_max: 8         # stale share * this
+    urgency_max: 6
+    urgency_patterns: [urgent, urgently, immediate, immediately, "\\basap\\b",
+                       multiple openings, multiple positions, start immediately,
+                       high volume, now hiring, immediate need, immediate opening]
+  firmographic_fit:
+    size_sweet_points: 10
+    size_acceptable_points: 6
+    industry_match_points: 6
+    geo_match_points: 4
+  buying_signals:
+    # Rebalanced from a 3-component split (3/4/3) to fund a 4th, 3-point
+    # Growth Signals component within the same 10-point weight -- nothing
+    # here changes the total achievable score, only its composition.
+    multi_location_min: 3            # distinct locations
+    multi_location_points: 2
+    contract_language_points: 3      # already buys contingent labor
+    contract_patterns: [contract-to-hire, contract to hire, "\\bc2h\\b", temporary,
+                        temp-to-perm, temp to perm, contingent, "\\b1099\\b",
+                        w2 contract, staff augmentation, contract position]
+    recent_burst_min: 5              # reqs posted in last 30d
+    recent_burst_points: 2
+    # Funding/expansion/new-office language in job posting descriptions or
+    # the company description -- a forward-looking growth signal distinct
+    # from "already hiring urgently" (fill_pain) or "already buys contingent
+    # labor" (contract_language above). Scored via Config.growth_signal_hits
+    # (see config.py) -- any hit earns the full points; this is a detector,
+    # not a counter, same treatment contract_language_points already gets.
+    growth_signal_points: 3
+    growth_signal_patterns: [series a, series b, series c, series d, seed round,
+                             seed funding, newly funded, recently funded, raised \$,
+                             raised a \$, closes \$, closed a \$, funding round,
+                             venture funding, growth funding, new office, opening a
+                             new office, expanding to, expansion into, new headquarters,
+                             relocating headquarters, doubling headcount, rapid growth,
+                             rapidly growing, scaling our team, scaling the team,
+                             hypergrowth]
+
+# --- Tiers ----------------------------------------------------------------
+tiers:
+  A: 70
+  B: 50
+  C: 35
+  # below C -> dropped
+
+# --- Outreach hand-off ------------------------------------------------------
+# Every Tier A/B company a run scores is automatically qualified (LLM pain
+# summary), has contacts looked up (Hunter.io), and is handed off to the
+# Outreach Agent to become a prospect + draft campaign -- no manual flag or
+# button. auto_qualify_top_n caps how many Tier A/B companies (ranked by
+# score, highest first) this covers per run, so one big discovery run can't
+# silently exhaust Hunter.io's free-tier monthly quota (25 searches) or run
+# up LLM costs in a single shot.
+outreach:
+  auto_qualify_top_n: 25
+
+# --- Fetch politeness -----------------------------------------------------
+http:
+  user_agent: "CSG-Research-Agent/0.1 (B2B staffing prospect research)"
+  per_host_delay_seconds: 1.0
+  timeout_seconds: 20
+  cache_ttl_hours: 168
+  max_concurrency: 8

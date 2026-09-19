@@ -1,0 +1,66 @@
+name: CI
+
+# Each project is independent (separate Supabase projects, separate
+# dependency trees), so each gets its own job and none block the others.
+# Both Python suites run fully offline against an in-memory PostgREST fake
+# (see each project's tests/conftest.py) -- no secrets are needed here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  research-agent:
+    name: Research Agent tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Research_Agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e .
+      - name: Run tests
+        run: pytest -q
+
+  outreach-agent:
+    name: Outreach Agent tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Outreach_Agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e .
+      - name: Run tests
+        run: pytest -q
+
+  dashboard:
+    name: Dashboard typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: Dashboard/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        # Known pre-existing failure in src/pages/research/UsageTab.tsx --
+        # not a regression gate until that's fixed; remove continue-on-error
+        # once it is.
+        run: npx tsc -b --noEmit
+        continue-on-error: true

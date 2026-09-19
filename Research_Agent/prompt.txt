@@ -1,0 +1,529 @@
+# CSG Research/ICP Agent — Architecture Review & Fix
+
+Review the existing Research/ICP Agent in this repo and fix its architecture against the
+requirements below.
+
+**Do NOT rewrite code yet.** Inspect first, report findings, then stop for approval
+(see section 16).
+
+**Do NOT build the Outreach Agent.**
+
+## Context: what already exists
+
+Read these before proposing anything. Much of the target architecture is already built —
+your job is to find what is broken, half-wired, or contradicting the requirements, not to
+rebuild from scratch.
+
+```text
+config/icp.yaml              embedded ICP: practice areas, weights, tiers, financials, geo
+config/seeds.csv             legacy seed list (to be retired — see §5)
+src/csg/config.py            ICP loader, regex taxonomy compilation
+src/csg/models.py            Company / JobPosting / ScoreResult / Prospect schema
+src/csg/pipeline.py          orchestration: detect → fetch → filter → score → contacts
+src/csg/scoring.py           5-dimension scoring + tiering (430 lines)
+src/csg/discovery/           base.py, web_search.py (Gemini), research.py, resolver.py
+src/csg/ats/                 greenhouse, lever, ashby, workday
+src/csg/contacts.py          Hunter.io contact discovery
+src/csg/cli.py               `run` (seed-based) and `discover` (region-based) commands
+src/csg/api.py               FastAPI backend for the frontend
+schema.sql                   database schema
+```
+
+The `csg discover <region>` command already runs the autonomous path end to end. Treat it
+as the intended entrypoint and judge everything else against it.
+
+---
+
+## 1. Core Objective
+
+The Research/ICP Agent must be an **autonomous company discovery and research system**.
+
+I should NOT provide:
+
+* Company names
+* Company domains
+* `seeds.csv`
+* ICP criteria
+* Company-size criteria
+* Financial criteria
+* Priority rules
+
+Those criteria must be **predefined in configuration** and applied by default on every run.
+
+The only input for a normal research run is the **geographic region**:
+
+```text
+Region: Georgia (GA)
+```
+
+The agent then independently discovers companies matching the embedded ICP.
+
+---
+
+## 2. Known Defects to Confirm and Fix
+
+These are verified against the actual code, not assumed. Re-confirm each, then fix as part
+of the plan. If you find any of them is wrong, say so.
+
+Defects are ordered by severity: §2.1–§2.4 are **broken right now**; §2.5–§2.10 are
+architectural gaps.
+
+### 2.1 BROKEN: the test suite does not pass
+
+`pytest tests/` currently reports **13 failed, 5 passed**. Every failure is the same
+`ValidationError`, e.g.:
+
+```text
+employee_count
+  Input should be a valid dictionary [type=dict_type, input_value=800, input_type=int]
+```
+
+`Company.employee_count` was changed to a provenance dict (`models.py:39`) without
+updating the tests, the seed loader, or the API. A repo whose tests do not run has no
+regression safety net — **fix this first, before any refactor.**
+
+### 2.2 BROKEN: `load_seeds` is one populated CSV cell away from crashing
+
+`pipeline.py:81` still builds `employee_count=_int_or_none(...)` — a plain `int` — but the
+model now requires a dict. I verified this crashes:
+
+```text
+domain,name,employee_count
+acme.com,Acme,250          ->  ValidationError
+```
+
+It does not crash today **only because all 41 rows in `config/seeds.csv` have an empty
+`employee_count` column**. Anyone filling in that column breaks the seed path instantly.
+The same latent break applies to any CSV a user uploads.
+
+### 2.3 BROKEN: API employee filters can never match
+
+`api.py:173-175` filters seeds with `c.employee_count >= f.min_employees`, comparing a
+dict against an int. Given §2.2 that field is always `None` in practice, so the filter
+silently returns nothing rather than raising — the `min_employees` / `max_employees`
+controls in the UI are dead. If §2.2 is fixed without fixing this, it becomes a
+`TypeError` instead.
+
+Whatever shape `employee_count` settles on, it must be consistent across `models.py`,
+`pipeline.py`, `api.py`, `db.py`, `scoring.py`, and the tests. Note `scoring.py:236-239`
+already defensively handles *both* shapes — evidence the migration was abandoned midway.
+
+### 2.4 BROKEN: contact discovery burns the Hunter.io quota
+
+`contacts.discover_run` is carefully written for a 25/month cap: serial, skips
+already-searched domains, and **stops on the first quota error** so it does not burn the
+rest.
+
+`pipeline.py:160-166` bypasses all of that. It calls `find_contacts` directly for every
+Tier A/B company, inside `asyncio.gather` (so **parallel**, defeating the serial design),
+and swallows every exception into a status string. A single discovery run over Tier A/B
+prospects can exhaust an entire month's quota and report success.
+
+Contact discovery must not run inline in the scoring pipeline. Make it an explicit,
+quota-aware stage.
+
+### 2.5 Financial criteria are configured but never used
+
+`config/icp.yaml` defines:
+
+```yaml
+financials:
+  revenue_sweet_min: 10000000   # $10M+
+  funding_preferred: true
+```
+
+`grep` finds **zero** references to `financials`, `revenue_sweet_min`, `company.revenue`,
+or `company.funding` anywhere in `src/`. `discovery/research.py` enriches revenue and
+funding into the `Company` model, and then scoring ignores both entirely.
+
+Revenue and funding must become real scoring inputs. $10M+ revenue and/or strong funding
+should be a genuine prioritization signal, not dead config.
+
+### 2.6 MISSING: the frontend cannot run autonomous discovery at all
+
+There is **no `/discover` endpoint in `api.py`** and no region input anywhere in
+`frontend/src/`. Every API route is seed-based (`/seeds/options`, `/seeds/preview`,
+`POST /runs` → `_load_and_filter_seeds`).
+
+So the autonomous pipeline exists **only** as the `csg discover` CLI command, while the
+entire UI drives the legacy seed path — which is itself broken per §2.2–§2.3. The product
+requirement in §1 ("select a region") is not reachable from the UI.
+
+This is the single largest gap between the requirements and the build. The plan must cover
+the API route, the job wiring, and the frontend region selector.
+
+### 2.7 Two contradictory entrypoints
+
+`cli.py` exposes both `run` (reads `seeds.csv`) and `discover` (autonomous). `api.py` calls
+`pipeline.load_seeds(DEFAULT_SEEDS)` in **two** places (`api.py:154`, `api.py:292`), so the
+frontend is still on the seed path. This directly violates the core objective.
+
+Decide the end state: autonomous discovery is the product. Report exactly what breaks if
+the seed path is removed, and what the migration looks like. Note `seeds.csv` may still be
+useful as an optional manual-override input — say so if you think it should stay, but it
+must not be the default path.
+
+### 2.8 Region is not actually embedded
+
+`geo.search_regions.active` in `icp.yaml` is read in exactly one place — a tier-A gate in
+`scoring.py:413` — and is never used to drive discovery. Meanwhile `cli.py discover` takes
+region as a positional CLI argument, and `web_search.py` keeps its own hardcoded
+`_REGION_PROMPTS` dict.
+
+Region handling is split across three places that do not agree. Consolidate it.
+
+### 2.9 ICP criteria are hardcoded inside discovery prompts
+
+`web_search.py` `_REGION_PROMPTS` hardcodes `"50-3000 employees"` and a fixed industry list
+in English prose. The same criteria already live, structured, in `icp.yaml`
+(`size.sweet_min/sweet_max`, `practice_areas`). Changing the ICP today requires editing
+Python prompt strings.
+
+Discovery queries must be **generated from the ICP config**, so the embedded ICP is the
+single source of truth.
+
+### 2.10 Tiering does not match the stated business logic
+
+`scoring.py:400-423` gates Tier A behind `is_smb AND strong_hiring AND active_region`, where
+`active_region` compares ATS posting states against `search_regions.active`. A company with
+an excellent score but unparseable job locations silently falls to Tier B.
+
+Rework tiering to match §11, including financial strength and accessibility. Tier
+assignment must degrade gracefully when a signal is unknown, never silently demote.
+
+### 2.11 Delivery-fit classification is a stub
+
+`pipeline.py:132-145` has a block commented `# Mock LLM Job Analysis Enhancement` that
+assigns `delivery_fit` with naive substring checks (`"latam" in desc`, `"us" in loc`). The
+substring `"us"` matches inside ordinary words — `"Austin"`, `"Houston"`, `"customer"` — so
+this mislabels routinely.
+
+It feeds `_csg_delivery_fit` (10 points of the 100-point score), so that dimension is
+currently unreliable. It also only ever assigns one of three labels from keyword presence,
+with no notion of role seniority, compliance sensitivity, or client-facing requirements —
+all of which §8 says should drive the recommendation.
+
+### 2.12 Enrichment is sequential and uncached
+
+`cli.py` `_enrich_all` loops companies one at a time, awaiting a Gemini call per company
+with no concurrency, no caching, and no persistence check — re-running discovery over the
+same region re-enriches every company from scratch. At 100 companies that is 100 serial
+LLM round trips.
+
+`discovery_sources` is written, but nothing checks whether a company was already enriched
+before spending another call.
+
+### 2.13 Provenance model is used inconsistently
+
+`models.py` defines a `ProvenanceValue` pydantic model, but `research.py` writes plain
+dicts (`{"value":…, "source":…, "method":…, "confidence":…}`) into
+`Company.employee_count` / `.revenue` / `.funding`, which are typed as bare
+`Optional[dict[str, Any]]`. So the provenance contract is documented but not enforced —
+nothing validates that a stored value actually carries source/date/confidence.
+
+§3 requires every financial figure to be marked Reported / Estimated / Unknown with source,
+URL, date, and confidence. Decide whether `ProvenanceValue` becomes the enforced type or is
+deleted, and make the code match.
+
+### 2.14 Discovery has a single point of failure
+
+`WebSearchProvider` (Gemini-grounded) is the only implementation of the `DiscoveryProvider`
+ABC. If the API key is missing, quota is hit, or the model returns unparseable JSON,
+discovery returns `[]` and the run silently produces nothing.
+
+The `DiscoveryProvider` abstraction exists precisely to support multiple sources. Assess
+what a second provider should be, and how failures should surface rather than returning an
+empty list.
+
+---
+
+## 3. Embedded ICP Criteria
+
+Verify `config/icp.yaml` encodes all of the following, and extend it where it does not.
+
+### Company Size
+
+Research startups, SMBs, and large enterprises. Size must be a **major prioritization
+signal but never the only scoring factor**, and never a hard disqualifier.
+
+### Financial Criteria
+
+Prioritize **$10M+ revenue** and/or strong funding/backing. Research and store:
+
+* Revenue
+* Funding / funding rounds
+* Employee count
+* Growth and expansion signals
+* Company age
+* Hiring activity
+
+Never invent financial information. Every value must be marked **Reported / Estimated /
+Unknown**, with source, URL, date, and confidence.
+
+The `ProvenanceValue` model in `models.py` already exists for this — confirm it is used
+consistently rather than raw dicts. Note that `research.py` currently writes plain dicts
+with a `method: "estimated"` key; reconcile the two.
+
+---
+
+## 4. Geographic Strategy
+
+I control only the **current geographic target**. Rollout order:
+
+```text
+Georgia (GA) → East Coast → Midwest → West Coast
+```
+
+The agent must NOT automatically search all regions. Selecting `GA` applies the embedded
+ICP to that region; later selecting `East Coast` reuses the same ICP with no re-entry.
+
+Region selection should read from the ICP config's active region by default, with an
+optional CLI/API override — not require a positional argument every time.
+
+---
+
+## 5. Autonomous Company Discovery
+
+Retire the `seeds.csv` dependency. Target workflow:
+
+```text
+Region → Embedded ICP → Discovery → Resolution/Dedup → Company Research
+→ Hiring Research → Qualification → Scoring → Tier A/B/C → Contacts
+→ Ranked Prospect Database
+```
+
+Legitimate public sources only:
+
+* Web search
+* Public company directories and startup/company databases
+* State/business directories
+* Public job boards and public ATS systems
+* Company websites
+* Public funding information
+* Government/public datasets
+
+**Do NOT scrape LinkedIn.**
+
+Also assess discovery robustness: today there is a single provider
+(`WebSearchProvider`, Gemini-grounded). Evaluate whether one LLM-backed provider is
+sufficient for coverage and recall, and whether the `_BLACKLIST_DOMAINS` approach scales.
+
+---
+
+## 6. CSG Expertise
+
+**https://www.careersourcegroup.com/** is the source of truth for CSG's expertise.
+
+The site lists **9 high-priority expertise areas**; these are the current high-priority
+role families. `icp.yaml` already encodes nine `practice_areas` plus a lower-weighted
+`non_tech_ops` — verify these still match the live site.
+
+The system must be able to identify additional relevant technical and non-technical roles
+over time. Do not hardcode only today's exact job titles.
+
+---
+
+## 7. Hiring Research
+
+Hiring activity is one of the strongest buying signals. For discovered companies research:
+
+* Open positions, number of openings, relevant roles
+* Job titles, descriptions, posting dates, job age
+* Location; remote/hybrid/onsite
+* Contract vs full-time
+* Urgency, repeated hiring, multiple openings in one role family, hiring growth
+
+Companies with little or no meaningful hiring demand get low priority.
+
+---
+
+## 8. CSG Delivery Fit
+
+Recommend the likely delivery model based on the actual role and requirement:
+
+* **US** — full-time, contract, client-facing, leadership, sensitive/compliance-heavy
+* **LATAM** — nearshore, contract, timezone overlap, embedded teams, engineering/product
+* **Pakistan** — offshore, contract, async execution, technical work, data/QA/support/back-office
+
+Replace the stub described in §2.11 with real classification.
+
+---
+
+## 9. Contact Discovery
+
+For qualified companies, find relevant contacts. Prioritize: Founder, CEO, COO, CHRO,
+VP People, Head of Talent, Talent Acquisition Director, Recruiting Manager, HR Director,
+and engineering/department leaders.
+
+Where publicly available collect: name, title, work email, company, professional profile
+URL, source, confidence.
+
+**Never fabricate contacts.** Separate verified from unverified.
+
+Note the current constraint: Hunter.io free tier is 25 domain searches/month, and
+contact discovery runs inline in `pipeline.py` for every Tier A/B company. Assess whether
+this is the right place for it given the quota.
+
+---
+
+## 10. Scoring
+
+Current scoring uses five dimensions totaling 100: Hiring Need 35, Fill Pain 20,
+Firmographic Fit 20, Buying Signals 15, CSG Delivery Fit 10.
+
+The score must account for:
+
+* Hiring need
+* Fill pain
+* Company size
+* **Financial strength** (currently missing — §2.5)
+* Geographic priority
+* CSG expertise fit
+* Buying/outsourcing signals
+* **Accessibility / penetration difficulty** (currently missing)
+* US/LATAM/Pakistan delivery fit
+* Strategic/commercial value
+
+If you add dimensions, the weights must still total 100 (`config.py` enforces this) —
+propose the rebalance explicitly.
+
+Scoring must stay transparent, with human-readable reasons per component:
+
+```text
++14 Hiring Need: 12 relevant open positions
++12 Fill Pain: several roles older than 45 days
++10 Firmographic Fit: target SMB
++8  Financial Fit: estimated $25M revenue
++7  CSG Fit: 6 openings match CSG expertise
+```
+
+Preserve the existing missing-data policy: unavailable components are **skipped and
+marked**, never silently scored zero.
+
+---
+
+## 11. Tiering
+
+```text
+Tier A = highest-priority prospects
+Tier B = strong prospects, especially larger enterprises
+Tier C = lower-priority prospects
+```
+
+Business logic: **startups and SMBs generally rank higher because they are easier to
+penetrate; large enterprises stay valuable but carry more complex sales/procurement.**
+Hiring demand and overall commercial fit must still influence the final tier.
+
+Fix the gating problem in §2.5. Tier assignment must degrade gracefully when a signal is
+unknown rather than silently demoting.
+
+---
+
+## 12. Research Output
+
+The prospect database should contain:
+
+**Company** — name, domain, location, region, industry, size category, employees, revenue,
+funding, growth indicators
+
+**Hiring** — open roles, relevant roles, role families, job age, hiring volume, urgency,
+contract/FT, location
+
+**CSG Fit** — matching expertise, delivery geography, staffing opportunity, pain summary,
+recommended opportunity
+
+**Contacts** — decision-makers, emails, profiles, verification status
+
+**Qualification** — score, tier, score reasons, sources, confidence, research date
+
+Compare this against `schema.sql` and `models.py` and list the concrete gaps.
+
+---
+
+## 13. Future Outreach Handoff
+
+Do NOT build Outreach. But structure the Research output so a future Outreach Agent can
+consume the top prospects:
+
+```text
+Research → Discovery → Research → Contacts → A/B/C scoring → Top 100 → Outreach Agent
+→ Personalized messaging → Email / LinkedIn / Social
+```
+
+Outreach will eventually personalize on the actual company, person, role, hiring problem,
+industry, and CSG solution. `models.py` documents `Prospect` as the frozen boundary for
+exactly this — verify that boundary still holds and that the schema carries enough context.
+
+---
+
+## 14. Architecture Requirement
+
+Provider-based and modular:
+
+```text
+Region Selection → Embedded ICP → Discovery Providers → Company Resolution
+→ Company Research → ATS/Job Research → Filtering → Scoring → Tiering
+→ Contact Discovery → Prospect Database
+```
+
+The ICP lives in configuration/default policy and is never manually entered per run.
+
+---
+
+## 15. Cost Control
+
+Keep deterministic operations free. Use LLMs only where judgment is required:
+
+* Understanding job descriptions
+* Role classification
+* Pain identification
+* Nuanced CSG fit
+* Research summaries
+* Recommended opportunity
+
+Do not spend LLM calls on basic company calculations.
+
+Audit current spend: `discover` makes one Gemini enrichment call **per discovered company**
+sequentially (`cli.py` `_enrich_all`), on top of discovery and `qualify`. Report the actual
+call count per run and where it can be batched, cached, or made deterministic.
+
+---
+
+## 16. What I Want You To Do Now
+
+**Do not rewrite code yet.** Inspect the existing agent and report:
+
+1. What is wrong with the current architecture
+2. Confirmation (or correction) of each defect in §2, with `file:line` references —
+   including any I got wrong
+3. Any defect I missed. I found §2 by inspection, not exhaustively; assume there are more
+4. What needs to change
+5. How autonomous discovery should work
+6. How the embedded ICP should work
+7. How region selection should work, end to end (config → API → frontend)
+8. How scoring/tiering should work, including the explicit weight rebalance
+9. How contact discovery should work within the 25/month quota
+10. What database/schema changes are needed
+11. What existing files change
+12. What gets removed
+13. What gets added
+14. Step-by-step implementation plan, ordered by dependency, flagging breaking changes
+
+Sequence the plan so the repo is **working and tested at every step**. Specifically:
+restore a green test suite (§2.1) before refactoring anything, and settle the
+`employee_count` type (§2.2–§2.3) before touching scoring — several defects depend on that
+decision.
+
+Ground every claim in the actual code. Cite `file:line`. Run the tests yourself rather than
+trusting my numbers. If a requirement is already satisfied, say so and move on rather than
+proposing to rebuild it.
+
+Then **STOP and wait for my approval before making major changes.**
+
+### Most important requirement
+
+> **I should only need to select the geographic region, such as GA. The Research/ICP Agent
+> must already know the predefined company-size, financial, hiring, prioritization, and
+> CSG-fit criteria, and must independently discover and research companies that match them.**
+
+Do not make me provide company names or ICP criteria manually.

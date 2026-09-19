@@ -1,0 +1,14 @@
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+scratchpad/
+.claude/
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.local

@@ -1,0 +1,38 @@
+# This repo is three independent projects (Research_Agent, Outreach_Agent,
+# Dashboard), each with its own .gitignore for stack-specific ignores
+# (__pycache__/, node_modules/, dist/, .venv/, etc). This root file only
+# covers things that can appear at the repo root itself or that are common
+# to all three and easy to commit by accident.
+
+# Environment secrets -- every project's .env holds live API keys
+# (Supabase service-role keys, SMTP credentials, Gemini/Anthropic/Groq/
+# Tavily keys). Never commit these; only *.env.example files are tracked.
+.env
+.env.*
+!.env.example
+!*/.env.example
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python (in case anything is ever added at the root outside the two agents)
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Node (in case anything is ever added at the root outside Dashboard)
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+
+# Scratch space used by Claude Code sessions working in this repo
+scratchpad/
+.claude/

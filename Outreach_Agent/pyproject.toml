@@ -1,0 +1,30 @@
+[project]
+name = "csg-outreach-agent"
+version = "0.1.0"
+description = "CSG Outreach Agent - personalizes and sends outreach to Research Agent prospects"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "rich>=13.7",
+    "anthropic>=0.69",
+    "google-genai>=2.0",
+    "python-dotenv>=1.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.scripts]
+outreach = "outreach.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/outreach"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

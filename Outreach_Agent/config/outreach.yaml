@@ -1,0 +1,79 @@
+# =============================================================================
+# CSG OUTREACH CONFIG
+# =============================================================================
+# Mirrors config/icp.yaml in the Research Agent: the single source of truth
+# for how prospects are selected and how outreach is sent. Editing this
+# changes selection + sending behavior together -- no code changes.
+#
+# This agent's job stops at Sent. Waiting/Replied/Booked are advanced by a
+# person in the UI (or a future reply-tracking agent) -- nothing here
+# configures reply detection.
+# =============================================================================
+
+profile: csg_outreach
+version: 1
+
+# --- Research Agent connection ---------------------------------------------
+# Where to pull qualified prospects from. Outreach never touches the Research
+# database directly -- only this HTTP API (see src/outreach/research_client.py).
+research:
+  api_base: "http://127.0.0.1:8000"
+  # Default tiers considered "qualified" for outreach selection.
+  qualified_tiers: [A, B]
+
+# --- Prospect selection ("top prospects") -----------------------------------
+# Applied when building a new campaign. `limit` is the configured "top N";
+# ranking is by the Research Agent's own score, descending -- Outreach does
+# not re-score.
+selection:
+  limit: 25
+  tiers: [A, B]
+  min_score: 50
+  # A Tier A/B company with no contact email is excluded from import
+  # entirely -- it never reaches the `prospects` cache, so it can never be
+  # selected into a campaign either (create_campaign_from_prospects only ever
+  # sees what's cached). Set false to instead import it anyway (still
+  # excluded from campaign selection regardless -- see ingest.py's
+  # create_campaign_from_prospects, which filters on has_contact
+  # independently of this flag) if you want contact-less companies visible on
+  # the Prospects page for manual follow-up.
+  require_contact_email: true
+
+# --- Sending ------------------------------------------------------------
+sending:
+  channel: email
+  from_name: "CSG Outreach"
+  from_email: ""                 # set via .env OUTREACH_FROM_EMAIL, kept out of committed config
+  reply_to: ""
+  rate_limit_per_minute: 20      # politeness cap on the email provider
+  dry_run: false                 # true = generate + log, never actually send
+
+# --- Personalization ------------------------------------------------------
+# Message generation reads pain_summary / recommended_angle / open_reqs off
+# the imported prospect snapshot. Falls back to a generic template when the
+# Research Agent has not run `csg qualify` for a domain yet.
+personalization:
+  prompt_template: prompts/outreach_email.md
+  revise_prompt_template: prompts/outreach_email_revise.md
+  max_open_reqs_cited: 3
+  sender_name: "Affan Jan"   # who's sending -- also the first line of the signature
+  # Full sign-off block every drafted/revised email ends with -- {{sender_name}}
+  # in the prompts is filled with this whole block, not just the name.
+  sender_signature: |
+    Affan Jan
+    Career Source Group LLC
+    Alpharetta, Georgia
+    https://careersourcegroup.com/
+
+# --- Pipeline stages --------------------------------------------------------
+# Documented here for the UI/API; this agent only ever writes
+# needs_review/pending -> sent (or failed on a send error). The remaining
+# stages are informational and are set by a person (or, later, a separate
+# reply-tracking agent), via either the item drawer's stage buttons or
+# dragging a card between kanban columns in the Dashboard -- both call the
+# same API. This list is documentation only -- the authoritative order is
+# Stage/STAGE_ORDER in src/outreach/models.py; not kept byte-for-byte synced.
+stages:
+  order: [needs_review, pending, sent, waiting, replied, booked]
+  owned_by_this_agent: [needs_review, pending, sent, failed]
+  manual_or_future_agent: [waiting, replied, booked]
