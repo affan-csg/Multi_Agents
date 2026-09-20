@@ -5,11 +5,15 @@ import {
   outreachApi,
   STAGE_ORDER,
   type Campaign,
+  type ConversationSettings,
   type ImportedProspect,
+  type ItemConversation,
   type JobSnapshot,
   type MessagePreview,
   type OutreachItem,
+  type ReplyIntent,
   type Stage,
+  type TickResult,
 } from "../../agents/outreach";
 import { Avatar, EmptyState, Icon, ScorePill, type IconName } from "../../components/ui";
 import { RunOverlay } from "../../components/RunOverlay";
@@ -87,6 +91,27 @@ const STAGE_EMPTY_SUB: Record<Stage, string> = {
   failed: "Failed sends will appear here if delivery errors out.",
 };
 
+// How a classified reply reads on a card. `out_of_office` and `bounce` are
+// shown in a muted tone because they are explicitly NOT replies -- mail
+// arrived, but no human answered, and the card deliberately did not move.
+const INTENT_LABEL: Record<ReplyIntent, string> = {
+  interested: "Interested",
+  booked: "Booked",
+  not_interested: "Not interested",
+  out_of_office: "Out of office",
+  bounce: "Bounced",
+  unclear: "Needs a look",
+};
+
+const INTENT_TONE: Record<ReplyIntent, "mint" | "violet" | "amber" | "dim"> = {
+  interested: "mint",
+  booked: "violet",
+  not_interested: "amber",
+  out_of_office: "dim",
+  bounce: "dim",
+  unclear: "amber",
+};
+
 interface Props {
   campaignId: string;
   campaignName?: string | null;
@@ -132,6 +157,31 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOverStage, setDragOverStage] = useState<Stage | null>(null);
 
+  // --- Conversation Agent -------------------------------------------------
+  const [convSettings, setConvSettings] = useState<ConversationSettings | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [tickResult, setTickResult] = useState<TickResult | null>(null);
+  const [convOpen, setConvOpen] = useState(false);
+  const [thread, setThread] = useState<ItemConversation | null>(null);
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [draftBusy, setDraftBusy] = useState<string | null>(null);
+  const [drafting, setDrafting] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [draftRedrafting, setDraftRedrafting] = useState<string | null>(null);
+  const [draftEditOpen, setDraftEditOpen] = useState<string | null>(null);
+  const [draftEditInstruction, setDraftEditInstruction] = useState("");
+  const [draftRevising, setDraftRevising] = useState(false);
+  const [draftReviseError, setDraftReviseError] = useState<string | null>(null);
+  // Which inbound messages are showing their full quoted original, instead
+  // of the default clean_body -- per message_id, so expanding one reply
+  // doesn't affect the others.
+  const [expandedQuotes, setExpandedQuotes] = useState<Set<string>>(new Set());
+  // The original outreach email is read-only history once an item reaches a
+  // conversation stage -- collapsed by default there so the conversation
+  // (what actually needs attention) reads first, with the original one
+  // click away rather than pushed further down the page.
+  const [originalMessageOpen, setOriginalMessageOpen] = useState(false);
+
   const { data: campaigns } = useCachedFetch<Campaign[]>("campaigns", () => outreachApi.listCampaigns());
   const campaign = campaigns?.find((c) => c.campaign_id === campaignId) ?? null;
   // Fall back to the name carried in via the route (from the campaigns list
@@ -162,6 +212,7 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
     setEditOpen(false);
     setEditInstruction("");
     setReviseError(null);
+    setOriginalMessageOpen(false);
     if (!selected || selected.subject || selected.stage !== "pending") return;
     setPreviewLoading(true);
     outreachApi.itemPreview(selected.item_id)
@@ -169,6 +220,168 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
       .catch((e) => setPreviewError(e instanceof Error ? e.message : String(e)))
       .finally(() => setPreviewLoading(false));
   }, [selected]);
+
+  // Load the toggle state once per campaign. A campaign that has never been
+  // configured reads as disabled rather than 404-ing, so this always resolves.
+  useEffect(() => {
+    let cancelled = false;
+    outreachApi.conversationSettings(campaignId)
+      .then((s) => { if (!cancelled) setConvSettings(s); })
+      .catch(() => { if (!cancelled) setConvSettings(null); });
+    return () => { cancelled = true; };
+  }, [campaignId]);
+
+  // Load the thread whenever a card in a conversation stage is opened.
+  useEffect(() => {
+    setThread(null);
+    setConvOpen(false);
+    setDraftError(null);
+    setDraftEditOpen(null);
+    setDraftEditInstruction("");
+    setDraftReviseError(null);
+    setExpandedQuotes(new Set());
+    if (!selected) return;
+    if (!["sent", "waiting", "replied", "booked"].includes(selected.stage)) return;
+
+    let cancelled = false;
+    setThreadLoading(true);
+    outreachApi.itemConversation(selected.item_id)
+      .then((t) => {
+        if (cancelled) return;
+        setThread(t);
+        // Open by default whenever there's something to actually read --
+        // a reply that arrived is exactly the thing this drawer exists to
+        // surface, not something to hide behind an extra click.
+        if (t.messages.length > 0) setConvOpen(true);
+      })
+      .catch(() => { if (!cancelled) setThread(null); })
+      .finally(() => { if (!cancelled) setThreadLoading(false); });
+    return () => { cancelled = true; };
+  }, [selected]);
+
+  // Optimistic: the switch flips the instant it's clicked, not after a
+  // round-trip. A settings PATCH is a single boolean write with nothing else
+  // to compute, so there is no reason the UI should visibly wait on it --
+  // waiting on it is what made the toggle feel slow. Rolled back to the
+  // pre-click state only if the request actually fails.
+  async function updateConversationSettings(patchBody: Partial<ConversationSettings>) {
+    const previous = convSettings;
+    setConvSettings((cur) => (cur ? { ...cur, ...patchBody } : cur));
+    setError(null);
+    try {
+      const updated = await outreachApi.setConversationSettings(campaignId, patchBody);
+      setConvSettings(updated);
+    } catch (e) {
+      setConvSettings(previous);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // One conversation cycle, run now. Synchronous: a tick is a short IMAP
+  // fetch plus a few per-item decisions, and the button is more useful
+  // reporting what happened than handing back a job id.
+  async function handleCheckReplies() {
+    setChecking(true);
+    setError(null);
+    setTickResult(null);
+    try {
+      const result = await outreachApi.conversationTick(campaignId);
+      setTickResult(result);
+      // Cards may have moved, so the board needs re-reading.
+      if (result.advanced > 0 || result.moved_to_waiting > 0) refreshItems();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function handleSendDraft(messageId: string) {
+    if (!selected) return;
+    setDraftBusy(messageId);
+    setError(null);
+    try {
+      await outreachApi.sendConversationDraft(messageId);
+      setThread(await outreachApi.itemConversation(selected.item_id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDraftBusy(null);
+    }
+  }
+
+  async function handleDiscardDraft(messageId: string) {
+    if (!selected) return;
+    setDraftBusy(messageId);
+    setError(null);
+    try {
+      await outreachApi.discardConversationDraft(messageId);
+      setThread(await outreachApi.itemConversation(selected.item_id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDraftBusy(null);
+    }
+  }
+
+  // Regenerate a pending draft from scratch -- same "try again" idea as the
+  // cold-outreach Re-draft button.
+  async function handleRedraftDraft(messageId: string) {
+    if (!selected) return;
+    setDraftRedrafting(messageId);
+    setDraftError(null);
+    try {
+      await outreachApi.redraftConversationDraft(messageId);
+      setThread(await outreachApi.itemConversation(selected.item_id));
+    } catch (e) {
+      setDraftError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDraftRedrafting(null);
+    }
+  }
+
+  async function handleReviseDraft(messageId: string) {
+    if (!selected || !draftEditInstruction.trim()) return;
+    setDraftRevising(true);
+    setDraftReviseError(null);
+    try {
+      await outreachApi.reviseConversationDraft(messageId, draftEditInstruction);
+      setThread(await outreachApi.itemConversation(selected.item_id));
+      setDraftEditOpen(null);
+      setDraftEditInstruction("");
+    } catch (e) {
+      setDraftReviseError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDraftRevising(false);
+    }
+  }
+
+  // Compose a reply to the latest inbound message on demand -- covers the
+  // case where a tick's automatic drafting attempt failed (LLM error/
+  // timeout) or never ran (the agent was off when the reply arrived), so a
+  // missing draft is never a dead end.
+  async function handleDraftReply() {
+    if (!selected) return;
+    setDrafting(true);
+    setDraftError(null);
+    try {
+      await outreachApi.draftConversationReply(selected.item_id);
+      setThread(await outreachApi.itemConversation(selected.item_id));
+    } catch (e) {
+      setDraftError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDrafting(false);
+    }
+  }
+
+  function toggleQuote(messageId: string) {
+    setExpandedQuotes((cur) => {
+      const next = new Set(cur);
+      if (next.has(messageId)) next.delete(messageId);
+      else next.add(messageId);
+      return next;
+    });
+  }
 
   const pendingCount = items.filter((i) => i.stage === "pending").length;
   const sentCount = items.filter((i) => i.stage === "sent").length;
@@ -451,6 +664,47 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
           <p>5-stage pipeline for research-based outreach.</p>
         </div>
         <div className="page-head-actions">
+          {/* Conversation Agent toggle. Switching it on never sends anything
+              by itself -- auto_reply is a separate switch in the kebab menu. */}
+          <div className="conv-toggle">
+            <button
+              type="button"
+              className={`conv-switch${convSettings?.enabled ? " conv-switch--on" : ""}`}
+              role="switch"
+              aria-checked={convSettings?.enabled ?? false}
+              aria-label="Conversation Agent"
+              disabled={!convSettings}
+              onClick={() => updateConversationSettings({ enabled: !convSettings?.enabled })}
+            >
+              <span className="conv-switch-knob" />
+            </button>
+            <div className="conv-toggle-text">
+              <span className="conv-toggle-label">Conversation Agent</span>
+              <span className="conv-toggle-state">
+                {!convSettings
+                  ? "…"
+                  : convSettings.enabled
+                    ? convSettings.auto_reply ? "On · auto-replying" : "On · drafts only"
+                    : "Off · manual"}
+              </span>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            className="ghost"
+            onClick={handleCheckReplies}
+            disabled={checking || !convSettings?.enabled}
+            title={
+              convSettings?.enabled
+                ? "Fetch replies, classify them, and advance cards"
+                : "Switch the Conversation Agent on to check for replies"
+            }
+          >
+            <Icon name="mail" size={15} />
+            {checking ? "Checking…" : "Check replies"}
+          </button>
+
           <button type="button" className="mint" onClick={handleSend} disabled={busy || pendingCount === 0}>
             <Icon name="send" size={15} />
             {busy ? "Sending…" : `Send ${pendingCount} pending`}
@@ -521,6 +775,21 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
                       {bulkRedrafting ? "Re-drafting…" : `Re-draft ${genericPendingCount} generic`}
                     </button>
                   )}
+                  {convSettings?.enabled && (
+                    <button
+                      type="button"
+                      className="menu-item"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        updateConversationSettings({ auto_reply: !convSettings.auto_reply });
+                      }}
+                    >
+                      <Icon name={convSettings.auto_reply ? "close" : "sparkle"} size={14} />
+                      {convSettings.auto_reply
+                        ? "Stop auto-replying (draft instead)"
+                        : "Let the agent send replies"}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="menu-item menu-item--danger"
@@ -541,6 +810,33 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
 
       {error && <p className="error-text">{error}</p>}
       {bulkRedraftResult && <p className="hint">{bulkRedraftResult}</p>}
+
+      {tickResult && (
+        <div className="schedule-banner">
+          <Icon name="mail" size={14} />
+          <span>
+            {!tickResult.enabled
+              ? "Conversation Agent is off for this campaign — nothing was checked."
+              : tickResult.new_inbound === 0 && tickResult.moved_to_waiting === 0
+                ? `No new replies. ${tickResult.fetched} message${tickResult.fetched === 1 ? "" : "s"} checked${
+                    tickResult.duplicates > 0 ? `, ${tickResult.duplicates} already processed` : ""
+                  }.`
+                : [
+                    tickResult.new_inbound > 0 && `${tickResult.new_inbound} new repl${tickResult.new_inbound === 1 ? "y" : "ies"}`,
+                    tickResult.advanced > 0 && `${tickResult.advanced} card${tickResult.advanced === 1 ? "" : "s"} moved`,
+                    tickResult.moved_to_waiting > 0 && `${tickResult.moved_to_waiting} moved to waiting`,
+                    tickResult.replies_drafted > 0 && `${tickResult.replies_drafted} repl${tickResult.replies_drafted === 1 ? "y" : "ies"} drafted for review`,
+                    tickResult.replies_sent > 0 && `${tickResult.replies_sent} repl${tickResult.replies_sent === 1 ? "y" : "ies"} sent`,
+                    tickResult.followups_drafted > 0 && `${tickResult.followups_drafted} follow-up${tickResult.followups_drafted === 1 ? "" : "s"} drafted`,
+                    tickResult.followups_sent > 0 && `${tickResult.followups_sent} follow-up${tickResult.followups_sent === 1 ? "" : "s"} sent`,
+                  ].filter(Boolean).join(" · ")}
+            {tickResult.message ? ` ${tickResult.message}` : ""}
+          </span>
+          <button type="button" className="schedule-banner-clear" onClick={() => setTickResult(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {campaignScheduledAt && (
         <div className="schedule-banner">
@@ -702,6 +998,94 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
         const displaySubject = selected.subject || preview?.subject;
         const displayBody = selected.body || preview?.body;
         const isLiveDraft = selected.stage === "needs_review" || selected.stage === "pending"; // not sent yet -- still editable
+        const isConversationStage = ["sent", "waiting", "replied", "booked"].includes(selected.stage);
+
+        // The "Message preview/sent" section -- extracted so it can render
+        // in its original place for a pre-send item, or further down
+        // (collapsed by default) once the item has moved into a
+        // conversation stage. Same content and the same Re-draft/Edit
+        // affordances either way; only its position and default visibility
+        // change with the stage.
+        const originalMessageBlock = (
+          <>
+            <div className="drawer-section-head">
+              <h3 className="drawer-section-title">
+                {isLiveDraft ? "Message preview" : "Original message"}
+              </h3>
+              {isLiveDraft && displaySubject && !editOpen && (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button type="button" className="drawer-section-action" onClick={handleRedraft} disabled={redrafting}>
+                    <Icon name="refresh" size={12} className={redrafting ? "icon-spin" : undefined} />
+                    {redrafting ? "Re-drafting…" : "Re-draft"}
+                  </button>
+                  <button type="button" className="drawer-section-action" onClick={() => setEditOpen(true)}>
+                    <Icon name="edit" size={12} />
+                    Edit
+                  </button>
+                </div>
+              )}
+            </div>
+            {isLiveDraft && (
+              <p className="hint">
+                This hasn't been sent yet — drafted once when the campaign was created, so this preview always
+                matches what will actually send. Sending still requires clicking "Send pending" above.
+              </p>
+            )}
+            {isLiveDraft && selected.personalized_from === "template_only" && (
+              <p className="hint">
+                This is a generic template — every attempt to personalize it failed, including a live web
+                search for more information. Click "Re-draft" to try again (useful if the prospect has since
+                been qualified or re-imported with fresh research), or edit it manually.
+              </p>
+            )}
+            {previewLoading && <p className="hint">Drafting…</p>}
+            {previewError && <p className="error-text">Couldn't draft a message: {previewError}</p>}
+            {reviseError && !editOpen && <p className="error-text">{reviseError}</p>}
+            {displaySubject && (
+              <>
+                <h4 className="drawer-subsection-title">Subject</h4>
+                <p className="drawer-subject-line">{displaySubject}</p>
+              </>
+            )}
+            {displayBody && (
+              <>
+                <h4 className="drawer-subsection-title">Body</h4>
+                <div className="quote-box" style={{ whiteSpace: "pre-wrap" }}>{displayBody}</div>
+              </>
+            )}
+            {selected.error && <p className="error-text">{selected.error}</p>}
+
+            {isLiveDraft && editOpen && (
+              <div className="edit-draft-box">
+                <p className="hint">
+                  Describe what to change — the existing email will be edited, not rewritten from scratch.
+                </p>
+                <textarea
+                  className="edit-draft-textarea"
+                  rows={3}
+                  placeholder='e.g. "make it shorter" or "mention our AI hiring experience instead"'
+                  value={editInstruction}
+                  onChange={(e) => setEditInstruction(e.target.value)}
+                />
+                {reviseError && <p className="error-text">{reviseError}</p>}
+                <div className="action-row">
+                  <button
+                    type="button"
+                    className="mint"
+                    onClick={handleRevise}
+                    disabled={revising || !editInstruction.trim()}
+                  >
+                    {revising ? "Updating…" : "Update email"}
+                  </button>
+                  <button type="button" onClick={() => setEditOpen(false)} disabled={revising}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        );
+
         return (
           <div className="drawer-overlay" onClick={() => setSelected(null)}>
             <div className="drawer" onClick={(e) => e.stopPropagation()}>
@@ -799,81 +1183,12 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
                 </>
               ) : null}
 
-              <div className="drawer-section-head">
-                <h3 className="drawer-section-title">
-                  {isLiveDraft ? "Message preview" : "Message sent"}
-                </h3>
-                {isLiveDraft && displaySubject && !editOpen && (
-                  <div style={{ display: "flex", gap: 6 }}>
-                    <button type="button" className="drawer-section-action" onClick={handleRedraft} disabled={redrafting}>
-                      <Icon name="refresh" size={12} className={redrafting ? "icon-spin" : undefined} />
-                      {redrafting ? "Re-drafting…" : "Re-draft"}
-                    </button>
-                    <button type="button" className="drawer-section-action" onClick={() => setEditOpen(true)}>
-                      <Icon name="edit" size={12} />
-                      Edit
-                    </button>
-                  </div>
-                )}
-              </div>
-              {isLiveDraft && (
-                <p className="hint">
-                  This hasn't been sent yet — drafted once when the campaign was created, so this preview always
-                  matches what will actually send. Sending still requires clicking "Send pending" above.
-                </p>
-              )}
-              {isLiveDraft && selected.personalized_from === "template_only" && (
-                <p className="hint">
-                  This is a generic template — every attempt to personalize it failed, including a live web
-                  search for more information. Click "Re-draft" to try again (useful if the prospect has since
-                  been qualified or re-imported with fresh research), or edit it manually.
-                </p>
-              )}
-              {previewLoading && <p className="hint">Drafting…</p>}
-              {previewError && <p className="error-text">Couldn't draft a message: {previewError}</p>}
-              {reviseError && !editOpen && <p className="error-text">{reviseError}</p>}
-              {displaySubject && (
-                <>
-                  <h4 className="drawer-subsection-title">Subject</h4>
-                  <p className="drawer-subject-line">{displaySubject}</p>
-                </>
-              )}
-              {displayBody && (
-                <>
-                  <h4 className="drawer-subsection-title">Body</h4>
-                  <div className="quote-box" style={{ whiteSpace: "pre-wrap" }}>{displayBody}</div>
-                </>
-              )}
-              {selected.error && <p className="error-text">{selected.error}</p>}
-
-              {isLiveDraft && editOpen && (
-                <div className="edit-draft-box">
-                  <p className="hint">
-                    Describe what to change — the existing email will be edited, not rewritten from scratch.
-                  </p>
-                  <textarea
-                    className="edit-draft-textarea"
-                    rows={3}
-                    placeholder='e.g. "make it shorter" or "mention our AI hiring experience instead"'
-                    value={editInstruction}
-                    onChange={(e) => setEditInstruction(e.target.value)}
-                  />
-                  {reviseError && <p className="error-text">{reviseError}</p>}
-                  <div className="action-row">
-                    <button
-                      type="button"
-                      className="mint"
-                      onClick={handleRevise}
-                      disabled={revising || !editInstruction.trim()}
-                    >
-                      {revising ? "Updating…" : "Update email"}
-                    </button>
-                    <button type="button" onClick={() => setEditOpen(false)} disabled={revising}>
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              )}
+              {/* For pre-send items (needs_review/pending) the original
+                  message is the main thing on the page and renders here, in
+                  its normal place. For anything already in a conversation
+                  stage it renders further down, after Conversation and
+                  collapsed by default -- see originalMessageBlock below. */}
+              {!isConversationStage && originalMessageBlock}
 
               {selected.stage === "needs_review" && (
                 <>
@@ -934,14 +1249,265 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
                 </>
               )}
 
-              {selected.stage !== "pending" && selected.stage !== "needs_review" && (
+              {["sent", "waiting", "replied", "booked"].includes(selected.stage) && (
                 <>
+                  <div className="drawer-section-head">
+                    <h3 className="drawer-section-title">Conversation</h3>
+                    {thread && thread.messages.length > 0 && (
+                      <button
+                        type="button"
+                        className="drawer-section-action"
+                        onClick={() => setConvOpen((v) => !v)}
+                      >
+                        <Icon name={convOpen ? "close" : "mail"} size={12} />
+                        {convOpen ? "Hide" : `Show ${thread.messages.length}`}
+                      </button>
+                    )}
+                  </div>
+
+                  {threadLoading && <p className="hint">Loading conversation…</p>}
+
+                  {thread && thread.messages.length === 0 && !threadLoading && (
+                    <p className="hint">
+                      No replies recorded yet.{" "}
+                      {convSettings?.enabled
+                        ? 'Click "Check replies" above to fetch from the inbox.'
+                        : "The Conversation Agent is off — switch it on to detect replies automatically, or move this card by hand below."}
+                    </p>
+                  )}
+
+                  {/* Drafts the agent wrote but did not send, because
+                      auto_reply is off. A person reviews, edits/re-drafts if
+                      needed, and approves or discards each. */}
+                  {thread && thread.pending_drafts.length > 0 && (
+                    <div className="drawer-panel drawer-panel--attention">
+                      <p className="hint">
+                        {thread.pending_drafts.length} repl{thread.pending_drafts.length === 1 ? "y" : "ies"} drafted
+                        and waiting for your approval — nothing has been sent.
+                      </p>
+                      {thread.pending_drafts.map((draft) => {
+                        const busy = draftBusy === draft.message_id;
+                        const redraftingThis = draftRedrafting === draft.message_id;
+                        const editingThis = draftEditOpen === draft.message_id;
+                        return (
+                          <div key={draft.message_id} className="conv-draft">
+                            <div className="drawer-section-head">
+                              <p className="drawer-subject-line" style={{ margin: 0 }}>{draft.subject}</p>
+                              {!editingThis && (
+                                <div style={{ display: "flex", gap: 6 }}>
+                                  <button
+                                    type="button"
+                                    className="drawer-section-action"
+                                    onClick={() => handleRedraftDraft(draft.message_id)}
+                                    disabled={redraftingThis || busy}
+                                  >
+                                    <Icon name="refresh" size={12} className={redraftingThis ? "icon-spin" : undefined} />
+                                    {redraftingThis ? "Re-drafting…" : "Re-draft"}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="drawer-section-action"
+                                    onClick={() => {
+                                      setDraftEditOpen(draft.message_id);
+                                      setDraftEditInstruction("");
+                                      setDraftReviseError(null);
+                                    }}
+                                    disabled={busy}
+                                  >
+                                    <Icon name="edit" size={12} />
+                                    Edit
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                            <div className="quote-box" style={{ whiteSpace: "pre-wrap" }}>{draft.body}</div>
+                            {draftError && !editingThis && <p className="error-text">{draftError}</p>}
+
+                            {editingThis && (
+                              <div className="edit-draft-box">
+                                <p className="hint">
+                                  Describe what to change — the existing reply will be edited, not rewritten from scratch.
+                                </p>
+                                <textarea
+                                  className="edit-draft-textarea"
+                                  rows={3}
+                                  placeholder='e.g. "make it shorter" or "mention the Calendly link"'
+                                  value={draftEditInstruction}
+                                  onChange={(e) => setDraftEditInstruction(e.target.value)}
+                                />
+                                {draftReviseError && <p className="error-text">{draftReviseError}</p>}
+                                <div className="action-row">
+                                  <button
+                                    type="button"
+                                    className="mint"
+                                    onClick={() => handleReviseDraft(draft.message_id)}
+                                    disabled={draftRevising || !draftEditInstruction.trim()}
+                                  >
+                                    {draftRevising ? "Updating…" : "Update reply"}
+                                  </button>
+                                  <button type="button" onClick={() => setDraftEditOpen(null)} disabled={draftRevising}>
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+
+                            <div className="action-row">
+                              <button
+                                type="button"
+                                className="mint"
+                                disabled={busy || redraftingThis}
+                                onClick={() => handleSendDraft(draft.message_id)}
+                              >
+                                <Icon name="send" size={14} />
+                                {busy ? "Sending…" : "Approve & send"}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy || redraftingThis}
+                                onClick={() => handleDiscardDraft(draft.message_id)}
+                              >
+                                Discard
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* A tick already drafts a reply automatically for every
+                      new inbound message when the agent is on -- this only
+                      shows up when that automatic attempt genuinely failed
+                      (an LLM error/timeout) or never ran (the agent was off
+                      when the reply arrived), AND the latest inbound message
+                      hasn't already been answered by something sent. */}
+                  {thread
+                    && thread.pending_drafts.length === 0
+                    && (() => {
+                      const lastInbound = [...thread.messages].reverse().find((m) => m.direction === "inbound");
+                      if (!lastInbound) return null;
+                      const answered = thread.messages.some(
+                        (m) => m.direction === "outbound" && !m.draft_pending
+                          && (m.created_at || "") > (lastInbound.created_at || ""),
+                      );
+                      return answered ? null : lastInbound;
+                    })() && (
+                    <div className="drawer-panel">
+                      <p className="hint">
+                        {convSettings?.enabled
+                          ? "The automatic draft for this reply didn't come through — try again, or write one now."
+                          : "The Conversation Agent is off, so no reply was drafted automatically. Draft one now, or switch the agent on above."}
+                      </p>
+                      {draftError && <p className="error-text">{draftError}</p>}
+                      <div className="action-row">
+                        <button type="button" className="mint" onClick={handleDraftReply} disabled={drafting}>
+                          <Icon name="sparkle" size={14} />
+                          {drafting ? "Drafting…" : "Draft a reply"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {convOpen && thread && thread.messages.length > 0 && (
+                    <div className="conv-thread">
+                      {thread.messages.map((message) => {
+                        const hasQuote = message.direction === "inbound" && message.body !== message.clean_body;
+                        const expanded = expandedQuotes.has(message.message_id);
+                        return (
+                          <div
+                            key={message.message_id}
+                            className={`conv-msg conv-msg--${message.direction}`}
+                          >
+                            <div className="conv-msg-head">
+                              <span className="conv-msg-who">
+                                {message.direction === "inbound"
+                                  ? message.from_email || "Them"
+                                  : "You"}
+                              </span>
+                              {message.intent && (
+                                <span className={`conv-intent conv-intent--${INTENT_TONE[message.intent]}`}>
+                                  {INTENT_LABEL[message.intent]}
+                                </span>
+                              )}
+                              {message.draft_pending && <span className="conv-intent conv-intent--amber">Draft</span>}
+                              <span className="conv-msg-time">
+                                {message.received_at || message.sent_at || message.created_at
+                                  ? new Date(
+                                      (message.received_at || message.sent_at || message.created_at) as string,
+                                    ).toLocaleString()
+                                  : ""}
+                              </span>
+                            </div>
+                            {message.subject && <p className="conv-msg-subject">{message.subject}</p>}
+                            <div className="conv-msg-body">
+                              {expanded ? message.body : message.clean_body}
+                            </div>
+                            {hasQuote && (
+                              <button
+                                type="button"
+                                className="conv-msg-quote-toggle"
+                                onClick={() => toggleQuote(message.message_id)}
+                              >
+                                {expanded ? "Hide quoted text" : "Show full quote"}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {thread && thread.followup_count > 0 && (
+                    <p className="hint">
+                      {thread.followup_count} follow-up{thread.followup_count === 1 ? "" : "s"} sent
+                      {convSettings ? ` of ${convSettings.max_followups} allowed` : ""}.
+                    </p>
+                  )}
+
+                  {/* The original outreach email, collapsed by default here
+                      -- it's the conversation's starting context, not what
+                      needs attention right now, so it reads below the
+                      replies instead of above them. */}
+                  <button
+                    type="button"
+                    className="drawer-section-action"
+                    style={{ marginBottom: 10 }}
+                    onClick={() => setOriginalMessageOpen((v) => !v)}
+                  >
+                    <Icon name={originalMessageOpen ? "close" : "mail"} size={12} />
+                    {originalMessageOpen ? "Hide original message" : "Show original message"}
+                  </button>
+                  {originalMessageOpen && originalMessageBlock}
+
                   <h3 className="drawer-section-title">Advance stage</h3>
                   <div className="drawer-panel">
                     <p className="hint">
-                      Manual for now — this agent's job stops at Sent. Set by a person until a reply-tracking
-                      agent exists.
+                      {convSettings?.enabled
+                        ? "The Conversation Agent moves these automatically as replies come in — you can always override it here."
+                        : "The Conversation Agent is off, so these are yours to set — here, or by dragging the card on the board."}
                     </p>
+                    <div className="action-row">
+                      {MANUAL_STAGES.map((stage) => (
+                        <button
+                          key={stage}
+                          type="button"
+                          disabled={selected.stage === stage}
+                          onClick={() => advanceStage(selected, stage)}
+                        >
+                          {STAGE_LABEL[stage]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {selected.stage === "failed" && (
+                <>
+                  <h3 className="drawer-section-title">Advance stage</h3>
+                  <div className="drawer-panel">
+                    <p className="hint">This send failed. Set a stage manually if you followed up another way.</p>
                     <div className="action-row">
                       {MANUAL_STAGES.map((stage) => (
                         <button

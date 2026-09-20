@@ -4612,3 +4612,207 @@ button.ghost:hover:not(:disabled) {
   color: var(--text-dim);
 }
 
+
+/* ===========================================================================
+   Conversation Agent (Agent 3)
+   The ON/OFF toggle in the campaign header, and the thread view in the item
+   drawer. See Dashboard/src/pages/outreach/CampaignDetail.tsx.
+   =========================================================================== */
+
+.conv-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 12px 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.conv-switch {
+  flex-shrink: 0;
+  width: 36px;
+  height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-sunken);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.conv-switch:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.conv-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: var(--shadow-xs);
+  transition: transform 0.15s ease;
+}
+
+.conv-switch--on {
+  background: var(--mint);
+  border-color: var(--mint-deep);
+}
+
+.conv-switch--on .conv-switch-knob {
+  transform: translateX(16px);
+}
+
+.conv-toggle-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.conv-toggle-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.conv-toggle-state {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* --- the thread ---------------------------------------------------------- */
+
+.conv-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.conv-msg {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+/* Inbound sits flush left with an accent edge, outbound is indented and
+   sunken -- so who said what is readable at a glance without labels. */
+.conv-msg--inbound {
+  border-left: 3px solid var(--accent);
+}
+
+.conv-msg--outbound {
+  background: var(--surface-sunken);
+  margin-left: 18px;
+}
+
+.conv-msg-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 5px;
+}
+
+.conv-msg-who {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.conv-msg-time {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.conv-msg-subject {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+.conv-msg-body {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Reveals the untouched full body (quoted original included) beneath an
+   inbound message whose clean_body differs from it -- off by default so the
+   thread reads as a conversation, not a stack of nested quotes. */
+.conv-msg-quote-toggle {
+  margin-top: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.conv-msg-quote-toggle:hover {
+  text-decoration: underline;
+}
+
+/* --- intent chips -------------------------------------------------------- */
+
+.conv-intent {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.conv-intent--mint {
+  background: var(--mint-soft);
+  border-color: var(--mint-border);
+  color: var(--mint-deep);
+}
+
+.conv-intent--violet {
+  background: #f0eefe;
+  border-color: #dcd8fb;
+  color: #6f63f2;
+}
+
+.conv-intent--amber {
+  background: var(--amber-soft);
+  border-color: var(--amber-border);
+  color: var(--amber);
+}
+
+/* out_of_office and bounce: mail arrived but nobody replied, and the card
+   deliberately did not move -- muted so it never reads as engagement. */
+.conv-intent--dim {
+  background: var(--surface-sunken);
+  border-color: var(--border);
+  color: var(--text-faint);
+}
+
+/* --- pending drafts ------------------------------------------------------ */
+
+.conv-draft + .conv-draft {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--amber-border);
+}
+
+.conv-draft .drawer-subject-line {
+  margin-bottom: 6px;
+}
+
+.conv-draft .action-row {
+  margin-top: 10px;
+}

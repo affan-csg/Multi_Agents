@@ -13,6 +13,8 @@ _KEYS = {
     "campaigns": ("campaign_id",),
     "outreach_items": ("item_id",),
     "outreach_events": ("event_id",),
+    "conversation_settings": ("campaign_id",),
+    "conversation_messages": ("message_id",),
 }
 
 _UNIQUE = {
@@ -20,6 +22,14 @@ _UNIQUE = {
     # create_item's on_conflict -- mirrored here so upsert-by-alt-key works.
     "outreach_items": ("campaign_id", "research_domain"),
 }
+
+
+def _as_text(value: Any) -> str:
+    """Render a value the way PostgREST would compare it in a filter --
+    booleans as lowercase 'true'/'false', everything else via str()."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 class FakeConn:
@@ -61,10 +71,23 @@ class FakeConn:
         for field, expr in filters.items():
             if expr.startswith("eq."):
                 want = expr[3:]
-                rows = [r for r in rows if str(r.get(field)) == want]
+                # PostgREST compares booleans as 'true'/'false' text; Python
+                # stringifies them as 'True'/'False'. Normalize so the
+                # conversation agent's enabled=eq.true filters work here.
+                rows = [r for r in rows if _as_text(r.get(field)) == want]
             elif expr.startswith("in."):
-                wanted = set(expr[4:-1].split(","))
+                wanted = set(expr[3:].strip("()").split(","))
                 rows = [r for r in rows if str(r.get(field)) in wanted]
+            elif expr == "is.null":
+                rows = [r for r in rows if r.get(field) is None]
+            elif expr == "not.is.null":
+                rows = [r for r in rows if r.get(field) is not None]
+            elif expr.startswith("lt."):
+                want = expr[3:]
+                rows = [r for r in rows if r.get(field) is not None and str(r.get(field)) < want]
+            elif expr.startswith("gt."):
+                want = expr[3:]
+                rows = [r for r in rows if r.get(field) is not None and str(r.get(field)) > want]
         if order:
             field = order.split(".")[0]
             desc = "desc" in order
@@ -74,6 +97,17 @@ class FakeConn:
     def update(self, table: str, values: dict[str, Any], **filters: str) -> None:
         for row in self.select(table, **filters):
             row.update(values)
+
+    def update_returning(self, table: str, values: dict[str, Any], **filters: str) -> list[dict[str, Any]]:
+        """PATCH reporting which rows it matched -- the real SupabaseConn's
+        `Prefer: return=representation`. The conversation agent's advisory
+        lock is a conditional PATCH whose whole point is distinguishing "I
+        won the lock" from "someone else holds it", so the fake has to model
+        the matched-row count, not just the write."""
+        matched = self.select(table, **filters)
+        for row in matched:
+            row.update(values)
+        return [dict(r) for r in matched]
 
     def delete(self, table: str, **filters: str) -> None:
         rows = self.select(table, **filters)

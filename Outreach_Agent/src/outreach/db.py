@@ -21,7 +21,14 @@ import httpx
 from dotenv import load_dotenv
 
 from .config import PROJECT_ROOT
-from .models import Campaign, ImportedProspect, OutreachEvent, OutreachItem
+from .models import (
+    Campaign,
+    ConversationMessage,
+    ConversationSettings,
+    ImportedProspect,
+    OutreachEvent,
+    OutreachItem,
+)
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -87,6 +94,21 @@ class SupabaseConn:
 
     def update(self, table: str, data: dict[str, Any], **filters: Any) -> None:
         self._check(self._client.patch(f"/{table}", params=filters, json=data))
+
+    def update_returning(self, table: str, data: dict[str, Any], **filters: Any) -> list[dict[str, Any]]:
+        """PATCH that reports which rows it actually matched.
+
+        `update` discards that, which is fine for unconditional writes but
+        useless for a conditional one: the Conversation Agent's advisory lock
+        works by PATCHing a row only while `conversation_locked_at=is.null`,
+        and needs to know whether it won that race or another tick got there
+        first. An empty list means the filter matched nothing -- i.e. the
+        lock was already held."""
+        r = self._check(self._client.patch(
+            f"/{table}", params=filters,
+            headers={"Prefer": "return=representation"}, json=data,
+        ))
+        return r.json() if r.content else []
 
     def delete(self, table: str, **filters: Any) -> None:
         self._check(self._client.delete(f"/{table}", params=filters))
@@ -283,3 +305,137 @@ def add_event(conn: SupabaseConn, e: OutreachEvent) -> None:
 def list_events(conn: SupabaseConn, item_id: str) -> list[OutreachEvent]:
     rows = conn.select("outreach_events", item_id=f"eq.{item_id}", order="created_at.asc")
     return [OutreachEvent(**r) for r in rows]
+
+
+# --- conversation settings (the per-campaign ON/OFF toggle) ------------------
+
+def get_conversation_settings(conn: SupabaseConn, campaign_id: str) -> Optional[ConversationSettings]:
+    """The campaign's settings row, or None if it was never configured.
+
+    None is meaningful, not an error: the caller (conversation.settings
+    .get_settings) turns it into a disabled default. The Conversation Agent
+    is opt-in per campaign, so "no row" and "enabled=false" must behave
+    identically."""
+    rows = conn.select("conversation_settings", campaign_id=f"eq.{campaign_id}", limit=1)
+    return ConversationSettings(**rows[0]) if rows else None
+
+
+def upsert_conversation_settings(conn: SupabaseConn, s: ConversationSettings) -> None:
+    row = s.model_dump(mode="json")
+    row["updated_at"] = _iso(s.updated_at or utcnow())
+    conn.upsert("conversation_settings", [row], on_conflict="campaign_id")
+
+
+def list_enabled_conversation_campaigns(conn: SupabaseConn) -> list[str]:
+    """Campaign ids with the Conversation Agent switched on. Used by the
+    all-campaigns tick so it never even loads items belonging to a campaign
+    that has the agent off."""
+    rows = conn.select("conversation_settings", enabled="eq.true")
+    return [r["campaign_id"] for r in rows]
+
+
+# --- conversation messages (the thread; append-only) -------------------------
+
+def add_conversation_message(conn: SupabaseConn, m: ConversationMessage) -> bool:
+    """Append one message to an item's thread.
+
+    Returns True if it was stored, False if an identical one was already
+    there. Deduplication is by (item_id, provider_message_id) -- the UNIQUE
+    constraint in schema.sql -- which is what makes reply ingestion
+    idempotent: the same email read off IMAP on ten consecutive ticks
+    produces one row, gets classified once, and moves the card once.
+
+    The check is done as a read-then-insert rather than relying on the
+    constraint to raise, so that a duplicate is an ordinary, expected
+    outcome the engine can count, not an exception it has to catch and
+    interpret."""
+    if m.provider_message_id:
+        existing = conn.select(
+            "conversation_messages",
+            item_id=f"eq.{m.item_id}",
+            provider_message_id=f"eq.{m.provider_message_id}",
+            limit=1,
+        )
+        if existing:
+            return False
+
+    row = m.model_dump(mode="json")
+    row["created_at"] = _iso(m.created_at or utcnow())
+    conn.insert("conversation_messages", [row])
+    return True
+
+
+def list_conversation_messages(conn: SupabaseConn, item_id: str) -> list[ConversationMessage]:
+    rows = conn.select("conversation_messages", item_id=f"eq.{item_id}", order="created_at.asc")
+    return [ConversationMessage(**r) for r in rows]
+
+
+def get_conversation_message(conn: SupabaseConn, message_id: str) -> Optional[ConversationMessage]:
+    rows = conn.select("conversation_messages", message_id=f"eq.{message_id}", limit=1)
+    return ConversationMessage(**rows[0]) if rows else None
+
+
+def update_conversation_message(conn: SupabaseConn, message_id: str, **fields: Any) -> None:
+    conn.update("conversation_messages", fields, message_id=f"eq.{message_id}")
+
+
+def list_pending_drafts(conn: SupabaseConn, item_id: str) -> list[ConversationMessage]:
+    """Replies the agent composed but did not send (auto_reply off), waiting
+    for a person to approve them."""
+    rows = conn.select(
+        "conversation_messages",
+        item_id=f"eq.{item_id}", direction="eq.outbound", draft_pending="eq.true",
+        order="created_at.asc",
+    )
+    return [ConversationMessage(**r) for r in rows]
+
+
+# --- conversation item locking ----------------------------------------------
+
+def claim_conversation_lock(conn: SupabaseConn, item_id: str, *, stale_before: datetime) -> bool:
+    """Try to take the advisory lock on an item. True if this caller won it.
+
+    Two ticks running at once (a manual "Check replies" click landing on top
+    of a CLI tick, say) must not both process the same item -- that is how
+    you get two follow-ups sent for one silence. The claim is a single
+    conditional PATCH: it only matches rows whose lock is null OR older than
+    `stale_before`, so exactly one concurrent caller can succeed, and a lock
+    stranded by a crashed tick becomes reclaimable rather than permanent.
+
+    PostgREST has no OR across two filters on one column, so the two cases
+    are attempted as two statements -- both are conditional, so neither can
+    steal a live lock."""
+    now = _iso(utcnow())
+
+    won = conn.update_returning(
+        "outreach_items", {"conversation_locked_at": now},
+        item_id=f"eq.{item_id}", conversation_locked_at="is.null",
+    )
+    if won:
+        return True
+
+    won = conn.update_returning(
+        "outreach_items", {"conversation_locked_at": now},
+        item_id=f"eq.{item_id}", conversation_locked_at=f"lt.{_iso(stale_before)}",
+    )
+    return bool(won)
+
+
+def release_conversation_lock(conn: SupabaseConn, item_id: str) -> None:
+    conn.update("outreach_items", {"conversation_locked_at": None}, item_id=f"eq.{item_id}")
+
+
+def list_conversation_items(conn: SupabaseConn, campaign_id: str, stages: list[str]) -> list[OutreachItem]:
+    """Items in a campaign that belong to the Conversation Agent.
+
+    `stages` is always models.CONVERSATION_STAGES -- the filter is applied in
+    the query itself, so items in pending/needs_review/failed are never
+    loaded at all. That is the structural guarantee that this agent cannot
+    touch work the Outreach Agent still owns."""
+    rows = conn.select(
+        "outreach_items",
+        campaign_id=f"eq.{campaign_id}",
+        stage=f"in.({','.join(stages)})",
+        order="created_at.desc",
+    )
+    return [OutreachItem(**r) for r in rows]

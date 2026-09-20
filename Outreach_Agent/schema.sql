@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS prospects (
     pain_summary        TEXT,                   -- from Research's qualify step, if present
     recommended_angle   TEXT,                   -- from Research's qualify step, if present
     open_reqs           JSONB,                  -- sample of open reqs, for personalization context
+    -- 'confirmed' | 'unknown' | NULL -- whether an empty open_reqs means a
+    -- job board/careers page was actually read and found empty, or every
+    -- discovery method failed and the true count is simply unknown. See
+    -- Research_Agent's models.HiringSignal and this project's
+    -- ImportedProspect.hiring_signal / personalize._render_open_reqs.
+    hiring_signal       TEXT,
     -- Best contact only (email required by Research's own outreach_ready
     -- gate -- see Research_Agent/src/csg/models.py Prospect.compute_outreach_flags).
     -- If Research later returns multiple contacts worth messaging separately,
@@ -115,3 +121,101 @@ CREATE TABLE IF NOT EXISTS outreach_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_item ON outreach_events(item_id);
+
+-- ===========================================================================
+-- CONVERSATION AGENT (Agent 3)
+--
+-- Everything below is ADDITIVE -- it does not alter or re-key any table
+-- above. The Conversation Agent runs in the SAME Supabase project as the
+-- Outreach Agent (deliberately, unlike the Research/Outreach split) because
+-- it operates on the very same outreach_items rows: it owns the stages the
+-- Outreach Agent explicitly does not (sent -> waiting -> replied -> booked),
+-- while the Outreach Agent keeps owning needs_review/pending -> sent/failed.
+-- Ownership is by STAGE, not by table, which is what keeps the two agents
+-- from racing each other -- see src/outreach/conversation/engine.py.
+--
+-- Re-running this whole file on an existing project is safe: every statement
+-- below is IF NOT EXISTS / ADD COLUMN IF NOT EXISTS.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- conversation_settings: the per-campaign ON/OFF toggle and the agent's
+-- behavior knobs. One row per campaign; absence of a row means "never
+-- configured", which reads as DISABLED (see conversation/settings.py
+-- get_settings) -- the agent is strictly opt-in per campaign and can never
+-- start acting on a campaign nobody switched it on for.
+--
+-- `enabled` OFF must be a pure no-op, not a teardown: toggling it off leaves
+-- every row here and in conversation_messages untouched, so turning it back
+-- on resumes from the recorded state rather than replaying history.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS conversation_settings (
+    campaign_id         TEXT PRIMARY KEY REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    enabled             BOOLEAN NOT NULL DEFAULT false,  -- master switch; false = agent does nothing at all
+    -- Second, independent switch. Even with enabled=true the agent only
+    -- DRAFTS replies unless this is also true -- detection, classification,
+    -- stage moves and follow-up scheduling all happen, but no reply email
+    -- leaves the building without a person clicking send. Deliberately
+    -- separate from `enabled` so "let the agent watch the inbox" and "let
+    -- the agent talk to prospects unattended" are two different decisions.
+    auto_reply          BOOLEAN NOT NULL DEFAULT false,
+    followup_after_days INT NOT NULL DEFAULT 3,          -- sent -> waiting once this much silence has passed
+    max_followups       INT NOT NULL DEFAULT 2,          -- hard cap on nudges per item, never exceeded
+    updated_at          TIMESTAMPTZ NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
+-- conversation_messages: the full two-way history for an item -- every
+-- inbound reply read off IMAP and every outbound message (the original
+-- outreach, follow-ups, and replies). Append-only; nothing here is ever
+-- UPDATEd or DELETEd except by the item's own ON DELETE CASCADE.
+--
+-- UNIQUE (item_id, provider_message_id) is the single most important
+-- constraint in this file: it is what makes reply ingestion idempotent.
+-- IMAP has no reliable "already read this" guarantee across sessions
+-- (flags can be reset, a mailbox can be re-synced, a tick can crash
+-- mid-way), so the agent re-reads freely and lets this constraint reject
+-- duplicates instead of trying to track read-state itself. The same
+-- physical email seen ten times produces exactly one row, one
+-- classification, and one stage transition.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    message_id          TEXT PRIMARY KEY,
+    item_id             TEXT NOT NULL REFERENCES outreach_items(item_id) ON DELETE CASCADE,
+    direction           TEXT NOT NULL,   -- 'inbound' (prospect -> us) | 'outbound' (us -> prospect)
+    provider_message_id TEXT,            -- RFC 5322 Message-ID; the dedupe key paired with item_id
+    in_reply_to         TEXT,            -- RFC 5322 In-Reply-To, how an inbound mail is threaded back to us
+    subject             TEXT,
+    body                TEXT,
+    from_email          TEXT,
+    to_email            TEXT,
+    -- Classifier output, inbound rows only: 'interested' | 'booked' |
+    -- 'not_interested' | 'out_of_office' | 'bounce' | 'unclear'.
+    -- NULL on outbound rows and on inbound rows not yet classified.
+    intent              TEXT,
+    -- Set on an outbound row that the agent composed but did NOT send
+    -- (auto_reply off). A person sends it from the UI, which clears this.
+    draft_pending       BOOLEAN NOT NULL DEFAULT false,
+    sent_at             TIMESTAMPTZ,
+    received_at         TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL,
+    UNIQUE (item_id, provider_message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conv_msgs_item      ON conversation_messages(item_id);
+CREATE INDEX IF NOT EXISTS idx_conv_msgs_direction ON conversation_messages(direction);
+
+-- ---------------------------------------------------------------------------
+-- outreach_items additions, for the Conversation Agent only. The Outreach
+-- Agent never reads or writes these three, so adding them cannot change any
+-- existing behavior.
+--
+-- conversation_locked_at is an advisory lock: the engine claims an item by
+-- PATCHing this from NULL to now() and releases it afterwards, so two
+-- overlapping ticks can never both act on the same item. A lock older than
+-- the staleness window is reclaimable, so a crashed tick cannot strand an
+-- item forever.
+-- ---------------------------------------------------------------------------
+ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS followup_count         INT NOT NULL DEFAULT 0;
+ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS last_inbound_at        TIMESTAMPTZ;
+ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS conversation_locked_at TIMESTAMPTZ;

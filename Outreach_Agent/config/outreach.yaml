@@ -64,16 +64,49 @@ personalization:
     Career Source Group LLC
     Alpharetta, Georgia
     https://careersourcegroup.com/
+  # Conversation Agent only (conversation/responder.py's reply prompt, not
+  # the cold-outreach prompts above): the scheduling link an `interested`
+  # reply offers once the prospect has been answered. The end goal of a
+  # conversation reply is a booked call, and a self-serve link is the
+  # lowest-friction way to get there -- set this to a real Calendly (or
+  # equivalent) URL before relying on auto_reply for real conversations.
+  # Left blank, the reply asks the prospect for a few times that work
+  # instead of linking anywhere.
+  calendly_url: ""
 
 # --- Pipeline stages --------------------------------------------------------
-# Documented here for the UI/API; this agent only ever writes
-# needs_review/pending -> sent (or failed on a send error). The remaining
-# stages are informational and are set by a person (or, later, a separate
-# reply-tracking agent), via either the item drawer's stage buttons or
-# dragging a card between kanban columns in the Dashboard -- both call the
-# same API. This list is documentation only -- the authoritative order is
-# Stage/STAGE_ORDER in src/outreach/models.py; not kept byte-for-byte synced.
+# Documented here for the UI/API; the Outreach Agent only ever writes
+# needs_review/pending -> sent (or failed on a send error). Everything after
+# Sent belongs to the Conversation Agent when it is switched on for a
+# campaign, and to a person otherwise (the item drawer's stage buttons or
+# dragging a kanban card -- both call the same API, and both keep working
+# whether or not the agent is on). This list is documentation only -- the
+# authoritative order is Stage/STAGE_ORDER in src/outreach/models.py, and the
+# ownership split is OUTREACH_STAGES/CONVERSATION_STAGES there.
 stages:
   order: [needs_review, pending, sent, waiting, replied, booked]
   owned_by_this_agent: [needs_review, pending, sent, failed]
-  manual_or_future_agent: [waiting, replied, booked]
+  owned_by_conversation_agent: [waiting, replied, booked]
+
+# --- Conversation Agent (Agent 3) -------------------------------------------
+# Defaults for a campaign that has never been configured. The real switch is
+# per campaign and lives in the database (conversation_settings), set from the
+# Dashboard toggle or `outreach conversation enable/disable` -- these values
+# only describe what a brand-new campaign starts as.
+#
+# Both switches default OFF, and they are independent on purpose:
+#   enabled    -- the master switch. Off = the agent does nothing at all.
+#   auto_reply -- whether it may SEND what it drafts. Off = it detects
+#                 replies, classifies them, moves cards and writes drafts,
+#                 but every outgoing email waits for a person to approve it.
+# So switching the agent on never, by itself, emails a prospect.
+conversation:
+  enabled: false
+  auto_reply: false
+  # Silence after which a `sent` item moves to `waiting` (No Reply) -- the
+  # comparison is against exact elapsed time since sent_at (see
+  # followup.days_since), not a calendar-day boundary, so 1 here means
+  # precisely 24 hours after the send, not "the next day arrives".
+  followup_after_days: 1
+  max_followups: 2           # hard cap on nudges per prospect
+  imap_lookback_days: 14     # how far back each inbox check reads

@@ -79,7 +79,12 @@ of the two backends above isn't running yet — start it and refresh.
   QA, see below), Campaign Detail (Kanban pipeline board: Needs Review →
   Pending → Sent → Waiting → Replied → Booked; cards from Sent onward are
   drag-and-drop between columns, in addition to the item drawer's stage
-  buttons — both paths call the same API).
+  buttons — both paths call the same API; the drawer's Conversation section
+  shows the reply thread, a pending draft to approve/redraft/edit, and the
+  original outreach message collapsed below it), and Bookings (every prospect
+  currently `booked`, pooled across every campaign, from `GET /bookings` —
+  row click opens the account's Calendly page when one is configured, the
+  campaign otherwise).
 - `src/components/` — shared UI (`ui.tsx` design system, Nav, drawers,
   modals) — one visual system for every agent's pages.
 - `App.css`/`index.css` — the shared design system's styles,

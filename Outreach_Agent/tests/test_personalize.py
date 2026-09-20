@@ -19,8 +19,15 @@ from outreach.personalize import DraftedMessage, _render_open_reqs, draft_messag
 
 @pytest.fixture(autouse=True)
 def _no_llm_keys(monkeypatch):
+    # All three tiers _call_llm tries (see personalize.py's module
+    # docstring) -- a real key for any of them in the environment (e.g. a
+    # developer's own .env) would otherwise make these "no LLM available"
+    # tests silently exercise a live API call instead of the fallback path
+    # under test.
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY_2", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
 
 
 def test_falls_back_to_template_when_truly_no_research_data():

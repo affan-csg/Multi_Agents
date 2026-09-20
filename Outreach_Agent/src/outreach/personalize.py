@@ -1,8 +1,11 @@
 """Message personalization: draft a subject + body for one outreach item from
 its cached prospect data.
 
-Same LLM-backend convention as the Research Agent's qualify.py: Gemini tried
-first if GEMINI_API_KEY is set, else Anthropic.
+Same LLM-backend convention as the Research Agent's qualify.py, extended with
+a third tier: Gemini tried first if GEMINI_API_KEY is set (rotating through
+GEMINI_API_KEY_2, _3, ... on a daily-quota 429 -- see gemini_keys.py), then
+Anthropic, then Groq (plain text, no search) as a last LLM resort before the
+caller's own non-LLM fallback. See _call_llm.
 
 `pain_summary`/`recommended_angle` come from the Research Agent's *optional*
 `csg qualify` step, which runs separately from scoring/discovery and can
@@ -44,6 +47,7 @@ from typing import Any, Optional
 import httpx
 
 from .config import PROJECT_ROOT, Config
+from .gemini_keys import GeminiKeyPool, is_daily_quota_exhausted
 from .models import ImportedProspect
 
 _PROMPT_PATH = PROJECT_ROOT / "prompts" / "outreach_email.md"
@@ -257,6 +261,37 @@ def _call_gemini(prompt: str) -> Optional[str]:
     return resp.text
 
 
+def _call_gemini_with_key_pool(prompt: str) -> Optional[str]:
+    """Try every configured Gemini key (GEMINI_API_KEY, GEMINI_API_KEY_2,
+    ...) in order, advancing only when a key's *daily* quota is exhausted --
+    see gemini_keys.py's module docstring. Re-raises anything else (a real
+    error, or a per-minute rate limit worth backing off on rather than
+    burning through the pool) so _call_llm's own except/fallback handles it
+    the same way a single-key failure always has.
+
+    Returns None only if every configured key's quota is exhausted; raises
+    (rather than silently returning None) for the first non-quota failure,
+    same contract as _call_gemini."""
+    from google import genai
+
+    pool = GeminiKeyPool.from_env()
+    last_quota_exc: Optional[Exception] = None
+    for attempt in pool.attempts():
+        try:
+            client = genai.Client(api_key=attempt.key)
+            resp = client.models.generate_content(model="gemini-3.6-flash", contents=prompt)
+            return resp.text
+        except Exception as exc:
+            if not is_daily_quota_exhausted(exc):
+                raise
+            last_quota_exc = exc
+            continue  # this key's daily quota is gone -- try the next one
+
+    if last_quota_exc is not None:
+        return None  # every configured key exhausted -- caller falls through to Anthropic
+    return None  # no Gemini key at all
+
+
 def _call_anthropic(prompt: str) -> Optional[str]:
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -318,6 +353,37 @@ def _tavily_search(company_query: str) -> list[dict[str, Any]]:
         return []
 
 
+def _call_groq_plain(prompt: str) -> Optional[str]:
+    """Plain text completion via Groq, no Tavily/search attached -- a third
+    independent LLM tier for _call_llm, alongside Gemini and Anthropic.
+    Unlike _call_groq_with_tavily (used only by the redraft "go find more
+    information" tier, where a live web search is the point), this is for
+    prompts that are already fully self-contained -- a conversation reply
+    answering a thread the caller has already assembled, for instance --
+    where no search is needed or wanted, just a third provider to try when
+    Gemini and Anthropic both fail (quota exhausted, no credit, an outage).
+    Requires GROQ_API_KEY; returns None (the caller's next/last fallback)
+    if it's unset or the call fails for any reason."""
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if not groq_key:
+        return None
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(_GROQ_URL, headers={
+                "Authorization": f"Bearer {groq_key}",
+                "Content-Type": "application/json",
+            }, json={
+                "model": _GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.4,
+            })
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
 def _call_groq_with_tavily(prompt: str, prospect: ImportedProspect) -> Optional[str]:
     """Search-augmented drafting via Tavily + Groq, independent of both
     Gemini and Anthropic -- see module docstring. Tavily searches for the
@@ -372,13 +438,45 @@ def _sender_signature(cfg: Config) -> str:
 
 
 def _call_llm(prompt: str) -> Optional[str]:
-    try:
-        if os.environ.get("GEMINI_API_KEY"):
-            return _call_gemini(prompt)
-        elif os.environ.get("ANTHROPIC_API_KEY"):
-            return _call_anthropic(prompt)
-    except Exception:
-        return None  # any LLM/network failure falls through to the caller's fallback
+    """Three independent tiers, in order -- a genuine fallback chain, not
+    just "whichever key happens to be set":
+
+      1. Every configured Gemini key (GEMINI_API_KEY, GEMINI_API_KEY_2, ...)
+         -- see gemini_keys.py for the key-pool/quota-rotation logic.
+      2. Anthropic.
+      3. Groq (plain text completion, no search attached).
+
+    Each tier can fail for reasons that have nothing to do with the prompt
+    itself -- a free-tier quota exhausted, an account out of credit, a
+    transient outage -- while a later tier is configured and healthy.
+    Previously a Gemini failure returned None immediately without ever
+    trying anything else, silently dropping to the caller's non-LLM
+    fallback (a static template, for a cold-outreach draft; an error
+    surfaced to the user, for a conversation reply) even when a working
+    provider was sitting right there unused. Groq specifically matters here
+    because it is billed and rate-limited completely independently of
+    Google/Anthropic, so it is the one tier likely to still be up when both
+    of the others are simultaneously exhausted (observed during this
+    project's own testing)."""
+    if os.environ.get("GEMINI_API_KEY"):
+        try:
+            text = _call_gemini_with_key_pool(prompt)
+            if text:
+                return text
+        except Exception:
+            pass  # try Anthropic next, if configured, rather than giving up here
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            text = _call_anthropic(prompt)
+            if text:
+                return text
+        except Exception:
+            pass  # try Groq next, if configured, rather than giving up here
+
+    if os.environ.get("GROQ_API_KEY"):
+        return _call_groq_plain(prompt)
+
     return None
 
 

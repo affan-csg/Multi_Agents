@@ -12,11 +12,12 @@ export type Route =
   | { name: "outreach-prospects" }
   | { name: "outreach-campaigns" }
   | { name: "outreach-campaign"; campaignId: string; campaignName?: string | null }
+  | { name: "outreach-bookings" }
   | { name: "outreach-analytics" };
 
 const SIMPLE_ROUTES = [
   "research-runs", "research-saved", "research-contacts", "research-analytics", "research-settings",
-  "outreach-prospects", "outreach-campaigns", "outreach-analytics",
+  "outreach-prospects", "outreach-campaigns", "outreach-bookings", "outreach-analytics",
 ] as const;
 
 // Campaign URLs are `/outreach/campaigns/{slug}-{uuid}` -- the UUID is the
@@ -100,6 +101,8 @@ export function routeToPath(route: Route): string {
       return "/outreach/campaigns";
     case "outreach-prospects":
       return "/outreach/prospects";
+    case "outreach-bookings":
+      return "/outreach/bookings";
     case "outreach-analytics":
       return "/outreach/analytics";
   }

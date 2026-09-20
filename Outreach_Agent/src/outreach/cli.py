@@ -6,9 +6,11 @@ of those into a new campaign. `campaign send` drafts + sends email for every
 pending item in a campaign. `pipeline` (Overview table) reads what's already
 been sent -- no API calls.
 
-This agent's job stops at Sent -- there is no `reply`/`book` command here by
-design; those stages are set manually (`item set-stage`) or by a future
-reply-tracking agent.
+The Outreach Agent's own job stops at Sent. Everything after that belongs to
+the Conversation Agent (`conversation` commands below, see
+src/outreach/conversation/), which is off by default per campaign -- until it
+is switched on, waiting/replied/booked are set by hand via `item set-stage`
+or the Dashboard board, exactly as before.
 """
 
 from __future__ import annotations
@@ -26,8 +28,10 @@ from .config import load_config
 app = typer.Typer(add_completion=False, help="CSG Outreach Agent")
 campaign_app = typer.Typer(add_completion=False, help="Manage outreach campaigns")
 item_app = typer.Typer(add_completion=False, help="Manage individual outreach items")
+conversation_app = typer.Typer(add_completion=False, help="Conversation Agent (replies, follow-ups)")
 app.add_typer(campaign_app, name="campaign")
 app.add_typer(item_app, name="item")
+app.add_typer(conversation_app, name="conversation")
 
 console = Console()
 
@@ -182,8 +186,10 @@ def item_set_stage(
     item_id: str = typer.Argument(...),
     stage: str = typer.Argument(..., help="waiting|replied|booked (pending/sent/failed are agent-owned)"),
 ) -> None:
-    """Manually advance an item past 'sent' -- this agent has no automated
-    reply detection; use this (or the UI) until a reply-tracking agent exists."""
+    """Manually advance an item past 'sent', as a person.
+
+    Always available, whether or not the Conversation Agent is switched on
+    for the campaign -- a person's move always overrides the agent's."""
     if stage not in ("waiting", "replied", "booked"):
         console.print("[red]only waiting/replied/booked can be set manually here[/red]")
         raise typer.Exit(1)
@@ -191,6 +197,127 @@ def item_set_stage(
     try:
         db.set_stage(conn, item_id, stage, actor="user")
         console.print(f"[green]{item_id}[/green] -> {stage}")
+    finally:
+        conn.close()
+
+
+# ----------------------------------------------------------------------------
+# Conversation Agent -- see src/outreach/conversation/
+# ----------------------------------------------------------------------------
+
+@conversation_app.command("status")
+def conversation_status(campaign_id: str = typer.Argument(...)) -> None:
+    """Show whether the Conversation Agent is on for a campaign, and how it
+    is configured."""
+    from .conversation.settings import get_settings
+
+    conn = db.connect()
+    try:
+        s = get_settings(conn, campaign_id)
+        t = Table(title=f"Conversation Agent -- {campaign_id}")
+        t.add_column("setting")
+        t.add_column("value")
+        t.add_row("enabled", "[green]ON[/green]" if s.enabled else "[dim]OFF[/dim]")
+        t.add_row("auto_reply", "[yellow]ON[/yellow]" if s.auto_reply else "[dim]OFF (drafts only)[/dim]")
+        t.add_row("followup_after_days", str(s.followup_after_days))
+        t.add_row("max_followups", str(s.max_followups))
+        console.print(t)
+        if s.enabled and not s.auto_reply:
+            console.print("[dim]Replies are drafted for approval, never sent automatically.[/dim]")
+    finally:
+        conn.close()
+
+
+@conversation_app.command("enable")
+def conversation_enable(
+    campaign_id: str = typer.Argument(...),
+    auto_reply: bool = typer.Option(
+        False, "--auto-reply",
+        help="Also let the agent SEND replies itself. Off by default: it drafts them for approval.",
+    ),
+) -> None:
+    """Switch the Conversation Agent on for a campaign.
+
+    On its own this never sends anything -- the agent detects replies,
+    classifies them, moves cards and writes drafts. Pass --auto-reply to also
+    let it send those drafts unattended."""
+    from .conversation.settings import set_settings
+
+    conn = db.connect()
+    try:
+        s = set_settings(conn, campaign_id, enabled=True, auto_reply=auto_reply)
+        console.print(f"[green]conversation agent ON[/green] for {campaign_id}")
+        if s.auto_reply:
+            console.print("[yellow]auto_reply is ON -- replies will be sent without review.[/yellow]")
+        else:
+            console.print("[dim]auto_reply is OFF -- replies are drafted for your approval.[/dim]")
+    finally:
+        conn.close()
+
+
+@conversation_app.command("disable")
+def conversation_disable(campaign_id: str = typer.Argument(...)) -> None:
+    """Switch the Conversation Agent off for a campaign.
+
+    Stops all automated processing immediately. Nothing is deleted or reset:
+    every message, stage and counter stays exactly as it is, and cards can be
+    moved by hand from here on. Re-enabling resumes without replaying
+    anything."""
+    from .conversation.settings import set_settings
+
+    conn = db.connect()
+    try:
+        set_settings(conn, campaign_id, enabled=False)
+        console.print(f"[dim]conversation agent OFF[/dim] for {campaign_id}")
+        console.print("[dim]Existing data untouched; move cards manually with `item set-stage`.[/dim]")
+    finally:
+        conn.close()
+
+
+@conversation_app.command("tick")
+def conversation_tick(
+    campaign_id: Optional[str] = typer.Argument(
+        None, help="Campaign to check. Omit to tick every enabled campaign.",
+    ),
+    config: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Run one conversation cycle now: fetch replies, classify them, advance
+    cards, and handle follow-ups.
+
+    A no-op for any campaign with the agent switched off."""
+    from .conversation import engine
+
+    cfg = _cfg(config)
+    conn = db.connect()
+    try:
+        results = (
+            [engine.tick(conn, cfg, campaign_id)] if campaign_id
+            else engine.tick_all(conn, cfg)
+        )
+        if not results:
+            console.print("[dim]no campaigns have the conversation agent enabled[/dim]")
+            return
+
+        for r in results:
+            console.print(f"\n[bold]{r.campaign_id}[/bold]")
+            if not r.enabled:
+                console.print(f"  [dim]{r.message}[/dim]")
+                continue
+            if r.message:
+                console.print(f"  [yellow]{r.message}[/yellow]")
+            console.print(
+                f"  fetched={r.fetched} matched={r.matched} new={r.new_inbound} "
+                f"duplicates={r.duplicates} unmatched={r.unmatched}"
+            )
+            console.print(
+                f"  advanced={r.advanced} to_waiting={r.moved_to_waiting} "
+                f"replies_sent={r.replies_sent} replies_drafted={r.replies_drafted} "
+                f"followups_sent={r.followups_sent} followups_drafted={r.followups_drafted}"
+            )
+            if r.classified:
+                console.print(f"  classified: {r.classified}")
+            for domain, err in r.errors.items():
+                console.print(f"  [red]{domain}[/red]: {err}")
     finally:
         conn.close()
 

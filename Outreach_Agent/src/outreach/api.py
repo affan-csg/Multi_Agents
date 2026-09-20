@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from . import db, ingest, personalize, pipeline
 from .config import load_config
+from .conversation.routes import router as conversation_router
 from .models import STAGE_ORDER
 from .research_client import ResearchClient, ResearchClientError
 
@@ -45,6 +46,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Conversation Agent (Agent 3) -- owns sent -> waiting -> replied -> booked.
+# Self-contained in conversation/; this mount is its only hook into this app.
+# See src/outreach/conversation/__init__.py.
+app.include_router(conversation_router)
 
 
 # ----------------------------------------------------------------------------
@@ -405,6 +411,93 @@ def analytics(campaign_id: str = "all") -> dict[str, Any]:
         conn.close()
 
 
+@app.get("/bookings")
+def list_bookings() -> list[dict[str, Any]]:
+    """Every prospect currently in the `booked` stage, across every
+    campaign, for the Bookings page -- the Conversation Agent's (or a
+    person's) end result: a prospect who agreed to a call.
+
+    Each entry pairs the pipeline item with the campaign it belongs to, the
+    cached prospect/contact it's for, and the exact stage-change event that
+    moved it to `booked` (see db.set_stage -- every transition is recorded in
+    outreach_events, so this is the same audit trail the item drawer already
+    reads from, not a separate booking record). `booked_at` and
+    `booked_detail` come from that event and are None only for a booking
+    made before this endpoint existed (nothing here can retroactively invent
+    history for an item that predates it).
+
+    Sorted most-recently-booked first. No pagination -- the number of booked
+    prospects at any time is small relative to the campaign's full pipeline,
+    the same assumption /analytics already makes for the whole item set."""
+    conn = db.connect()
+    try:
+        items = db.list_items(conn, stage="booked")
+        if not items:
+            return []
+
+        # The account's own Calendly scheduling page -- there is no
+        # per-booking event URL to link to: the "New Event" notification
+        # Calendly sends carries the invitee's address in Reply-To (see
+        # matcher.py strategy 4) but no stable, generically-parseable
+        # join/manage link in a header this agent reads. Same URL on every
+        # row; still useful as "go see/manage this booking in Calendly".
+        calendly_url = load_config().calendly_url or None
+
+        campaigns_by_id = {c.campaign_id: c for c in db.list_campaigns(conn)}
+        domains = list({i.research_domain for i in items})
+        prospects_by_domain = db.prospects_by_domain(conn, domains)
+
+        entries: list[dict[str, Any]] = []
+        for item in items:
+            campaign = campaigns_by_id.get(item.campaign_id)
+            prospect = prospects_by_domain.get(item.research_domain)
+
+            # The event that actually moved this item to `booked` -- may not
+            # be the LAST event on the item (a person could add a note-like
+            # event afterward in the future), so this finds the most recent
+            # transition landing on `booked` specifically, not just the
+            # latest event of any kind.
+            booked_event = next(
+                (e for e in reversed(db.list_events(conn, item.item_id))
+                 if e.event_type == "stage_change" and e.to_stage == "booked"),
+                None,
+            )
+
+            entries.append({
+                "item_id": item.item_id,
+                "campaign_id": item.campaign_id,
+                "campaign_name": campaign.name if campaign else None,
+                "research_domain": item.research_domain,
+                "company_name": prospect.name if prospect else None,
+                "contact_name": prospect.contact_name if prospect else None,
+                "contact_email": prospect.contact_email if prospect else item.to_email,
+                "contact_position": prospect.contact_position if prospect else None,
+                "industry": prospect.industry if prospect else None,
+                "sent_at": item.sent_at.isoformat() if item.sent_at else None,
+                "booked_at": booked_event.created_at.isoformat() if booked_event and booked_event.created_at else None,
+                # 'reason' from db.set_stage's detail (e.g. "reply classified
+                # as booked") and, when the Conversation Agent made the move,
+                # the classified intent and the inbound message's provider_message_id.
+                "booked_detail": booked_event.detail if booked_event else {},
+                "booked_by": booked_event.actor if booked_event else None,
+                "calendly_url": calendly_url,
+            })
+
+        # Stable sort, newest first. `enumerate` breaks ties on identical
+        # `booked_at` values by insertion order rather than leaving Python's
+        # sort to (stably, but silently) leave same-timestamp entries in
+        # whatever order db.list_items returned them -- two bookings can
+        # legitimately land in the same tick and end up with an identical
+        # timestamp down to the microsecond (observed on this machine: two
+        # back-to-back db.set_stage calls can resolve to the same wall-clock
+        # reading), so relying on strict inequality alone is not safe.
+        indexed = list(enumerate(entries))
+        indexed.sort(key=lambda pair: (pair[1]["booked_at"] or "", -pair[0]), reverse=True)
+        return [entry for _, entry in indexed]
+    finally:
+        conn.close()
+
+
 @app.get("/campaigns/{campaign_id}/items")
 def campaign_items(campaign_id: str) -> list[dict[str, Any]]:
     """The pipeline board's data: every item in a campaign with its stage."""
@@ -668,10 +761,16 @@ def delete_item(item_id: str) -> dict[str, str]:
 
 @app.post("/items/{item_id}/stage")
 def set_item_stage(item_id: str, req: SetStageRequest) -> dict[str, str]:
-    """Manually advance an item past 'sent'. This agent never calls this
-    itself -- pending/sent/failed are the only stages it sets on its own
-    (see pipeline.send_campaign). waiting/replied/booked are for a person (or,
-    later, a separate reply-tracking agent) to set."""
+    """Manually advance an item past 'sent', as a person.
+
+    The Outreach Agent never calls this itself -- pending/sent/failed are the
+    only stages it sets (see pipeline.send_campaign). waiting/replied/booked
+    belong to the Conversation Agent when it is switched on for the campaign
+    (see conversation/engine.py), and to a person otherwise.
+
+    This route stays available either way, deliberately: dragging a card by
+    hand is exactly how you drive the pipeline with the agent switched off,
+    and an `actor="user"` move is always allowed to override the agent's."""
     if req.stage not in ("waiting", "replied", "booked"):
         raise HTTPException(400, "only waiting/replied/booked can be set via this route")
     conn = db.connect()

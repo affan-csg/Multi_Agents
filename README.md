@@ -6,26 +6,39 @@ pipeline, plus one shared dashboard to operate them:
 | Project | What it does | Port |
 |---|---|---|
 | [Research_Agent](Research_Agent/README.md) | Discovers US companies, scores/tiers them as staffing prospects, finds contacts, and (optionally) runs an LLM qualification pass (`csg qualify`). | `:8000` |
-| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. | `:8001` |
+| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent**, which handles replies and follow-ups after the send. | `:8001` |
 | [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser. No database or backend of its own. | `:5173` |
 
 ```
-                    ┌─────────────────┐        HTTP only        ┌──────────────────┐
-   companies  ──►   │  Research Agent  │ ───────────────────►   │  Outreach Agent   │  ──► email
-   (discover,       │  (own Supabase   │  qualified prospects   │  (own Supabase    │
-   score, qualify)  │   project)       │  + auto hand-off       │   project)        │
-                    └─────────▲────────┘                        └─────────▲─────────┘
+                    ┌─────────────────┐        HTTP only        ┌──────────────────────────┐
+   companies  ──►   │  Research Agent  │ ───────────────────►   │  Outreach Agent   :8001  │ ──► email
+   (discover,       │  (own Supabase   │  qualified prospects   │  ┌────────────────────┐  │     (SMTP)
+   score, qualify)  │   project)       │  + auto hand-off       │  │ Conversation Agent │  │ ◄── replies
+                    │      :8000       │                        │  └────────────────────┘  │     (IMAP)
+                    └─────────▲────────┘                        └─────────▲────────────────┘
                               │                                           │
                               └───────────────  Dashboard  ───────────────┘
                                   (browser-only, no DB, no backend)
 ```
 
-**Each agent owns a separate Supabase project.** They never share a
+**Research and Outreach own separate Supabase projects.** They never share a
 database, a table, or a direct DB connection — the only link between them is
 Outreach's [research_client.py](Outreach_Agent/src/outreach/research_client.py)
 calling Research's own API, and a plain `research_domain` string used as the
-join key. Deleting or redeploying any one of the three projects never
-touches the other two.
+join key. Deleting or redeploying either never touches the other.
+
+**The Conversation Agent deliberately shares the Outreach Agent's project**,
+unlike that split. It is not a third database or a third process: it operates
+on the very same `outreach_items` rows a person watches on the kanban board,
+so there is nothing to copy across a boundary, and a second database would
+mean two sources of truth for one card's stage. The two agents are isolated
+from each other by **stage ownership** instead — Outreach writes
+`needs_review/pending → sent/failed`, Conversation writes
+`sent → waiting → replied → booked`, and neither queries the other's stages.
+It remains a self-contained package
+([src/outreach/conversation/](Outreach_Agent/src/outreach/conversation/)) that
+can be switched off per campaign or removed entirely without touching the
+Outreach Agent.
 
 ## Quickstart
 
@@ -94,9 +107,22 @@ project — see each one's own README:
    Anthropic+`web_search`) → a static template as the last resort. Only that
    final static-template path sends an item to **Needs Review** — anything
    an LLM could genuinely personalize from goes straight to **Pending**.
-5. **Send / track** (Outreach Agent + Dashboard) — a person reviews and
-   sends from the pipeline board; Sent → Waiting → Replied → Booked are
-   moved by hand, there is no automated reply-tracking yet.
+5. **Send** (Outreach Agent + Dashboard) — a person reviews and sends from
+   the pipeline board. This is where the Outreach Agent's job ends.
+6. **Converse** (Conversation Agent) — once switched on for a campaign, it
+   reads replies over IMAP, classifies them, and drives Sent → Waiting →
+   Replied → Booked, drafting replies and follow-ups along the way. A `sent`
+   item with no reply for 24 hours moves itself to **Waiting** automatically
+   (checked on every tick, not a background timer). Every reply draft steers
+   toward a booked call via a Calendly link, and a real booking (detected
+   from the scheduling tool's own confirmation email, not just prospect
+   prose) moves the card straight to **Booked**. It is **off by default per
+   campaign**, and even when on it only *drafts* outgoing email unless
+   `auto_reply` is also enabled. With it off, those stages are moved by hand
+   exactly as before. See
+   [Outreach_Agent/README.md](Outreach_Agent/README.md#conversation-agent-agent-3).
+7. **Bookings** (Dashboard) — every prospect currently in `booked`, across
+   every campaign, in one list — see the Dashboard's Bookings page.
 
 ## Tests
 
@@ -106,7 +132,7 @@ so no live database or API keys are needed to run them:
 
 ```
 cd Research_Agent && pytest    # 231 passed
-cd Outreach_Agent  && pytest   # 62 passed
+cd Outreach_Agent  && pytest   # 254 passed (99 outreach + 155 conversation)
 ```
 
 The Dashboard has no test suite; its guard rail is the TypeScript compiler:
@@ -120,7 +146,9 @@ in CI.
 
 ## Known limitations
 
-- No automated reply-tracking — Outreach's job stops at Sent.
+- Reply checking is manual (a button or a CLI tick) — the Conversation Agent
+  has no background poller yet, by design, until the flow has been exercised
+  against real mail.
 - `POST /campaigns` has no server-side "one campaign per research run"
   guard; today's only two callers (the Dashboard form, and Research's
   automatic hand-off) each only call it once per run in practice, but

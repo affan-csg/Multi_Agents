@@ -31,6 +31,7 @@ import { Analytics } from "./pages/research/Analytics";
 import { Prospects } from "./pages/outreach/Prospects";
 import { Campaigns } from "./pages/outreach/Campaigns";
 import { CampaignDetail } from "./pages/outreach/CampaignDetail";
+import { Bookings } from "./pages/outreach/Bookings";
 import { Analytics as OutreachAnalytics } from "./pages/outreach/Analytics";
 import { useRoute } from "./router";
 import "./App.css";
@@ -470,6 +471,12 @@ function App() {
             campaignId={route.campaignId}
             campaignName={route.campaignName}
             onBack={() => navigate({ name: "outreach-campaigns" })}
+          />
+        )}
+
+        {route.name === "outreach-bookings" && (
+          <Bookings
+            onOpenCampaign={(id, campaignName) => navigate({ name: "outreach-campaign", campaignId: id, campaignName })}
           />
         )}
 

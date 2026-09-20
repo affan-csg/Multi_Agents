@@ -66,12 +66,46 @@ class Config:
         return self.raw["personalization"]
 
     @property
+    def calendly_url(self) -> str:
+        """The scheduling link the Conversation Agent's reply prompt offers
+        an interested prospect. Env var wins over committed config, same
+        convention as from_email, so a real link never has to be committed
+        to the repo. Blank means "none configured" -- the reply prompt asks
+        for a few times that work instead of linking anywhere."""
+        return (os.environ.get("CALENDLY_URL") or self.personalization.get("calendly_url") or "").strip()
+
+    @property
     def stages(self) -> dict[str, Any]:
         return self.raw["stages"]
 
     @property
     def stage_order(self) -> list[str]:
         return list(self.stages.get("order") or ["pending", "sent", "waiting", "replied", "booked"])
+
+    @property
+    def conversation(self) -> dict[str, Any]:
+        """Conversation Agent defaults for a campaign that has never been
+        configured. The live per-campaign switch lives in the database
+        (conversation_settings) -- this only seeds a new campaign's row, and
+        an absent section still reads as fully disabled."""
+        return self.raw.get("conversation") or {}
+
+    @property
+    def conversation_defaults(self) -> dict[str, Any]:
+        cfg = self.conversation
+        return {
+            # Both switches default off: deploying the agent must never turn
+            # itself on for an existing campaign, and switching it on must
+            # never by itself authorize sending.
+            "enabled": bool(cfg.get("enabled", False)),
+            "auto_reply": bool(cfg.get("auto_reply", False)),
+            "followup_after_days": int(cfg.get("followup_after_days", 3)),
+            "max_followups": int(cfg.get("max_followups", 2)),
+        }
+
+    @property
+    def imap_lookback_days(self) -> int:
+        return int(self.conversation.get("imap_lookback_days", 14))
 
 
 def load_config(path: str | Path | None = None) -> Config:

@@ -170,7 +170,9 @@ def test_created_items_without_research_data_need_review(conn, monkeypatch):
     generic template draft -- it must NOT enter pending on its own, it waits
     in needs_review for a person (or a future re-draft once qualified)."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY_2", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
     cfg = load_config()
     _seed(conn, "nodata.com", "A", 80, qualified=False)
 

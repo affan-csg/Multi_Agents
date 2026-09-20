@@ -42,6 +42,7 @@ function useSections(): NavSection[] {
       items: [
         { route: { name: "outreach-prospects" }, label: "Prospects", icon: "target", badge: prospectCount ?? undefined },
         { route: { name: "outreach-campaigns" }, label: "Campaigns", icon: "send" },
+        { route: { name: "outreach-bookings" }, label: "Bookings", icon: "calendar" },
         { route: { name: "outreach-analytics" }, label: "Analytics", icon: "analytics" },
       ],
     },
