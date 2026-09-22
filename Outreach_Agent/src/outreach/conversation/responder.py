@@ -129,13 +129,18 @@ def compose_reply(
     thread: list[ConversationMessage],
     latest_reply: ConversationMessage,
     intent: ReplyIntent,
+    learning_context: Optional[str] = None,
 ) -> Optional[tuple[str, str]]:
     """Draft the reply text. Returns (subject, body), or None if no LLM is
     available or the response could not be parsed.
 
     None is not an error the caller should swallow silently -- it means a
     reply genuinely could not be written, and the engine records that on the
-    item so a person knows to write one by hand."""
+    item so a person knows to write one by hand.
+
+    `learning_context`: optional structured guidance blurb from the Feedback
+    Learning Agent (see learning/context.py) -- same additive, no-op-when-None
+    contract as personalize.draft_message's parameter of the same name."""
     signature = personalize._sender_signature(cfg)
     template = _REPLY_PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -162,6 +167,7 @@ def compose_reply(
         .replace("{{intent}}", intent)
         .replace("{{signature}}", signature)
     )
+    prompt = personalize._append_learning_context(prompt, learning_context)
 
     text = personalize._call_llm(prompt)
     if not text:
@@ -196,6 +202,7 @@ def revise_reply(
     current_subject: str,
     current_body: str,
     instruction: str,
+    learning_context: Optional[str] = None,
 ) -> tuple[str, str]:
     """Edit an already-drafted reply per a free-text instruction, instead of
     regenerating it from scratch -- mirrors personalize.revise_message's
@@ -203,7 +210,10 @@ def revise_reply(
     the instruction, everything else preserved). Raises RuntimeError if no
     LLM is available or the response can't be parsed; there is no sensible
     non-LLM fallback for an arbitrary edit instruction, same as the cold-
-    outreach version."""
+    outreach version.
+
+    `learning_context`: see compose_reply's docstring -- same additive,
+    no-op-when-None contract."""
     signature = personalize._sender_signature(cfg)
     template = _REVISE_PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -219,6 +229,7 @@ def revise_reply(
         .replace("{{instruction}}", instruction)
         .replace("{{signature}}", signature)
     )
+    prompt = personalize._append_learning_context(prompt, learning_context)
 
     text = personalize._call_llm(prompt)
     if not text:

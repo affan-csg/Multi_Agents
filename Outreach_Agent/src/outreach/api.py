@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from . import db, ingest, personalize, pipeline
 from .config import load_config
 from .conversation.routes import router as conversation_router
+from .learning.routes import router as learning_router
 from .models import STAGE_ORDER
 from .research_client import ResearchClient, ResearchClientError
 
@@ -51,6 +52,11 @@ app.add_middleware(
 # Self-contained in conversation/; this mount is its only hook into this app.
 # See src/outreach/conversation/__init__.py.
 app.include_router(conversation_router)
+
+# Feedback Learning / Optimization Agent -- read-only against everything but
+# its own three tables. Self-contained in learning/; this mount is its only
+# hook into this app. See src/outreach/learning/__init__.py.
+app.include_router(learning_router)
 
 
 # ----------------------------------------------------------------------------
@@ -589,17 +595,34 @@ def revise_item(item_id: str, req: ReviseRequest) -> dict[str, Any]:
         if not prospect:
             raise HTTPException(404, f"no cached prospect for {item.research_domain}")
         cfg = load_config()
+        learning_ctx = None
+        try:
+            from .learning.context import get_learning_context_summary
+            learning_ctx = get_learning_context_summary(conn)
+        except Exception:
+            pass  # learning unavailable -- draft proceeds unmodified, see rl_prompt.md section 12
         try:
             draft = personalize.revise_message(
                 cfg, prospect, current_subject=item.subject, current_body=item.body,
-                instruction=req.instruction,
+                instruction=req.instruction, learning_context=learning_ctx,
             )
         except RuntimeError as exc:
             raise HTTPException(502, str(exc))
+        before_subject, before_body = item.subject, item.body
         db.update_item_fields(
             conn, item_id, subject=draft.subject, body=draft.body,
             personalized_from=draft.personalized_from,
         )
+        try:
+            from .learning.db import record_draft_edit
+            record_draft_edit(
+                conn, item_id=item_id, campaign_id=item.campaign_id, source="revise",
+                before_subject=before_subject, before_body=before_body,
+                after_subject=draft.subject, after_body=draft.body,
+                instruction=req.instruction, prospect=prospect.model_dump(mode="json"),
+            )
+        except Exception:
+            pass  # learning write failure must never break the revise response
         return {"subject": draft.subject, "body": draft.body, "personalized_from": draft.personalized_from}
     finally:
         conn.close()
@@ -644,12 +667,29 @@ def redraft_item(item_id: str) -> dict[str, Any]:
         if not prospect:
             raise HTTPException(404, f"no cached prospect for {item.research_domain}")
         cfg = load_config()
-        draft = personalize.draft_message(cfg, prospect, use_web_search=True)
+        learning_ctx = None
+        try:
+            from .learning.context import get_learning_context_summary
+            learning_ctx = get_learning_context_summary(conn)
+        except Exception:
+            pass  # learning unavailable -- draft proceeds unmodified, see rl_prompt.md section 12
+        before_subject, before_body = item.subject, item.body
+        draft = personalize.draft_message(cfg, prospect, use_web_search=True, learning_context=learning_ctx)
         db.update_item_fields(
             conn, item_id, subject=draft.subject, body=draft.body,
             personalized_from=draft.personalized_from,
             to_email=prospect.contact_email,
         )
+        try:
+            from .learning.db import record_draft_edit
+            record_draft_edit(
+                conn, item_id=item_id, campaign_id=item.campaign_id, source="redraft",
+                before_subject=before_subject, before_body=before_body,
+                after_subject=draft.subject, after_body=draft.body,
+                prospect=prospect.model_dump(mode="json"),
+            )
+        except Exception:
+            pass  # learning write failure must never break the redraft response
         ready = prospect.has_contact and draft.personalized_from != "template_only"
         if item.stage == "needs_review" and ready:
             db.set_stage(conn, item_id, "pending", actor="system", detail={"reason": "redraft now personalized"})
@@ -688,17 +728,34 @@ def redraft_generic_items(campaign_id: str) -> dict[str, Any]:
             if i.stage in ("pending", "needs_review") and i.personalized_from == "template_only"
         ]
         cfg = load_config()
+        learning_ctx = None
+        try:
+            from .learning.context import get_learning_context_summary
+            learning_ctx = get_learning_context_summary(conn)
+        except Exception:
+            pass  # learning unavailable -- drafts proceed unmodified, see rl_prompt.md section 12
         upgraded = 0
         still_generic = 0
         for item in items:
             prospect = db.get_prospect(conn, item.research_domain)
             if not prospect:
                 continue
-            draft = personalize.draft_message(cfg, prospect, use_web_search=True)
+            before_subject, before_body = item.subject, item.body
+            draft = personalize.draft_message(cfg, prospect, use_web_search=True, learning_context=learning_ctx)
             db.update_item_fields(
                 conn, item.item_id, subject=draft.subject, body=draft.body,
                 personalized_from=draft.personalized_from,
             )
+            try:
+                from .learning.db import record_draft_edit
+                record_draft_edit(
+                    conn, item_id=item.item_id, campaign_id=campaign_id, source="redraft_generic",
+                    before_subject=before_subject, before_body=before_body,
+                    after_subject=draft.subject, after_body=draft.body,
+                    prospect=prospect.model_dump(mode="json"),
+                )
+            except Exception:
+                pass  # one item's learning-write failure must never stop the rest of the batch
             if draft.personalized_from == "template_only":
                 still_generic += 1
             else:

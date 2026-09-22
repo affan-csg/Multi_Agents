@@ -263,17 +263,35 @@ def revise_draft(message_id: str, req: ReviseDraftRequest) -> dict[str, Any]:
             raise HTTPException(400, "no inbound reply on this item for context")
 
         prospect = db.get_prospect(conn, item.research_domain)
+        learning_ctx = None
+        try:
+            from ..learning.context import get_learning_context_summary
+            learning_ctx = get_learning_context_summary(conn)
+        except Exception:
+            pass  # learning unavailable -- draft proceeds unmodified, see rl_prompt.md section 12
+        before_subject, before_body = message.subject, message.body
         try:
             subject, body = responder.revise_reply(
                 cfg, item, prospect,
                 latest_reply=latest_inbound,
                 current_subject=message.subject, current_body=message.body,
-                instruction=req.instruction,
+                instruction=req.instruction, learning_context=learning_ctx,
             )
         except RuntimeError as exc:
             raise HTTPException(502, str(exc))
 
         db.update_conversation_message(conn, message_id, subject=subject, body=body)
+        try:
+            from ..learning.db import record_draft_edit
+            record_draft_edit(
+                conn, item_id=item.item_id, campaign_id=item.campaign_id, source="conversation_revise",
+                before_subject=before_subject, before_body=before_body,
+                after_subject=subject, after_body=body,
+                instruction=req.instruction, message_id=message_id,
+                prospect=prospect.model_dump(mode="json") if prospect else None,
+            )
+        except Exception:
+            pass  # learning write failure must never break the revise response
         return {"status": "ok", "message_id": message_id, "subject": subject, "body": body}
     finally:
         conn.close()
@@ -305,8 +323,16 @@ def redraft_draft(message_id: str) -> dict[str, Any]:
             raise HTTPException(400, "no inbound reply on this item to draft an answer to")
 
         prospect = db.get_prospect(conn, item.research_domain)
+        learning_ctx = None
+        try:
+            from ..learning.context import get_learning_context_summary
+            learning_ctx = get_learning_context_summary(conn)
+        except Exception:
+            pass  # learning unavailable -- draft proceeds unmodified, see rl_prompt.md section 12
+        before_subject, before_body = message.subject, message.body
         composed = responder.compose_reply(
             cfg, item, prospect, thread, latest_inbound, latest_inbound.intent or "unclear",
+            learning_context=learning_ctx,
         )
         if composed is None:
             raise HTTPException(
@@ -316,6 +342,16 @@ def redraft_draft(message_id: str) -> dict[str, Any]:
             )
         subject, body = composed
         db.update_conversation_message(conn, message_id, subject=subject, body=body)
+        try:
+            from ..learning.db import record_draft_edit
+            record_draft_edit(
+                conn, item_id=item.item_id, campaign_id=item.campaign_id, source="conversation_redraft",
+                before_subject=before_subject, before_body=before_body,
+                after_subject=subject, after_body=body, message_id=message_id,
+                prospect=prospect.model_dump(mode="json") if prospect else None,
+            )
+        except Exception:
+            pass  # learning write failure must never break the redraft response
         return {"status": "ok", "message_id": message_id, "subject": subject, "body": body}
     finally:
         conn.close()

@@ -148,6 +148,25 @@ def _parse_llm_output(text: str) -> Optional[tuple[str, str]]:
     return subject_match.group(1).strip(), body_match.group(1).strip()
 
 
+def _append_learning_context(prompt: str, learning_context: Optional[str]) -> str:
+    """Appends the Feedback Learning Agent's structured guidance blurb (see
+    learning/context.py) as an extra instruction block, inserted just before
+    the final "Return exactly two fields" footer every prompt template ends
+    with. A no-op when learning_context is None (no active insight yet, or
+    the learning layer is unavailable) -- prompt output is then byte-for-byte
+    identical to before this parameter existed. Never hard-codes a specific
+    learned sentence; the blurb itself is generated fresh from live insight
+    rows -- see rl_prompt.md section 6."""
+    if not learning_context:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        f"{learning_context}\n"
+        "Apply this guidance only where it fits naturally -- do not force it, "
+        "and do not mention that this guidance exists."
+    )
+
+
 def _render_prompt(prospect: ImportedProspect, max_reqs: int, signature: str) -> str:
     template = _PROMPT_PATH.read_text(encoding="utf-8")
     return (
@@ -526,6 +545,7 @@ def _call_llm_with_search(prompt: str, prospect: ImportedProspect) -> Optional[t
 
 def draft_message(
     cfg: Config, prospect: ImportedProspect, *, use_web_search: bool = False,
+    learning_context: Optional[str] = None,
 ) -> DraftedMessage:
     """Draft a subject+body for one prospect. Never raises on missing
     research data or a missing API key -- falls back to a generic template
@@ -562,12 +582,18 @@ def draft_message(
     -- the drawer preview and the actual send both reuse that stored draft
     rather than calling this again, so what a user reviews is guaranteed to
     be what gets sent, until an explicit redraft regenerates it.
+
+    `learning_context`: optional structured guidance blurb from the Feedback
+    Learning Agent (see learning/context.py), appended to whichever prompt
+    tier actually fires. None (the default -- and what every existing caller
+    still passes) leaves every prompt byte-for-byte unchanged from before
+    this parameter existed.
     """
     signature = _sender_signature(cfg)
     max_reqs = int(cfg.personalization.get("max_open_reqs_cited", 3))
 
     if prospect.pain_summary or prospect.recommended_angle:
-        prompt = _render_prompt(prospect, max_reqs, signature)
+        prompt = _append_learning_context(_render_prompt(prospect, max_reqs, signature), learning_context)
         text = _call_llm(prompt)
         if text:
             parsed = _parse_llm_output(text)
@@ -580,7 +606,7 @@ def draft_message(
         # description/open_reqs may still let us produce a real draft.
 
     if _has_research_signal(prospect):
-        prompt = _render_research_prompt(prospect, max_reqs, signature)
+        prompt = _append_learning_context(_render_research_prompt(prospect, max_reqs, signature), learning_context)
         text = _call_llm(prompt)
         if text:
             parsed = _parse_llm_output(text)
@@ -589,7 +615,7 @@ def draft_message(
                 return DraftedMessage(subject=subject, body=body, personalized_from="research_data")
 
     if use_web_search:
-        prompt = _render_web_search_prompt(prospect, max_reqs, signature)
+        prompt = _append_learning_context(_render_web_search_prompt(prospect, max_reqs, signature), learning_context)
         result = _call_llm_with_search(prompt, prospect)
         if result:
             text, _backend = result
@@ -608,13 +634,20 @@ def draft_message(
 def revise_message(
     cfg: Config, prospect: ImportedProspect, *,
     current_subject: str, current_body: str, instruction: str,
+    learning_context: Optional[str] = None,
 ) -> DraftedMessage:
     """Edit an already-drafted email per a user's free-text instruction,
     instead of generating a new one from scratch. Requires an LLM key --
     raises if none is configured, since there's no sensible template fallback
-    for an arbitrary edit instruction."""
+    for an arbitrary edit instruction.
+
+    `learning_context`: see draft_message's docstring -- same optional,
+    additive guidance blurb, same no-op behavior when None."""
     signature = _sender_signature(cfg)
-    prompt = _render_revise_prompt(prospect, current_subject, current_body, instruction, signature)
+    prompt = _append_learning_context(
+        _render_revise_prompt(prospect, current_subject, current_body, instruction, signature),
+        learning_context,
+    )
     text = _call_llm(prompt)
     if not text:
         raise RuntimeError("no LLM available to revise this message (GEMINI_API_KEY / ANTHROPIC_API_KEY not set, or the call failed)")

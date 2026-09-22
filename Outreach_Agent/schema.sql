@@ -232,3 +232,81 @@ CREATE INDEX IF NOT EXISTS idx_conv_msgs_direction ON conversation_messages(dire
 ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS followup_count         INT NOT NULL DEFAULT 0;
 ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS last_inbound_at        TIMESTAMPTZ;
 ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS conversation_locked_at TIMESTAMPTZ;
+
+-- ===========================================================================
+-- FEEDBACK LEARNING / OPTIMIZATION AGENT
+--
+-- Everything below is ADDITIVE -- it does not alter or re-key any table
+-- above, and neither the Outreach Agent nor the Conversation Agent ever
+-- reads or writes these three tables. This layer only ever READS
+-- outreach_items/outreach_events/conversation_messages; it never writes to
+-- them and never changes a stage. See src/outreach/learning/__init__.py.
+--
+-- Re-running this whole file on an existing project is safe: every statement
+-- below is IF NOT EXISTS. See migrations/005_learning_agent.sql for the full
+-- rationale behind each table.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS draft_versions (
+    version_id       TEXT PRIMARY KEY,
+    item_id          TEXT NOT NULL REFERENCES outreach_items(item_id) ON DELETE CASCADE,
+    campaign_id      TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    source           TEXT NOT NULL,   -- 'revise' | 'redraft' | 'redraft_generic' | 'conversation_revise' | 'conversation_redraft'
+    message_id       TEXT REFERENCES conversation_messages(message_id) ON DELETE CASCADE,
+    before_subject   TEXT,
+    before_body      TEXT,
+    after_subject    TEXT,
+    after_body       TEXT,
+    instruction      TEXT,
+    diff_version             INT NOT NULL DEFAULT 1,
+    subject_changed          BOOLEAN NOT NULL DEFAULT false,
+    opening_changed          BOOLEAN NOT NULL DEFAULT false,
+    cta_changed               BOOLEAN NOT NULL DEFAULT false,
+    cta_shortened              BOOLEAN NOT NULL DEFAULT false,
+    length_delta_chars          INT,
+    length_delta_words          INT,
+    shortened                    BOOLEAN NOT NULL DEFAULT false,
+    lengthened                    BOOLEAN NOT NULL DEFAULT false,
+    sentences_removed_count        INT NOT NULL DEFAULT 0,
+    personalization_delta           INT NOT NULL DEFAULT 0,
+    formatting_changed               BOOLEAN NOT NULL DEFAULT false,
+    outcome_stage           TEXT,
+    outcome_replied          BOOLEAN,
+    outcome_positive_reply     BOOLEAN,
+    outcome_booked              BOOLEAN,
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_draft_versions_item     ON draft_versions(item_id);
+CREATE INDEX IF NOT EXISTS idx_draft_versions_campaign ON draft_versions(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_draft_versions_source   ON draft_versions(source);
+CREATE INDEX IF NOT EXISTS idx_draft_versions_created  ON draft_versions(created_at);
+
+CREATE TABLE IF NOT EXISTS learning_insights (
+    pattern_key      TEXT PRIMARY KEY,
+    pattern_label    TEXT NOT NULL,
+    category         TEXT NOT NULL,
+    description      TEXT NOT NULL,
+    evidence_count   INT NOT NULL DEFAULT 0,
+    metric_comparison JSONB NOT NULL DEFAULT '{}'::jsonb,
+    confidence        TEXT NOT NULL DEFAULT 'low',
+    status             TEXT NOT NULL DEFAULT 'insufficient_data',
+    evidence_campaign_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    evidence_item_ids      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    first_observed_at       TIMESTAMPTZ NOT NULL,
+    last_updated_at          TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_learning_insights_status   ON learning_insights(status);
+CREATE INDEX IF NOT EXISTS idx_learning_insights_category ON learning_insights(category);
+
+CREATE TABLE IF NOT EXISTS learning_events (
+    event_id    TEXT PRIMARY KEY,
+    pattern_key TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    detail      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_learning_events_pattern ON learning_events(pattern_key);
+CREATE INDEX IF NOT EXISTS idx_learning_events_created ON learning_events(created_at);

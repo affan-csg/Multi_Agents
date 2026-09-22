@@ -81,15 +81,19 @@ of the two backends above isn't running yet — start it and refresh.
   drag-and-drop between columns, in addition to the item drawer's stage
   buttons — both paths call the same API; the drawer's Conversation section
   shows the reply thread, a pending draft to approve/redraft/edit, and the
-  original outreach message collapsed below it), and Bookings (every prospect
+  original outreach message collapsed below it), Bookings (every prospect
   currently `booked`, pooled across every campaign, from `GET /bookings` —
   row click opens the account's Calendly page when one is configured, the
-  campaign otherwise).
+  campaign otherwise), and Learning (new tab — observes draft edits, tracks
+  performance, displays learned patterns, before/after comparisons, human-edit
+  trends, and drill-down into the data backing each insight).
 - `src/components/` — shared UI (`ui.tsx` design system, Nav, drawers,
   modals) — one visual system for every agent's pages.
+- `src/agents/learning.ts` — typed HTTP client for the new `/learning/*`
+  endpoints on the Outreach Agent.
 - `App.css`/`index.css` — the shared design system's styles,
-  plus a `.kanban-*` block appended at the end for the Outreach pipeline
-  board (the only new UI pattern Research didn't already have).
+  plus a `.kanban-*` block for the Outreach pipeline board and a `.tabs`
+  block for the Learning page's internal section navigation.
 - `src/hooks/useCachedFetch.ts` — stale-while-revalidate data layer every
   page's `useCachedFetch(key, fetcher)` call goes through: cached data
   renders instantly on remount while a background refetch runs, so revisiting

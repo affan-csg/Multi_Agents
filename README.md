@@ -6,8 +6,8 @@ pipeline, plus one shared dashboard to operate them:
 | Project | What it does | Port |
 |---|---|---|
 | [Research_Agent](Research_Agent/README.md) | Discovers US companies, scores/tiers them as staffing prospects, finds contacts, and (optionally) runs an LLM qualification pass (`csg qualify`). | `:8000` |
-| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent**, which handles replies and follow-ups after the send. | `:8001` |
-| [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser. No database or backend of its own. | `:5173` |
+| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent** (replies/follow-ups after send) and the **Feedback Learning / Optimization Agent** (learns from performance, edits, outcomes; feeds insights back into drafts). | `:8001` |
+| [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser. No database or backend of its own. Includes a dedicated Learning tab under Outreach Agent. | `:5173` |
 
 ```
                     ┌─────────────────┐        HTTP only        ┌──────────────────────────┐
@@ -121,7 +121,16 @@ project — see each one's own README:
    `auto_reply` is also enabled. With it off, those stages are moved by hand
    exactly as before. See
    [Outreach_Agent/README.md](Outreach_Agent/README.md#conversation-agent-agent-3).
-7. **Bookings** (Dashboard) — every prospect currently in `booked`, across
+7. **Learn** (Feedback Learning / Optimization Agent) — observes everything:
+   snapshots AI-original vs. human-final drafts, tracks performance metrics
+   (reply/positive-reply/booking rates), and computes confidence-scored
+   patterns from the observed data (never causal inference). Active insights
+   are fed back into future draft generation as structured guidance. Fully
+   additive — if it fails, the pipeline keeps working. See the Dashboard's
+   new **Learning** tab for overview, performance comparisons, detected
+   patterns, human-edit trends, and drill-down into the data behind each
+   insight.
+8. **Bookings** (Dashboard) — every prospect currently in `booked`, across
    every campaign, in one list — see the Dashboard's Bookings page.
 
 ## Tests
@@ -132,7 +141,7 @@ so no live database or API keys are needed to run them:
 
 ```
 cd Research_Agent && pytest    # 295 passed
-cd Outreach_Agent  && pytest   # 269 passed (114 outreach + 155 conversation)
+cd Outreach_Agent  && pytest   # 374 passed (114 outreach + 155 conversation + 105 learning)
 ```
 
 The Dashboard has no test suite; its guard rail is the TypeScript compiler:
@@ -154,6 +163,11 @@ in CI.
   automatic hand-off) each only call it once per run in practice, but
   nothing in the code itself prevents a duplicate. See
   [Outreach_Agent/README.md](Outreach_Agent/README.md#known-limitations).
+- Learning insight recomputation is synchronous per-request; fine at current
+  volumes but could move to frontend caching or event-driven if `draft_versions`
+  grows very large. Confidence thresholds (20/50/150 samples; 1.5pp effect size)
+  are tunable constants, not yet exposed as config. `learning_era_comparison`
+  endpoint exists but is not yet surfaced on the Dashboard.
 - The Dashboard has one pre-existing, unrelated TypeScript error in
   `src/pages/research/UsageTab.tsx` (a JSX element assigned where a `string`
   prop is expected) — tracked, not yet fixed; everything else type-checks

@@ -15,6 +15,9 @@ _KEYS = {
     "outreach_events": ("event_id",),
     "conversation_settings": ("campaign_id",),
     "conversation_messages": ("message_id",),
+    "draft_versions": ("version_id",),
+    "learning_insights": ("pattern_key",),
+    "learning_events": ("event_id",),
 }
 
 _UNIQUE = {

@@ -2,7 +2,9 @@
 
 Personalizes and sends outreach to prospects qualified by the Research Agent,
 and — via the **Conversation Agent** bundled in this project — handles what
-happens after the send.
+happens after the send. Also includes the **Feedback Learning / Optimization
+Agent**, which observes draft edits, tracks performance, and learns patterns
+that feed back into future drafts.
 
 **It never touches the Research Agent's database.** It pulls qualified
 companies over HTTP from Research's own API, caches them locally, selects the
@@ -113,10 +115,10 @@ theoretical one.
 3. **Database**: paste [schema.sql](schema.sql) into **this** Outreach
    Supabase project's SQL editor (a fresh project, separate from Research's).
    On an existing project, re-running the whole file is safe
-   (`CREATE TABLE IF NOT EXISTS`/`ADD COLUMN IF NOT EXISTS`), or apply just
-   [migrations/003_prospects_run_history.sql](migrations/003_prospects_run_history.sql)
-   and [migrations/004_prospects_qualification_failed.sql](migrations/004_prospects_qualification_failed.sql)
-   on their own.
+   (`CREATE TABLE IF NOT EXISTS`/`ADD COLUMN IF NOT EXISTS`), or apply just the
+   individual migration files in `migrations/` (e.g.
+   [005_learning_agent.sql](migrations/005_learning_agent.sql) for the new
+   Learning Agent tables).
 
 ## Qualification status — reflecting Research's qualify outcome
 
@@ -398,8 +400,9 @@ code changes needed to adjust it:
 pytest
 ```
 
-269 tests, no network (a fake in-memory PostgREST fixture in
-[tests/conftest.py](tests/conftest.py) stands in for Supabase):
+374 tests, no network (a fake in-memory PostgREST fixture in
+[tests/conftest.py](tests/conftest.py) stands in for Supabase) — 114 Outreach +
+155 Conversation + 105 Learning Agent tests:
 
 - [test_ingest.py](tests/test_ingest.py) — importing prospects from
   Research's API response shape; that a tier-matching company with no
@@ -505,6 +508,78 @@ so the full reply path runs with no mailbox, no LLM, and no waiting:
   (including a same-microsecond tie on Windows), and the Calendly link
   included on each row.
 
+### Feedback Learning / Optimization Agent (105 of the 374)
+
+Data-driven pattern detection without ML or causal claims, fed back into future drafts.
+
+- [test_learning_diffing.py](tests/test_learning_diffing.py) — pure, rule-based
+  diffs (subject/opening/CTA-before-signature/length/sentences/personalization/
+  formatting), no LLM, no DB.
+- [test_learning_db.py](tests/test_learning_db.py) — round-trip insert/list/get
+  for the 3 new tables (draft_versions, learning_insights, learning_events).
+- [test_learning_hooks.py](tests/test_learning_hooks.py) — snapshot writes at
+  each `/revise`, `/redraft`, `/redraft-generic`, and conversation-reply hook
+  point; idempotency (two revises → two distinct rows).
+- [test_learning_failure_isolation.py](tests/test_learning_failure_isolation.py) —
+  the critical spec requirement: learning layer failures never block drafting,
+  sending, or conversation behavior.
+- [test_learning_engine.py](tests/test_learning_engine.py) — confidence scoring
+  (two gates: sample size + effect size; never "active" below 20 emails with 1.5pp
+  difference); insight recomputation; state-transition history.
+- [test_learning_performance.py](tests/test_learning_performance.py) — before/after
+  windowing, campaign comparison, follow-up buckets; explicit "Not enough data yet"
+  rather than fabricated metrics.
+- [test_learning_routes.py](tests/test_learning_routes.py) — all 9 `/learning/*`
+  endpoints.
+- [test_learning_malformed_data.py](tests/test_learning_malformed_data.py) —
+  None/empty text, missing outcome joins, empty tables.
+- [test_learning_fixtures.py](tests/test_learning_fixtures.py) — deterministic
+  synthetic dataset (120+ emails with exact 50% vs 5% reply rate gap; n=6 samples
+  must not create active insight; 30-edit fixture with exact 73% shorten-CTA
+  pattern).
+
+## Feedback Learning / Optimization Agent
+
+The Learning Agent observes everything: captures AI-original vs. human-edited
+drafts, tracks performance (reply rates, positive replies, bookings), and learns
+explainable patterns (never causal claims). Insights feed back into future drafts
+as structured guidance. Fully additive — if it fails, the pipeline works normally.
+
+### How it works
+
+1. **Observe drafts** — every `/revise`, `/redraft`, `/redraft-generic`, and
+   conversation-reply operation snapshots before/after subject+body, computes
+   observable diffs (subject changed, opening changed, CTA shortened, length
+   delta, personalization added/removed, formatting changed), and stores them.
+2. **Track outcomes** — reads existing `outreach_items` and `conversation_messages`
+   to determine reply/positive-reply/booking outcomes per draft.
+3. **Learn patterns** — runs a fixed catalog of detectors on-demand (no background
+   job): "shorter CTAs → higher reply rate," "more personalization → more
+   bookings," "human editors shorten CTAs 72% of the time," etc.
+4. **Gate with confidence** — patterns only become "active" when sample size ≥20
+   AND group-size-adjusted effect size ≥1.5pp. Five emails never create a
+   high-confidence rule.
+5. **Feed insights to new drafts** — when generating a new draft, retrieves active
+   insights and injects them as structured prompt context (never hard-coded
+   sentences, never auto-apply anything).
+
+### Setup
+
+No additional setup beyond the main Outreach schema. New Learning Agent tables are
+in [schema.sql](schema.sql); the migration [005_learning_agent.sql](migrations/005_learning_agent.sql)
+is idempotent. Once applied, the agent observes drafts automatically and exposes
+9 read-only `/learning/*` endpoints. The Dashboard's **Learning** tab (new Outreach
+section) displays overview, performance metrics, detected patterns, human-edit
+trends, campaign comparison, and clickable drill-down.
+
+### Using it
+
+No CLI commands — the agent works silently in the background. Access insights via:
+- Dashboard: **Outreach Agent → Learning** tab (requires at least one draft to
+  have been created/edited).
+- API: `GET /learning/overview`, `GET /learning/insights`, `GET /learning/performance/*`,
+  `GET /learning/human-edits`, etc. (see [src/outreach/learning/routes.py](src/outreach/learning/routes.py)).
+
 ## Known limitations
 
 - **Reply checking is manual.** The Conversation Agent runs on a button click
@@ -530,3 +605,8 @@ so the full reply path runs with no mailbox, no LLM, and no waiting:
   and the Research Agent's automatic hand-off) each only call it once per
   run in practice, so this has not been a live problem, but nothing in this
   codebase actually prevents a duplicate.
+- **Learning insight recomputation is synchronous per-request.** Acceptable
+  at current volumes but could move to frontend caching or event-driven if
+  `draft_versions` tables grow very large. Confidence thresholds and the
+  minimum-evidence gate are tunable constants in [src/outreach/learning/engine.py](src/outreach/learning/engine.py),
+  not yet exposed as config.

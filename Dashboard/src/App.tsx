@@ -34,6 +34,7 @@ import { Campaigns } from "./pages/outreach/Campaigns";
 import { CampaignDetail } from "./pages/outreach/CampaignDetail";
 import { Bookings } from "./pages/outreach/Bookings";
 import { Analytics as OutreachAnalytics } from "./pages/outreach/Analytics";
+import { Learning as OutreachLearning } from "./pages/outreach/Learning";
 import { useRoute } from "./router";
 import "./App.css";
 
@@ -506,6 +507,8 @@ function App() {
         )}
 
         {route.name === "outreach-analytics" && <OutreachAnalytics campaignId={scopeCampaign} campaigns={campaigns} />}
+
+        {route.name === "outreach-learning" && <OutreachLearning />}
       </main>
 
       {selectedDomain && runs.length > 0 && route.name !== "research-company" && (
