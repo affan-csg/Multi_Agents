@@ -23,11 +23,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from . import contacts as contacts_mod, db, discover as discover_mod, qualify as qualify_mod
+from . import export_excel, export_pdf
 from .ats import normalize_domain
 from .config import load_config, update_icp_basics
 from .discovery import DiscoveryError
@@ -131,6 +132,11 @@ class QualifyRequest(BaseModel):
     tiers: list[str] = ["A", "B"]
     limit_reqs: int = 8
     force: bool = False
+    # Restricts qualification to exactly these domains (e.g. a single
+    # company's "Qualify with AI" button) instead of every company matching
+    # `tiers` -- see qualify.pending_rows. None (the default) means no
+    # restriction, preserving the existing tiers-only behavior.
+    domains: Optional[list[str]] = None
 
 
 class ContactsRequest(BaseModel):
@@ -239,8 +245,34 @@ def _run_qualify_job(job: Job, run_id: str, req: QualifyRequest) -> None:
 
         stats = asyncio.run(qualify_mod.qualify_run(
             conn, run_id, tiers=req.tiers, limit_reqs=req.limit_reqs,
-            force=req.force, on_progress=progress,
+            force=req.force, on_progress=progress, domains=req.domains,
         ))
+        job.status = "done"
+        job.result = stats
+        job.publish()
+    except qualify_mod.QualificationError as exc:
+        job.status = "error"
+        job.error = str(exc)
+        job.publish()
+    except Exception as exc:
+        job.status = "error"
+        job.error = f"{type(exc).__name__}: {exc}"
+        job.publish()
+    finally:
+        conn.close()
+
+
+def _run_qualify_retry_job(job: Job, run_id: str) -> None:
+    conn = db.connect()
+    try:
+        job.status = "running"
+        job.publish()
+
+        def progress(done: int, total: int, domain: str) -> None:
+            job.done, job.total, job.current_domain = done, total, domain
+            job.publish()
+
+        stats = asyncio.run(qualify_mod.retry_failed_run(conn, run_id, on_progress=progress))
         job.status = "done"
         job.result = stats
         job.publish()
@@ -500,12 +532,20 @@ def company_detail(run_id: str, domain: str) -> dict[str, Any]:
         scores = [r for r in db.get_scores(conn, effective_run_id) if r["domain"] == domain] if effective_run_id else []
         postings = db.get_postings(conn, domain)
         qual = db.get_qualification(conn, domain, effective_run_id) if effective_run_id else None
+        qual_attempt = db.get_qualification_attempt(conn, domain, effective_run_id) if effective_run_id else None
         people = db.get_contacts(conn, domain)
         return {
             "company": company.model_dump(),
             "score": scores[0] if scores else None,
             "postings": [p.model_dump(mode="json") for p in postings],
             "qualification": qual,
+            # None if never attempted; otherwise the latest attempt's
+            # {"status": "succeeded"|"failed", "error_reason", "error_detail",
+            # "attempt_count", "last_attempted_at"} so the UI can show a
+            # distinct "qualification failed, retry" state instead of the
+            # generic "not qualified yet" for a company that was actually
+            # tried and hit a real error.
+            "qualification_attempt": qual_attempt,
             "contacts": people,
             # Single source of truth with the JSONL export (see
             # export.to_jsonl / Prospect.compute_outreach_flags): email is
@@ -514,6 +554,52 @@ def company_detail(run_id: str, domain: str) -> dict[str, Any]:
         }
     finally:
         conn.close()
+
+
+@app.get("/runs/{run_id}/export/excel")
+def export_excel_route(run_id: str) -> Response:
+    """Downloadable, read-only export -- "Excel: Companies & Contacts" on
+    the dashboard. One row per company scored in this run (list-level
+    fields only: identity, ICP score/tier, firmographics, ATS/hiring
+    signal, contact name/email/title/LinkedIn) -- never the full research
+    report. Uses only already-stored data (db.get_scores/contacts_by_domain/
+    companies_by_domain); never triggers a new research run. A run with zero
+    companies still gets a valid, well-formed workbook with headers only."""
+    conn = db.connect()
+    try:
+        content = export_excel.to_bytes(conn, run_id)
+    finally:
+        conn.close()
+    filename = f"research_companies_{run_id}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/runs/{run_id}/export/pdf")
+def export_pdf_route(run_id: str) -> Response:
+    """Downloadable, read-only export -- "PDF Reports: All Companies" on the
+    dashboard. One full company report per company scored in this run
+    (everything CompanyDetail.tsx shows: overview/firmographics with
+    provenance, ICP score + dimension breakdown + explanation, pain summary
+    + recommended angle, contacts, open requisitions), bundled into a single
+    ZIP -- the product owner explicitly said a ZIP of many PDFs is fine for
+    a large run. Uses only already-stored data; never triggers a new
+    research run. A run with zero companies still returns a valid, empty
+    ZIP rather than erroring."""
+    conn = db.connect()
+    try:
+        content = export_pdf.build_zip(conn, run_id)
+    finally:
+        conn.close()
+    filename = f"research_reports_{run_id}.zip"
+    return Response(
+        content=content,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def _domains_scored_in(conn: db.SupabaseConn, run_id: str) -> Optional[set[str]]:
@@ -944,7 +1030,7 @@ def run_analytics(run_id: str) -> dict[str, Any]:
 def start_qualify(run_id: str, req: QualifyRequest) -> dict[str, Any]:
     conn = db.connect()
     try:
-        pending = qualify_mod.pending_rows(conn, run_id, req.tiers, force=req.force)
+        pending = qualify_mod.pending_rows(conn, run_id, req.tiers, force=req.force, domains=req.domains)
         if not pending:
             return {"job_id": None, "message": "nothing to qualify"}
         provider = qualify_mod.backend_name()
@@ -956,6 +1042,38 @@ def start_qualify(run_id: str, req: QualifyRequest) -> dict[str, Any]:
     job = _new_job(kind="qualify", run_id=run_id)
     job.total = len(pending)
     _MAIN_LOOP.run_in_executor(None, _run_qualify_job, job, run_id, req)
+    return {"job_id": job.job_id, "provider": provider, "companies": len(pending)}
+
+
+@app.get("/runs/{run_id}/qualify/failed")
+def list_failed_qualifications(run_id: str) -> list[dict[str, Any]]:
+    """Tier A/B companies in `run_id` whose last qualification attempt
+    failed and have not since succeeded -- drives the Dashboard's "N
+    qualifications failed, retry" affordance on both the Prospects/Companies
+    list and the Company Profile page."""
+    conn = db.connect()
+    try:
+        return qualify_mod.failed_rows(conn, run_id)
+    finally:
+        conn.close()
+
+
+@app.post("/runs/{run_id}/qualify/retry-failed")
+def start_qualify_retry(run_id: str) -> dict[str, Any]:
+    conn = db.connect()
+    try:
+        pending = qualify_mod.failed_rows(conn, run_id)
+        if not pending:
+            return {"job_id": None, "message": "nothing to retry"}
+        provider = qualify_mod.backend_name()
+    except qualify_mod.QualificationError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        conn.close()
+
+    job = _new_job(kind="qualify", run_id=run_id)
+    job.total = len(pending)
+    _MAIN_LOOP.run_in_executor(None, _run_qualify_retry_job, job, run_id)
     return {"job_id": job.job_id, "provider": provider, "companies": len(pending)}
 
 

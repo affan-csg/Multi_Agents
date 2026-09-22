@@ -129,6 +129,63 @@ def test_compose_reply_returns_none_when_llm_unavailable(cfg, item, prospect, mo
 
 
 # ---------------------------------------------------------------------------
+# subject drift -- the reply-threading bug
+# ---------------------------------------------------------------------------
+#
+# The reply prompt asks the model to keep the thread's existing subject, but
+# that is only an instruction, not a guarantee: a reply to "Quick question
+# about your hiring pipeline" came back subjected "Re: Tech and AI talent
+# delivery" -- a fluent but invented subject line. Gmail (and most clients)
+# thread primarily on Subject + In-Reply-To/References together, so sending
+# with that drifted subject landed the reply as a brand-new conversation in
+# the recipient's inbox, even though matcher.py still resolves it as the same
+# item server-side via the Message-ID headers alone. compose_reply and
+# compose_followup must never let the model's own SUBJECT field reach the
+# actual send -- the thread's real subject is the only source of truth.
+
+def test_compose_reply_ignores_a_hallucinated_subject(cfg, item, prospect, monkeypatch):
+    monkeypatch.setattr(
+        "outreach.conversation.responder.personalize._call_llm",
+        lambda p: "SUBJECT: Tech and AI talent delivery\nBODY: Sure, happy to chat.\n\nAffan",
+    )
+
+    latest = _reply_with_quote("Sounds good, tell me more")
+    subject, _ = responder.compose_reply(cfg, item, prospect, [latest], latest, "interested")
+
+    # item.subject is "Hiring support for Acme" -- the model's invented
+    # "Tech and AI talent delivery" must never win.
+    assert subject == "Re: Hiring support for Acme"
+
+
+def test_compose_reply_prefers_the_latest_replys_subject_over_the_items(cfg, item, prospect, monkeypatch):
+    """latest_reply.subject (their actual mail client's Re: line) is a more
+    faithful thread anchor than item.subject when the two differ -- e.g. a
+    prospect's client already normalized it -- and still wins regardless of
+    whatever the model returned."""
+    monkeypatch.setattr(
+        "outreach.conversation.responder.personalize._call_llm",
+        lambda p: "SUBJECT: Something else entirely\nBODY: Sure.\n\nAffan",
+    )
+
+    latest = _reply_with_quote("Sounds good")
+    assert latest.subject == "Re: Hiring support for Acme"
+    subject, _ = responder.compose_reply(cfg, item, prospect, [latest], latest, "interested")
+
+    assert subject == "Re: Hiring support for Acme"
+
+
+def test_compose_followup_ignores_a_hallucinated_subject(cfg, item, prospect, monkeypatch):
+    monkeypatch.setattr(
+        "outreach.conversation.responder.personalize._call_llm",
+        lambda p: "SUBJECT: A totally different subject\nBODY: Just checking in.\n\nAffan",
+    )
+
+    subject, _ = responder.compose_followup(cfg, item, prospect, followup_number=1, max_followups=3)
+
+    assert subject == "Re: Hiring support for Acme"
+
+
+# ---------------------------------------------------------------------------
 # in_reply_to actually reaching the send call -- the threading bug
 # ---------------------------------------------------------------------------
 #

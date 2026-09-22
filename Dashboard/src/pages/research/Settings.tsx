@@ -592,6 +592,28 @@ export function Settings({
                                     <Icon name="edit" size={14} />
                                     Rename run
                                   </button>
+                                  {r.finished_at && (
+                                    <>
+                                      <a
+                                        className="menu-item"
+                                        style={{ textDecoration: "none" }}
+                                        href={researchApi.exportExcelUrl(r.run_id)}
+                                        onClick={() => setRunMenuOpenId(null)}
+                                      >
+                                        <Icon name="export" size={14} />
+                                        Export: Excel — Companies &amp; Contacts
+                                      </a>
+                                      <a
+                                        className="menu-item"
+                                        style={{ textDecoration: "none" }}
+                                        href={researchApi.exportPdfUrl(r.run_id)}
+                                        onClick={() => setRunMenuOpenId(null)}
+                                      >
+                                        <Icon name="export" size={14} />
+                                        Export: PDF Reports — All Companies
+                                      </a>
+                                    </>
+                                  )}
                                   {r.stalled_count > 0 && (
                                     <button
                                       type="button"

@@ -126,6 +126,17 @@ If the Research API is unreachable, import fails loudly (`ResearchClientError`)
 — there is no local fallback read. This agent must never guess at Research's
 data.
 
+**Qualification failure status is carried through, not just qualify's
+success output.** `GET /runs/{run_id}/companies/{domain}` on Research now
+also returns `qualification_attempt` (see
+[Research_Agent/WORKFLOW.md](../Research_Agent/WORKFLOW.md#4-qualify--srccsgqualifypy-costs-tokens)) —
+`_to_imported_prospect` sets `ImportedProspect.qualification_failed = true`
+when that attempt's status is `"failed"` and there is no successful
+`qualification` for the same domain/run. A domain that was simply never
+qualified yet (`qualification_attempt is None`) is left `false` — "failed"
+and "not attempted" must stay visually distinct on the Prospects page, not
+both collapse to the same blank cell.
+
 ### Picking the one contact to email
 
 A company can have several Hunter.io contacts on record; only one is ever

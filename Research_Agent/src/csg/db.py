@@ -481,6 +481,43 @@ def get_qualifications(conn: SupabaseConn, run_id: str) -> dict[str, dict[str, A
     return {r["domain"]: r for r in rows}
 
 
+def save_qualification_attempt(
+    conn: SupabaseConn, run_id: str, domain: str, status: str,
+    error_reason: Optional[str] = None, error_detail: Optional[str] = None,
+) -> None:
+    """Record one qualification attempt (success or failure). `status` is
+    'succeeded' or 'failed'. Upserts on (domain, run_id) and bumps
+    attempt_count by reading the current row first -- attempts are rare
+    enough (bounded by MAX_RETRIES worth of backoff, one call per qualify_run
+    pass) that the extra read is not worth a raw SQL increment here."""
+    existing = get_qualification_attempt(conn, domain, run_id)
+    attempt_count = (existing["attempt_count"] + 1) if existing else 1
+    conn.upsert("qualification_attempts", [{
+        "domain": domain, "run_id": run_id, "status": status,
+        "error_reason": error_reason, "error_detail": error_detail,
+        "attempt_count": attempt_count, "last_attempted_at": _iso(utcnow()),
+    }], on_conflict="domain,run_id")
+
+
+def get_qualification_attempt(conn: SupabaseConn, domain: str, run_id: str) -> Optional[dict[str, Any]]:
+    rows = conn.select("qualification_attempts", domain=f"eq.{domain}", run_id=f"eq.{run_id}", limit=1)
+    return rows[0] if rows else None
+
+
+def get_qualification_attempts(conn: SupabaseConn, run_id: str) -> dict[str, dict[str, Any]]:
+    rows = conn.select("qualification_attempts", run_id=f"eq.{run_id}")
+    return {r["domain"]: r for r in rows}
+
+
+def get_failed_qualifications(conn: SupabaseConn, run_id: str) -> list[dict[str, Any]]:
+    """Domains whose most recent qualification attempt for this run failed
+    and have no successful qualification row -- i.e. still need a retry.
+    A domain that later succeeds after a prior failure is excluded here
+    (save_qualification_attempt('succeeded') overwrites the failed row)."""
+    rows = conn.select("qualification_attempts", run_id=f"eq.{run_id}", status="eq.failed")
+    return rows
+
+
 # --- contacts (Hunter.io) --------------------------------------------------
 
 def save_contacts(conn: SupabaseConn, domain: str, contacts: list[dict[str, Any]], source: str) -> int:

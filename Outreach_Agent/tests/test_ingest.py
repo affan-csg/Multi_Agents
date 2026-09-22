@@ -255,3 +255,58 @@ def test_to_imported_prospect_confirmed_hiring_signal():
     }
     prospect = ingest._to_imported_prospect(detail, "run1")
     assert prospect.hiring_signal == "confirmed"
+
+
+def test_to_imported_prospect_flags_qualification_failed():
+    """Regression: a company whose Research Agent qualification attempt
+    failed (and never succeeded) must be surfaced as qualification_failed on
+    the Outreach snapshot -- previously the only signal was pain_summary
+    being None, which is identical to 'never attempted' and let a real
+    failure render the same as an untried company on the Prospects page."""
+    detail = {
+        "company": {"domain": "acme.com", "name": "Acme"},
+        "score": {"tier": "A", "score": 80},
+        "qualification": None,
+        "qualification_attempt": {
+            "status": "failed", "error_reason": "rate_limited",
+            "error_detail": "429", "attempt_count": 4,
+        },
+        "postings": [],
+        "contacts": [{"email": "jane@acme.com"}],
+    }
+    prospect = ingest._to_imported_prospect(detail, "run1")
+    assert prospect.qualification_failed is True
+    assert prospect.pain_summary is None
+
+
+def test_to_imported_prospect_success_wins_over_a_stale_failed_attempt():
+    """A domain that failed once and then succeeded on retry must NOT be
+    flagged as failed -- the qualification dict (a real success) always
+    takes precedence over an older failed attempt record."""
+    detail = {
+        "company": {"domain": "acme.com", "name": "Acme"},
+        "score": {"tier": "A", "score": 80},
+        "qualification": {"pain_summary": "recovered", "recommended_angle": "angle"},
+        "qualification_attempt": {
+            "status": "succeeded", "error_reason": None,
+            "error_detail": None, "attempt_count": 2,
+        },
+        "postings": [],
+        "contacts": [{"email": "jane@acme.com"}],
+    }
+    prospect = ingest._to_imported_prospect(detail, "run1")
+    assert prospect.qualification_failed is False
+    assert prospect.pain_summary == "recovered"
+
+
+def test_to_imported_prospect_never_attempted_is_not_flagged_as_failed():
+    detail = {
+        "company": {"domain": "acme.com", "name": "Acme"},
+        "score": {"tier": "A", "score": 80},
+        "qualification": None,
+        "qualification_attempt": None,
+        "postings": [],
+        "contacts": [{"email": "jane@acme.com"}],
+    }
+    prospect = ingest._to_imported_prospect(detail, "run1")
+    assert prospect.qualification_failed is False

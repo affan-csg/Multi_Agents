@@ -181,6 +181,17 @@ export interface CompanyDetail {
     model: string;
     qualified_at: string;
   } | null;
+  /** Latest qualification attempt for this company+run, success or failure --
+   *  null only when qualification was never attempted at all. Lets the UI
+   *  distinguish "not qualified yet" from "qualification failed, retry" (see
+   *  Research_Agent's qualification_attempts table / migrations/004). */
+  qualification_attempt: {
+    status: "succeeded" | "failed";
+    error_reason: string | null;
+    error_detail: string | null;
+    attempt_count: number;
+    last_attempted_at: string;
+  } | null;
   contacts: Array<{
     email: string;
     first_name: string | null;
@@ -395,10 +406,19 @@ export const researchApi = {
       body: JSON.stringify({ domain, reason }),
     }),
 
-  startQualify: (runId: string, tiers: string[], force = false) =>
+  startQualify: (runId: string, tiers: string[], force = false, domains?: string[]) =>
     req<{ job_id: string | null; message?: string; provider?: string; companies?: number }>(
       `/runs/${runId}/qualify`,
-      { method: "POST", body: JSON.stringify({ tiers, force }) },
+      { method: "POST", body: JSON.stringify({ tiers, force, domains: domains ?? null }) },
+    ),
+
+  listFailedQualifications: (runId: string) =>
+    req<ScoredCompany[]>(`/runs/${runId}/qualify/failed`),
+
+  retryFailedQualifications: (runId: string) =>
+    req<{ job_id: string | null; message?: string; provider?: string; companies?: number }>(
+      `/runs/${runId}/qualify/retry-failed`,
+      { method: "POST" },
     ),
 
   startContacts: (runId: string, tiers: string[], force = false) =>
@@ -453,6 +473,13 @@ export const researchApi = {
       method: "PATCH",
       body: JSON.stringify(fields),
     }),
+
+  /** URLs for the two on-demand, read-only exports (see Research_Agent's
+   *  GET /runs/{run_id}/export/excel|pdf) -- plain download links, not
+   *  fetch() calls, so the browser's native file-download flow handles the
+   *  streamed response (same pattern as any `<a href>` file download). */
+  exportExcelUrl: (runId: string) => `${BASE}/runs/${runId}/export/excel`,
+  exportPdfUrl: (runId: string) => `${BASE}/runs/${runId}/export/pdf`,
 
   jobStatus: (jobId: string) => req<JobSnapshot>(`/jobs/${jobId}`),
 

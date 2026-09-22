@@ -112,6 +112,26 @@ theoretical one.
      Anthropic+`web_search`; skipped (not an error) if either key is unset.
 3. **Database**: paste [schema.sql](schema.sql) into **this** Outreach
    Supabase project's SQL editor (a fresh project, separate from Research's).
+   On an existing project, re-running the whole file is safe
+   (`CREATE TABLE IF NOT EXISTS`/`ADD COLUMN IF NOT EXISTS`), or apply just
+   [migrations/003_prospects_run_history.sql](migrations/003_prospects_run_history.sql)
+   and [migrations/004_prospects_qualification_failed.sql](migrations/004_prospects_qualification_failed.sql)
+   on their own.
+
+## Qualification status — reflecting Research's qualify outcome
+
+A cached prospect's `qualification_failed` flag (`models.ImportedProspect`)
+mirrors Research's own `qualification_attempt` for that domain/run:
+`true` only when the *latest* qualify attempt over there failed and nothing
+has succeeded since (`ingest._to_imported_prospect`). It's refreshed on
+every re-import — there is no live join back to Research, so if a company
+was retried and fixed on the Research side, re-importing (the Prospects
+page's "Import qualified prospects" button) is what picks that up here.
+
+The Prospects page shows this as a distinct "failed" badge (with the
+failure reason in a tooltip) in the Qualified column, separate from both
+"yes" (has a `pain_summary`) and "—" (never attempted) — see
+[Dashboard/src/pages/outreach/Prospects.tsx](../Dashboard/src/pages/outreach/Prospects.tsx).
 
 ## Running it
 
@@ -378,7 +398,7 @@ code changes needed to adjust it:
 pytest
 ```
 
-254 tests, no network (a fake in-memory PostgREST fixture in
+269 tests, no network (a fake in-memory PostgREST fixture in
 [tests/conftest.py](tests/conftest.py) stands in for Supabase):
 
 - [test_ingest.py](tests/test_ingest.py) — importing prospects from
@@ -387,9 +407,13 @@ pytest
   (never padded into a `limit` slot, never given a `needs_review` item); the
   one remaining `pending` vs. `needs_review` gate at campaign creation
   (draft genuinely personalized), which only ever holds an already-contactable
-  prospect for review, never excludes it; and that `hiring_signal` survives
+  prospect for review, never excludes it; that `hiring_signal` survives
   the Research → Outreach handoff onto `ImportedProspect` (`"confirmed"` |
-  `"unknown"`, see the Research Agent's `models.HiringSignal`).
+  `"unknown"`, see the Research Agent's `models.HiringSignal`); and that
+  `qualification_failed` is set from Research's `qualification_attempt`
+  field only when the latest attempt actually failed with no success since —
+  never for a domain that hasn't been qualified yet, and never once a retry
+  succeeds (see **Qualification status** below).
 - [test_personalize.py](tests/test_personalize.py) — the full tiered
   personalization strategy: `pain_summary`/`recommended_angle` (qualify
   output) → other cached research data (industry/description/open

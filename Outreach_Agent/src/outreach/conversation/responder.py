@@ -171,8 +171,20 @@ def compose_reply(
     if not parsed:
         return None
 
-    subject, body = parsed
-    return _thread_subject(subject or latest_reply.subject or item.subject), body
+    # The model is asked to keep the thread's subject (see
+    # conversation_reply.md's SUBJECT instruction), but an instruction is not
+    # a guarantee: an LLM can paraphrase or invent a subject line even when
+    # told to preserve one verbatim -- observed directly (a reply to "Quick
+    # question about your hiring pipeline" came back subjected "Re: Tech and
+    # AI talent delivery"). Gmail and most clients thread primarily on
+    # Subject + In-Reply-To/References together, so a drifted subject here
+    # sends the reply into a brand-new conversation in the recipient's inbox
+    # even though matcher.py still correctly resolves it as the same item
+    # server-side. The parsed `subject` is therefore discarded outright for a
+    # cold-reply/follow-up send -- _thread_subject always derives from the
+    # real prior subject, never from what the model returned.
+    _, body = parsed
+    return _thread_subject(latest_reply.subject or item.subject), body
 
 
 def revise_reply(
@@ -256,8 +268,11 @@ def compose_followup(
     if not parsed:
         return None
 
-    subject, body = parsed
-    return _thread_subject(subject or item.subject), body
+    # Same reasoning as compose_reply above: never trust the model's own
+    # SUBJECT for a follow-up either -- always thread against the original
+    # outreach item's real subject.
+    _, body = parsed
+    return _thread_subject(item.subject), body
 
 
 def store_and_maybe_send(

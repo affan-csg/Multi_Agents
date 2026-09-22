@@ -661,7 +661,7 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
               {isDraft ? "Draft" : "Active"}
             </span>
           </h1>
-          <p>5-stage pipeline for research-based outreach.</p>
+          <p>6-stage pipeline for research-based outreach.</p>
         </div>
         <div className="page-head-actions">
           {/* Conversation Agent toggle. Switching it on never sends anything

@@ -88,6 +88,17 @@ class FakeConn:
             elif expr.startswith("gt."):
                 want = expr[3:]
                 rows = [r for r in rows if r.get(field) is not None and str(r.get(field)) > want]
+            elif expr.startswith("cs."):
+                # PostgREST's JSON/array "contains" operator, e.g.
+                # `research_run_ids=cs.["disc-A"]` -- matches rows whose
+                # `field` (a Python list, since JSONB round-trips as one
+                # here) contains every element of the query's array. Only
+                # single-element containment checks are needed by this
+                # codebase (list_prospects filters on one run_id at a time),
+                # so a minimal json.loads + subset check is enough.
+                import json as _json
+                wanted = set(_json.loads(expr[3:]))
+                rows = [r for r in rows if wanted.issubset(set(r.get(field) or []))]
         if order:
             field = order.split(".")[0]
             desc = "desc" in order

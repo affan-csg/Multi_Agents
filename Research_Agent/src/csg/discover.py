@@ -404,16 +404,31 @@ async def _auto_qualify_and_contact(
     conn: SupabaseConn, run_id: str, top_n: int, stats: DiscoveryStats,
     on_progress: Optional[ProgressFn],
 ) -> None:
-    """Qualify + find contacts for the top `top_n` scored companies that
-    landed in Tier A/B -- see run_discovery's docstring. Failures here are
-    recorded on `stats`, not raised: the discovery/scoring run itself already
-    succeeded and must not be reported as failed just because the optional
-    qualify/contacts add-on hit a missing API key or quota limit.
+    """Qualify + find contacts for the top `top_n` Tier A/B scored companies
+    -- see run_discovery's docstring.
+
+    `top_n` slices AFTER filtering to Tier A/B, not before: ranking the full
+    (all-tier) list first and filtering to A/B afterward would let Tier C/D
+    companies occupy slots in the top-N window, silently pushing genuinely
+    eligible Tier A/B companies (ranked N+1, N+2, ... among A/B specifically)
+    out of qualification even though every requirement (make sure every
+    Tier A/B prospect gets qualified, up to the cost cap) says they should be
+    covered. Tier is a monotonic function of score, so in practice this only
+    differs from the old "slice-then-filter" behavior when there are MORE
+    than top_n Tier A/B companies in the run -- exactly the case that must
+    not be silently short-changed.
+
+    Failures here are recorded on `stats`, not raised: the discovery/scoring
+    run itself already succeeded and must not be reported as failed just
+    because the optional qualify/contacts add-on hit a missing API key or
+    quota limit.
     """
-    ranked = [r for r in db.get_scores(conn, run_id) if not r.get("disqualified")][:top_n]
-    domains = [r["domain"] for r in ranked if r["tier"] in ("A", "B")]
+    eligible = [r for r in db.get_scores(conn, run_id)
+                if not r.get("disqualified") and r["tier"] in ("A", "B")]
+    ranked = eligible[:top_n]
+    domains = [r["domain"] for r in ranked]
     stats.auto_qualify_top_n = len(ranked)
-    stats.auto_qualify_skipped_tier = len(ranked) - len(domains)
+    stats.auto_qualify_skipped_tier = 0
     if not domains:
         return
 

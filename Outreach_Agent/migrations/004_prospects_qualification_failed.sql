@@ -1,0 +1,23 @@
+-- Migration 004 -- add prospects.qualification_failed
+--
+-- Run this ONCE in the Outreach project's Supabase SQL editor if that
+-- project was provisioned before this migration existed. A freshly
+-- provisioned project does not need this file -- schema.sql already has
+-- the column. Safe to run more than once (IF NOT EXISTS).
+--
+-- Why: the Prospects page's "Qualified" column used to read `pain_summary
+-- IS NOT NULL`, which is indistinguishable between "never attempted
+-- qualification" and "qualification was attempted and failed". This column
+-- carries that distinction over from the Research Agent's
+-- qualification_attempts table (see Research_Agent/migrations/004) so a
+-- failed qualification is visibly different from an unattempted one instead
+-- of both silently rendering as "-".
+--
+-- Backfill: existing rows default to FALSE ("no known failure"), which is
+-- correct -- a prospect imported before this column existed was, by
+-- definition, successfully qualified (only successfully-qualified/contacted
+-- Tier A/B companies were ever imported into Outreach in the first place).
+-- The next re-import (or the Research Agent's own retry-failed action)
+-- keeps this field current going forward.
+
+ALTER TABLE prospects ADD COLUMN IF NOT EXISTS qualification_failed BOOLEAN NOT NULL DEFAULT FALSE;

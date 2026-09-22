@@ -355,6 +355,36 @@ sends it to an LLM using the prompt template in
 qualification can be re-run with a different model/prompt without
 re-scoring.
 
+**Every attempt is recorded, success or failure — a failure is never
+silently indistinguishable from "never tried."** Alongside `qualifications`
+(success-only), each domain's outcome is upserted into
+`qualification_attempts` (`domain, run_id, status, error_reason,
+error_detail, attempt_count, last_attempted_at` — see
+[migrations/004_qualification_attempts.sql](migrations/004_qualification_attempts.sql)),
+whether the LLM call actually succeeded or errored out. This is what lets
+the Company Detail page distinguish "not qualified yet" (no attempt row)
+from "qualification failed" (an attempt row with `status="failed"`), and
+what `failed_rows()`/`retry_failed_run()` (below) query against.
+Persisting the attempt is wrapped in its own try/except inside the worker,
+so a DB write failure on the attempts table can never crash the qualify job
+itself.
+
+**Retrying a failure doesn't require re-qualifying the whole run.**
+`qualify.failed_rows(conn, run_id)` returns exactly the domains whose most
+recent attempt failed and haven't succeeded since; `qualify.retry_failed_run(conn,
+run_id)` re-runs `qualify_run` scoped to just those domains
+(`force=True, domains=[...]`), or is a zero-cost no-op (never calling the
+LLM backend at all) when nothing has failed. Exposed as
+`GET /runs/{run_id}/qualify/failed` and `POST /runs/{run_id}/qualify/retry-failed`,
+and surfaced in the Dashboard as a banner on the Companies page ("N
+qualifications failed — Retry failed") that only renders when the count is
+non-zero.
+
+**A single company's "Qualify with AI" button is scoped to just that
+company.** `POST /runs/{run_id}/qualify` accepts an optional `domains` list;
+when given, `pending_rows`/`qualify_run` restrict to exactly those domains
+instead of every pending company in the requested tiers.
+
 Two ways to trigger it:
 - **Automatically for Tier A/B, capped** — part of
   `discover_mod.run_discovery` (`discover.py`'s `_auto_qualify_and_contact`).

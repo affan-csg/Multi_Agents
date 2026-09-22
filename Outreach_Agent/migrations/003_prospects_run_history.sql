@@ -1,0 +1,40 @@
+-- Migration 003 -- add prospects.research_run_ids, fixing a bug where
+-- prospects already imported for a research run would disappear from the
+-- Prospects page's per-run filter after that same research/region was run
+-- again.
+--
+-- Root cause: the Research Agent has no way to "resume" a previous run --
+-- discover.run_discovery always mints a brand-new run_id
+-- (disc-<timestamp>) for every discovery, even for the exact same region,
+-- and the Dashboard's "Start research" never passes an existing run_id.
+-- When that new run auto-imports a company Outreach had already cached from
+-- an earlier run, db.upsert_prospect used to overwrite research_run_id
+-- outright (upsert is keyed on research_domain alone). A person still
+-- viewing the Prospects page filtered to the OLDER run would then see that
+-- prospect vanish, even though it was never deleted -- it just silently
+-- became scoped to the new run only.
+--
+-- The fix keeps research_run_id as "which run this snapshot's data
+-- currently reflects" (unchanged meaning, still overwritten on re-import)
+-- and adds research_run_ids as the full membership history: every run_id
+-- that has ever imported this domain. list_prospects(run_id=...) now
+-- filters on membership in this array, so a prospect stays visible under
+-- every run that ever surfaced it, not just the latest one.
+--
+-- Run this ONCE in the Outreach project's Supabase SQL editor if that
+-- project was provisioned before this migration existed. A freshly
+-- provisioned project does not need this file -- schema.sql already has
+-- the column. Safe to run more than once (IF NOT EXISTS).
+--
+-- Backfill: existing rows get research_run_ids = '[]' by the column
+-- default, not `[research_run_id]` -- backfilling from the single column
+-- would just be guessing that "the last known run" was the "only" run,
+-- which isn't reliably true and doesn't need to be: the very next
+-- import/upsert of a still-relevant prospect appends its run_id into the
+-- (initially empty) list, same as any brand-new prospect would. A prospect
+-- that is never re-imported again keeps working exactly as before --
+-- read/deletion by the single research_run_id column is untouched, and it
+-- only stops showing up under the per-run filter until its next import,
+-- which is a one-time, harmless narrowing rather than data loss.
+
+ALTER TABLE prospects ADD COLUMN IF NOT EXISTS research_run_ids JSONB NOT NULL DEFAULT '[]'::jsonb;

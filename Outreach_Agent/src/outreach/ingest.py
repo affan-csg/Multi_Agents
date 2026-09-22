@@ -56,6 +56,7 @@ def _to_imported_prospect(detail: dict[str, Any], run_id: str) -> ImportedProspe
     company = detail.get("company") or {}
     score = detail.get("score") or {}
     qualification = detail.get("qualification") or {}
+    qualification_attempt = detail.get("qualification_attempt") or {}
     contacts = detail.get("contacts") or []
     best_contact = _best_contact(contacts)
 
@@ -72,6 +73,10 @@ def _to_imported_prospect(detail: dict[str, Any], run_id: str) -> ImportedProspe
         recommended_angle=qualification.get("recommended_angle"),
         open_reqs=(detail.get("postings") or [])[:10],
         hiring_signal=company.get("hiring_signal"),
+        # A qualification row (above) always wins if one exists -- this only
+        # reflects "failed and nothing has succeeded since" (see
+        # ImportedProspect.qualification_failed).
+        qualification_failed=not qualification and qualification_attempt.get("status") == "failed",
         contact_email=best_contact.get("email"),
         contact_name=" ".join(
             x for x in (best_contact.get("first_name"), best_contact.get("last_name")) if x

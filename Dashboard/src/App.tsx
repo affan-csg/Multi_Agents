@@ -19,6 +19,7 @@ import { ConfirmModal } from "./components/ConfirmModal";
 import { RunOverlay } from "./components/RunOverlay";
 import { ToastStack, type ToastData } from "./components/Toast";
 import { RunSelector } from "./components/RunSelector";
+import { FailedQualificationsBanner } from "./components/FailedQualificationsBanner";
 import { CampaignSelector } from "./components/CampaignSelector";
 import { Home } from "./pages/Home";
 import { RunConfig } from "./pages/research/RunConfig";
@@ -351,7 +352,18 @@ function App() {
     setPendingAction(null);
 
     try {
-      const resp = kind === "qualify" ? await researchApi.startQualify(actionRunId, tiers) : await researchApi.startContacts(actionRunId, tiers);
+      // A single-domain action (e.g. CompanyDetail's "Qualify with AI") must
+      // be scoped to just that domain and forced -- without `domains`, this
+      // used to broaden to every pending company across all four tiers
+      // (tiers was widened to A-D above but the domain restriction was never
+      // actually sent), so clicking "qualify" for one company silently
+      // re-qualified the whole run instead. `force: true` ensures a person
+      // re-qualifying one already-qualified company (e.g. after editing the
+      // prompt, or retrying a stale result) isn't silently skipped by the
+      // already-qualified check.
+      const resp = kind === "qualify"
+        ? await researchApi.startQualify(actionRunId, tiers, !!pendingAction.domains, pendingAction.domains)
+        : await researchApi.startContacts(actionRunId, tiers);
       if (!resp.job_id) {
         pushToast({ tone: "success", title: resp.message || "Nothing to do" });
         return;
@@ -422,18 +434,31 @@ function App() {
         )}
 
         {route.name === "research-companies" && (
-          <Companies
-            rows={rows}
-            loading={rowsLoading}
-            hasRun={runs.length > 0}
-            filter={companyFilter}
-            selectedDomain={selectedDomain}
-            savedDomains={savedDomains}
-            onFilterChange={setCompanyFilter}
-            onSelect={setSelectedDomain}
-            onToggleSave={toggleSave}
-            onNewRun={() => navigate({ name: "research-runs" })}
-          />
+          <>
+            <FailedQualificationsBanner
+              runId={actionRunId}
+              onRetryStarted={(jobId, total) => {
+                setActiveJob({
+                  job_id: jobId, kind: "qualify", run_id: actionRunId,
+                  status: "pending", done: 0, total, current_domain: null,
+                  result: null, error: null,
+                });
+                watchJob(jobId);
+              }}
+            />
+            <Companies
+              rows={rows}
+              loading={rowsLoading}
+              hasRun={runs.length > 0}
+              filter={companyFilter}
+              selectedDomain={selectedDomain}
+              savedDomains={savedDomains}
+              onFilterChange={setCompanyFilter}
+              onSelect={setSelectedDomain}
+              onToggleSave={toggleSave}
+              onNewRun={() => navigate({ name: "research-runs" })}
+            />
+          </>
         )}
 
         {route.name === "research-analytics" && <Analytics runId={scopeRun} runs={runs} />}

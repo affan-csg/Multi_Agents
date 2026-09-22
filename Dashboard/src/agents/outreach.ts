@@ -37,6 +37,16 @@ export interface ExcludedProspect {
 export interface ImportedProspect {
   research_domain: string;
   research_run_id: string | null;
+  /** Every research run that has ever imported this domain, not just the
+   *  most recent one (`research_run_id` above) -- this is what
+   *  GET /prospects?run_id=... filters membership on server-side, so a
+   *  prospect stays visible under an older run's filtered view even after a
+   *  later rerun (which always gets a brand-new run_id -- the Research
+   *  Agent has no "resume this run" path) refreshed its data under a new
+   *  run. The frontend doesn't need to filter on this directly today (the
+   *  backend already scopes the response to `run_id`), it's just part of
+   *  the wire shape now. */
+  research_run_ids: string[];
   name: string | null;
   tier: string | null;
   score: number | null;
@@ -53,6 +63,13 @@ export interface ImportedProspect {
    *  Never read an empty `open_reqs` as "not hiring" when this is
    *  'unknown'. */
   hiring_signal: "confirmed" | "unknown" | null;
+  /** True when the Research Agent's last qualification attempt for this
+   *  domain failed and nothing has succeeded since (see Research_Agent's
+   *  qualification_attempts table). Distinguishes "qualification failed,
+   *  retry in Research" from "never attempted" -- both used to render
+   *  identically as pain_summary === null. Refreshed only on re-import;
+   *  Outreach never calls Research's qualify endpoints itself. */
+  qualification_failed: boolean;
   contact_email: string | null;
   contact_name: string | null;
   contact_position: string | null;

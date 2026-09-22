@@ -304,7 +304,11 @@ def pending_rows(
     Without `force`, a domain already qualified for this run_id is excluded --
     this is what makes `csg qualify` cheap to re-run after partial failures
     (only the missing ones cost tokens/quota) and what the CLI's cost preview
-    counts before asking for confirmation.
+    counts before asking for confirmation. A domain whose last attempt FAILED
+    is never considered "already qualified" here -- only a row in
+    `qualifications` (a real success) counts, so a previously-failed company
+    is picked up again on the very next un-forced run without needing
+    `force=True` at all. See `failed_rows` for filtering to just those.
     """
     want = {t.upper() for t in (tiers or ["A", "B"])}
     rows = [r for r in db.get_scores(conn, run_id) if r["tier"] in want]
@@ -315,6 +319,21 @@ def pending_rows(
         return rows
     already = set(db.get_qualifications(conn, run_id).keys())
     return [r for r in rows if r["domain"] not in already]
+
+
+def failed_rows(conn: SupabaseConn, run_id: str) -> list[dict[str, Any]]:
+    """Scored companies in `run_id` whose most recent qualification attempt
+    failed and have no successful qualification since -- the "Retry failed"
+    action's input. Distinct from `pending_rows` (which is "not yet
+    attempted OR failed"): this is specifically "attempted and failed", for
+    a UI that wants to show/retry only genuine failures rather than
+    re-running the full pending set."""
+    failed_domains = {r["domain"] for r in db.get_failed_qualifications(conn, run_id)}
+    if not failed_domains:
+        return []
+    already = set(db.get_qualifications(conn, run_id).keys())
+    failed_domains -= already
+    return [r for r in db.get_scores(conn, run_id) if r["domain"] in failed_domains]
 
 
 async def qualify_run(
@@ -367,12 +386,29 @@ async def qualify_run(
                     recommended_angle=qual.recommended_angle,
                     model=backend.model,
                 )
+                db.save_qualification_attempt(conn, run_id, row["domain"], status="succeeded")
                 conn.commit()
                 stats["qualified"] += 1
             except Exception as exc:
                 stats["errors"] += 1
                 reason = classify_error(exc)
-                stats["error_details"][row["domain"]] = f"[{reason}] {type(exc).__name__}: {exc}"
+                detail = f"{type(exc).__name__}: {exc}"
+                stats["error_details"][row["domain"]] = f"[{reason}] {detail}"
+                # Persisted even though save_qualification never ran for this
+                # domain -- a failure must be queryable/retryable, not
+                # indistinguishable from "never attempted" (see migrations/004).
+                try:
+                    db.save_qualification_attempt(
+                        conn, run_id, row["domain"], status="failed",
+                        error_reason=reason, error_detail=detail,
+                    )
+                    conn.commit()
+                except Exception as persist_exc:
+                    # The qualification failure itself is already recorded in
+                    # stats/error_details above; losing the DB-side attempt
+                    # record too must not crash the whole run over it.
+                    print(f"[qualify] failed to persist attempt record for "
+                          f"{row['domain']}: {persist_exc}", file=sys.stderr)
             done += 1
             if on_progress:
                 on_progress(done, len(rows), row["domain"])
@@ -380,3 +416,30 @@ async def qualify_run(
     await asyncio.gather(*(worker(r) for r in rows))
     await backend.close()
     return stats
+
+
+async def retry_failed_run(
+    conn: SupabaseConn,
+    run_id: str,
+    limit_reqs: int = 8,
+    on_progress: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Retry only the domains whose last qualification attempt for `run_id`
+    failed (see `failed_rows`) and have not since succeeded. Reuses
+    `qualify_run` with an explicit `domains` list and `force=True` -- `force`
+    is needed here specifically because a failed domain has no row in
+    `qualifications`, so `pending_rows` would already include it without
+    `force`, but forcing keeps this call's intent explicit ("retry exactly
+    these") regardless of pending_rows' own already-qualified logic.
+    Returns the same {"qualified", "skipped", "errors", "error_details"}
+    shape as qualify_run; {"qualified": 0, "skipped": 0, "errors": 0,
+    "error_details": {}} if nothing is currently failed.
+    """
+    rows = failed_rows(conn, run_id)
+    if not rows:
+        return {"qualified": 0, "skipped": 0, "errors": 0, "error_details": {}}
+    domains = [r["domain"] for r in rows]
+    return await qualify_run(
+        conn, run_id, limit_reqs=limit_reqs, force=True,
+        on_progress=on_progress, domains=domains,
+    )

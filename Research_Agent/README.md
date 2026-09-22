@@ -89,6 +89,20 @@ csg contacts --run <run_id>                 # HR contact discovery via Hunter.io
 csg export --run <run_id>                   # re-export CSV/JSONL
 ```
 
+**A qualification attempt is never silently dropped on failure.** Every
+`csg qualify` domain (automatic or by hand) records its outcome —
+`succeeded` or `failed`, with a reason — in the `qualification_attempts`
+table, separate from the success-only `qualifications` table. A company
+whose LLM call errored out shows as **qualification failed**, not
+identical to "never attempted": the Company Detail page and the Outreach
+Prospects page both show this state explicitly (with the failure reason and
+attempt count), and `GET /runs/{run_id}/qualify/failed` +
+`POST /runs/{run_id}/qualify/retry-failed` (surfaced in the Dashboard as a
+banner on the Companies page) let you retry just the domains that actually
+failed, without re-qualifying everything else in the run. See
+[WORKFLOW.md](WORKFLOW.md#4-qualify--srccsgqualifypy-costs-tokens) for the
+full mechanics.
+
 **The CLI and the API/Dashboard behave differently on purpose here.** A plain
 `csg discover` with no flag spends nothing beyond discovery + scoring —
 qualify/contacts stay explicit, opt-in steps (`--auto-qualify-top N`, behind
@@ -249,7 +263,7 @@ drifts out of sync with what the agent actually searches for.
 pytest
 ```
 
-231 tests, no network and no LLM calls (HTTP boundaries are mocked with
+295 tests, no network and no LLM calls (HTTP boundaries are mocked with
 `httpx.MockTransport` or a fake fetcher/DB, not real calls) — the
 deterministic core and every provider integration is fully covered:
 
@@ -299,6 +313,26 @@ deterministic core and every provider integration is fully covered:
   the research run.
 - [test_outreach_client.py](tests/test_outreach_client.py) — `OutreachClient`
   against a mocked HTTP transport: job polling, timeouts, and error surfacing.
+- [test_db_qualification_attempts.py](tests/test_db_qualification_attempts.py) —
+  round-trip tests for the `qualification_attempts` ledger: attempt-count
+  increments across repeated failures, a later success overwriting a stale
+  failure's status, and run-scoped/status-filtered reads
+  (`get_qualification_attempts`, `get_failed_qualifications`).
+- [test_qualify_run.py](tests/test_qualify_run.py) — `qualify_run` end to
+  end against a fake backend/DB: a success persists to both
+  `qualifications` and `qualification_attempts`; a failure persists as
+  `failed` instead of being dropped; partial failure across several
+  companies leaves each one's own correct status; `retry_failed_run` only
+  re-qualifies domains whose latest attempt failed (never a domain that's
+  never been tried or already succeeded) and is a no-op that never touches
+  the LLM backend when nothing has failed; and `_complete_with_retry`'s
+  existing backoff recovers from a transient error, gives up after
+  `MAX_RETRIES`, and never retries a permanent one.
+- [test_api_qualify.py](tests/test_api_qualify.py) — the qualify HTTP
+  surface: `POST /qualify`'s `domains` restriction (the fix for a single
+  company's "Qualify with AI" button previously widening to the whole
+  pending set), `GET /qualify/failed`, `POST /qualify/retry-failed`, and
+  `company_detail`'s `qualification_attempt` field.
 
 There is still no automated end-to-end test: a real run makes live HTTP calls
 to career sites and the Gemini API. See [WORKFLOW.md](WORKFLOW.md) for what a
@@ -323,6 +357,19 @@ live in [migrations/](migrations/):
   `job_postings.{delivery_fit,practice_area}`, and converts
   `companies.employee_count` from an integer to a JSONB provenance envelope.
   Without it, researched firmographics are silently discarded on write.
+- [002_api_usage.sql](migrations/002_api_usage.sql) — adds the `api_usage`
+  table the Settings > Usage & Quota tab reads from. Without it,
+  `GET /settings/usage` just returns all-zero data instead of erroring.
+- [003_job_discovery_fallback.sql](migrations/003_job_discovery_fallback.sql) —
+  adds `companies.{job_discovery_method,job_source,hiring_signal,job_discovery_notes}`
+  for the ATS → careers-page → web-search → unknown fallback chain (see
+  **Job discovery fallback chain** in [WORKFLOW.md](WORKFLOW.md)).
+- [004_qualification_attempts.sql](migrations/004_qualification_attempts.sql) —
+  adds the `qualification_attempts` table (see **Running it** above). Needed
+  on any existing project to get per-domain qualify failure tracking, the
+  Company Detail page's failure state, and the retry-failed banner/route —
+  without it those simply have nothing to read and behave as if nothing has
+  ever failed.
 
 Earlier migrations, kept in `scratchpad/` as a record:
 - [migration_add_fk_cascades.sql](scratchpad/migration_add_fk_cascades.sql) —

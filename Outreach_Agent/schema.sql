@@ -27,7 +27,14 @@
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS prospects (
     research_domain     TEXT PRIMARY KEY,       -- = companies.domain in the Research DB
-    research_run_id     TEXT,                   -- which Research run this snapshot came from
+    research_run_id     TEXT,                   -- which Research run this snapshot's data currently reflects (most recent import)
+    -- Every run_id that has EVER imported this domain, not just the most
+    -- recent one -- see db.upsert_prospect/list_prospects. Re-running
+    -- discovery for "the same research" always produces a fresh run_id
+    -- (Research has no way to resume an old one), so without this, a prospect
+    -- re-imported under a new run would silently vanish from a person's view
+    -- of the old run on the Prospects page even though it was never deleted.
+    research_run_ids    JSONB NOT NULL DEFAULT '[]'::jsonb,
     name                TEXT,
     tier                TEXT,
     score                REAL,
@@ -43,6 +50,12 @@ CREATE TABLE IF NOT EXISTS prospects (
     -- Research_Agent's models.HiringSignal and this project's
     -- ImportedProspect.hiring_signal / personalize._render_open_reqs.
     hiring_signal       TEXT,
+    -- True when Research's last qualification attempt for this domain FAILED
+    -- and nothing has succeeded since (see ingest._to_imported_prospect and
+    -- Research_Agent's qualification_attempts table / migrations/004). Lets
+    -- the Prospects table show "qualification failed" distinctly from "never
+    -- qualified" instead of both reading as a bare pain_summary IS NULL.
+    qualification_failed BOOLEAN NOT NULL DEFAULT FALSE,
     -- Best contact only (email required by Research's own outreach_ready
     -- gate -- see Research_Agent/src/csg/models.py Prospect.compute_outreach_flags).
     -- If Research later returns multiple contacts worth messaging separately,

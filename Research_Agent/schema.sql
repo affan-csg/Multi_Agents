@@ -118,6 +118,22 @@ CREATE TABLE IF NOT EXISTS qualifications (
     PRIMARY KEY (domain, run_id)
 );
 
+-- Per-(domain, run_id) qualification attempt ledger -- see migrations/004 for
+-- the full rationale. `qualifications` above only ever gets a row on success;
+-- this table records every attempt, success or failure, so a failed
+-- qualification is queryable and retryable instead of looking identical to
+-- "never attempted".
+CREATE TABLE IF NOT EXISTS qualification_attempts (
+    domain             TEXT NOT NULL REFERENCES companies(domain) ON DELETE CASCADE,
+    run_id             TEXT NOT NULL,
+    status             TEXT NOT NULL,  -- 'failed' | 'succeeded'
+    error_reason       TEXT,           -- classify_error() bucket; NULL when status='succeeded'
+    error_detail       TEXT,           -- human-readable exception text for the last attempt
+    attempt_count      INT NOT NULL DEFAULT 1,
+    last_attempted_at  TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (domain, run_id)
+);
+
 -- Saved companies ("saved lists" in the UI). Keyed by domain only, not
 -- run_id: a save is a human judgement about the company itself, so it
 -- outlives the run that surfaced it and stays valid across re-scores.

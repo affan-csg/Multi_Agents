@@ -131,8 +131,8 @@ fixture stands in for Supabase — see each project's `tests/conftest.py`),
 so no live database or API keys are needed to run them:
 
 ```
-cd Research_Agent && pytest    # 231 passed
-cd Outreach_Agent  && pytest   # 254 passed (99 outreach + 155 conversation)
+cd Research_Agent && pytest    # 295 passed
+cd Outreach_Agent  && pytest   # 269 passed (114 outreach + 155 conversation)
 ```
 
 The Dashboard has no test suite; its guard rail is the TypeScript compiler:

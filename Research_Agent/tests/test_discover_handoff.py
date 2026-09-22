@@ -49,10 +49,8 @@ def _score_row(domain: str, tier: str, score: float, disqualified: bool = False)
 
 
 def test_auto_qualify_selects_only_tier_ab_within_the_cap(monkeypatch):
-    """Tier is a monotonic function of score (A=70+, B=50+, C=35+) and
-    get_scores orders score.desc, so 'top N ranked' and 'every Tier A/B
-    capped at N' are equivalent -- this locks in that no Tier C/D company
-    can ever sneak in ahead of a Tier A/B one."""
+    """Only Tier A/B (and never a disqualified company) is ever selected,
+    regardless of tier interleaving in the ranked list."""
     rows = [
         _score_row("a1.com", "A", 90),
         _score_row("b1.com", "B", 60),
@@ -81,8 +79,47 @@ def test_auto_qualify_selects_only_tier_ab_within_the_cap(monkeypatch):
 
     assert captured_domains["qualify"] == ["a1.com", "b1.com"]
     assert captured_domains["contacts"] == ["a1.com", "b1.com"]
-    assert stats.auto_qualify_top_n == 3  # a1, b1, c1 -- dq.com filtered before the slice
-    assert stats.auto_qualify_skipped_tier == 1  # c1.com
+    assert stats.auto_qualify_top_n == 2  # a1, b1 -- c1 (Tier C) and dq (disqualified) never counted
+    assert stats.auto_qualify_skipped_tier == 0  # nothing is "skipped for tier" any more -- off-tier rows are never in the candidate pool to begin with
+
+
+def test_auto_qualify_top_n_ranks_within_tier_ab_not_across_all_tiers(monkeypatch):
+    """Regression for the bug reported against the Dashboard: with a cap of
+    2 and 3 Tier A/B companies but a higher-scoring Tier D company sitting
+    ahead of them in the raw (all-tier) ranking, the OLD behavior sliced the
+    top 2 rows first (D, A) and filtered to A/B afterward -- selecting only
+    1 eligible company (a1.com) and silently dropping b1.com even though it
+    is a fully eligible Tier B company within the top_n=2 budget. The fix
+    ranks Tier A/B only, then slices -- so b1.com (the 2nd-highest A/B
+    company) is correctly included and only the lowest-ranked A/B company
+    (c2.com) is left for a later run/larger cap."""
+    rows = [
+        _score_row("hot-d.com", "D", 99),  # outranks every A/B row but must never occupy a slot
+        _score_row("a1.com", "A", 90),
+        _score_row("b1.com", "B", 60),
+        _score_row("b2.com", "B", 55),  # 3rd-ranked A/B company -- must be excluded by the cap, not by tier
+    ]
+    monkeypatch.setattr(discover.db, "get_scores", lambda conn, run_id: rows)
+
+    captured_domains = {}
+
+    async def fake_qualify_run(conn, run_id, *, domains, on_progress=None):
+        captured_domains["qualify"] = domains
+        return {"qualified": len(domains), "skipped": 0, "errors": 0, "error_details": {}}
+
+    async def fake_discover_run(conn, domains, *, on_progress=None):
+        return {"found": len(domains), "skipped": 0, "errors": 0, "contacts_saved": 0, "error_details": {}}
+
+    monkeypatch.setattr(discover.qualify_mod, "qualify_run", fake_qualify_run)
+    monkeypatch.setattr(discover.contacts_mod, "discover_run", fake_discover_run)
+    monkeypatch.setattr(discover.export, "to_csv", lambda conn, run_id: "x.csv")
+    monkeypatch.setattr(discover.export, "to_jsonl", lambda conn, run_id, tiers=None: "x.jsonl")
+
+    stats = discover.DiscoveryStats(region="GA", run_id="run1")
+    asyncio.run(discover._auto_qualify_and_contact(conn=None, run_id="run1", top_n=2, stats=stats, on_progress=None))
+
+    assert captured_domains["qualify"] == ["a1.com", "b1.com"]
+    assert stats.auto_qualify_top_n == 2
 
 
 def test_auto_qualify_cap_limits_how_many_tier_ab_are_covered(monkeypatch):

@@ -60,6 +60,22 @@ class ImportedProspect(BaseModel):
 
     research_domain: str
     research_run_id: Optional[str] = None
+    # Every run_id that has ever imported this domain, oldest first --
+    # NOT just the latest one. `research_run_id` above is overwritten on each
+    # re-import (it's "the run this snapshot's data currently reflects"), but
+    # a person viewing the Prospects page filtered to an OLDER run must still
+    # see this prospect if that run is the reason it ever got imported at
+    # all -- see db.upsert_prospect and the bug this fixes: re-running
+    # discovery for "the same research" always gets a fresh run_id
+    # (discover.run_discovery has no way to resume an old one), and
+    # re-importing the same company then silently flipped research_run_id to
+    # the new run, making the prospect vanish from the old run's filtered
+    # view even though nothing was deleted. list_prospects(run_id=...) now
+    # filters on membership in this list, not equality against the single
+    # column, so a prospect stays visible under every run that ever surfaced
+    # it. Defaults to [] only for prospects created before this field existed
+    # (or the synthetic test fixtures, which pass research_run_id=None).
+    research_run_ids: list[str] = Field(default_factory=list)
     name: Optional[str] = None
     tier: Optional[str] = None
     score: Optional[float] = None
@@ -77,6 +93,20 @@ class ImportedProspect(BaseModel):
     # must never word an email (or a human reviewing it) around "they have no
     # open roles" when this is "unknown" -- see personalize.py.
     hiring_signal: Optional[Literal["confirmed", "unknown"]] = None
+
+    # True when the Research Agent's last qualification attempt for this
+    # domain FAILED (LLM/API error surviving retries) and no successful
+    # qualification has landed since -- see Research_Agent's
+    # qualification_attempts table / migrations/004. None/False both render
+    # the same ("no failure known"); the distinction only matters for
+    # prospects imported before this field existed, which read as False
+    # (never fetched a failure), not True. Lets the Prospects table show
+    # "qualification failed, retry in Research" instead of a bare "-" that
+    # looks identical to "never attempted". Refreshed on the next re-import
+    # from the same run (see ingest._to_imported_prospect) -- Outreach never
+    # calls the Research Agent's qualify endpoints itself, only re-reads
+    # whatever Research currently has.
+    qualification_failed: bool = False
 
     # Best contact only -- one person per company, chosen by
     # ingest._best_contact (verification status, then seniority, then

@@ -17,17 +17,31 @@ import { invalidate } from "../../hooks/useCachedFetch";
 
 const columnHelper = createColumnHelper<ImportedProspect>();
 
-const columns = [
+function makeColumns(runLabels: Map<string, string>) {
+  return [
   columnHelper.accessor((r) => r.name || r.research_domain, {
     id: "company",
     header: "Company",
     cell: (info) => {
       const row = info.row.original;
+      const runCount = row.research_run_ids?.length ?? 0;
       return (
         <div className="cell-company">
           <Avatar name={row.name || row.research_domain} size="sm" />
           <div>
-            <div className="cell-company-name">{row.name || row.research_domain}</div>
+            <div className="cell-company-name">
+              {row.name || row.research_domain}
+              {runCount > 1 && (
+                <span
+                  className="run-count-badge"
+                  title={`Imported from ${runCount} research runs: ${row.research_run_ids
+                    .map((id) => runLabels.get(id) || id)
+                    .join(", ")}`}
+                >
+                  in {runCount} runs
+                </span>
+              )}
+            </div>
             <div className="cell-company-domain">{row.research_domain}</div>
           </div>
         </div>
@@ -66,27 +80,44 @@ const columns = [
   columnHelper.display({
     id: "pain",
     header: "Qualified",
-    cell: (info) =>
-      info.row.original.pain_summary ? (
-        <span className="tier-badge tier-A">
-          <Icon name="sparkle" size={12} /> yes
-        </span>
-      ) : (
-        <span className="cell-muted">—</span>
-      ),
+    cell: (info) => {
+      const row = info.row.original;
+      if (row.pain_summary) {
+        return (
+          <span className="tier-badge tier-A">
+            <Icon name="sparkle" size={12} /> yes
+          </span>
+        );
+      }
+      if (row.qualification_failed) {
+        return (
+          <span
+            className="tier-badge tier-D"
+            title="AI qualification failed after retries in the Research Agent -- not silently marked complete. Retry it from the company's profile in Research, then re-import here."
+          >
+            <Icon name="info" size={12} /> failed
+          </span>
+        );
+      }
+      return <span className="cell-muted">—</span>;
+    },
   }),
-];
+  ];
+}
 
 const TIER_OPTIONS = ["A", "B", "C", "D"] as const;
 const CONTACT_OPTIONS = [
   { value: "with-contact", label: "With contact" },
   { value: "qualified", label: "LLM-qualified" },
+  { value: "qualification-failed", label: "Qualification failed" },
 ] as const;
 type ContactFilter = (typeof CONTACT_OPTIONS)[number]["value"] | "all";
 
 export function Prospects() {
   const { data: runsData } = useCachedFetch<RunSummary[]>("research-runs", () => researchApi.listRuns());
   const runs = runsData ?? [];
+  const runLabels = useMemo(() => new Map(runs.map((r) => [r.run_id, r.label || r.run_id])), [runs]);
+  const columns = useMemo(() => makeColumns(runLabels), [runLabels]);
   const [selectedRun, setSelectedRun] = useState<string>("");
   const [tiers, setTiers] = useState("A,B");
   const [sorting, setSorting] = useState<SortingState>([{ id: "score", desc: true }]);
@@ -119,6 +150,7 @@ export function Prospects() {
     if (tierFilter.size > 0) rows = rows.filter((p) => p.tier && tierFilter.has(p.tier));
     if (contactFilter === "with-contact") rows = rows.filter((p) => p.contact_email);
     if (contactFilter === "qualified") rows = rows.filter((p) => p.pain_summary);
+    if (contactFilter === "qualification-failed") rows = rows.filter((p) => p.qualification_failed);
     if (search.trim()) {
       const needle = search.toLowerCase();
       rows = rows.filter(
@@ -167,6 +199,7 @@ export function Prospects() {
     total: allProspects.length,
     withContact: allProspects.filter((p) => p.contact_email).length,
     qualified: allProspects.filter((p) => p.pain_summary).length,
+    qualificationFailed: allProspects.filter((p) => p.qualification_failed).length,
     tierA: allProspects.filter((p) => p.tier === "A").length,
   }), [allProspects]);
 
@@ -302,6 +335,15 @@ export function Prospects() {
         <StatCard compact icon="mail" tone="mint" value={stats.withContact.toLocaleString()} label="With contact email" />
         <StatCard compact icon="sparkle" tone="violet" value={stats.qualified.toLocaleString()} label="LLM-qualified" />
         <StatCard compact icon="star" tone="amber" value={stats.tierA.toLocaleString()} label="Tier A" />
+        {stats.qualificationFailed > 0 && (
+          <StatCard
+            compact
+            icon="info"
+            tone="amber"
+            value={stats.qualificationFailed.toLocaleString()}
+            label="Qualification failed"
+          />
+        )}
       </div>
 
       <div className="filter-bar">

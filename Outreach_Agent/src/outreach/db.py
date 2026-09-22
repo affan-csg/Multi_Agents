@@ -128,6 +128,39 @@ def connect(url: Optional[str] = None, service_key: Optional[str] = None) -> Sup
 # --- prospects (cached snapshot from the Research Agent) -------------------
 
 def upsert_prospect(conn: SupabaseConn, p: ImportedProspect) -> None:
+    """Cache (or refresh) one prospect snapshot.
+
+    `research_run_id` is still overwritten to `p.research_run_id` every call
+    -- it means "the run this snapshot's data currently reflects", and a
+    re-import is supposed to refresh score/tier/contact/etc from whatever run
+    triggered it. But `research_run_ids` (the set of every run that has ever
+    imported this domain) is MERGED, not overwritten: we read the existing
+    row first and append the new run_id if it isn't already recorded, so a
+    prospect re-imported under a fresh run_id (which is the ONLY kind of
+    rerun the Research Agent supports -- see discover.run_discovery, it has
+    no "resume this exact run" path) doesn't lose its membership in the
+    run(s) that originally surfaced it. That membership list is what
+    list_prospects(run_id=...) filters on, which is what keeps a prospect
+    visible on the Prospects page under a run someone previously imported it
+    from, even after a later rerun refreshed its data under a new run_id.
+    """
+    existing = get_prospect(conn, p.research_domain)
+    run_ids = list(existing.research_run_ids) if existing else []
+    if p.research_run_id and p.research_run_id not in run_ids:
+        run_ids.append(p.research_run_id)
+    p = p.model_copy(update={"research_run_ids": run_ids})
+    _write_prospect(conn, p)
+
+
+def _write_prospect(conn: SupabaseConn, p: ImportedProspect) -> None:
+    """The actual upsert, with no run_ids merging -- upsert_prospect's
+    "append the new run, keep every old one" rule is right for a normal
+    import, but delete_by_research_run needs to REMOVE a run from the
+    membership list (a run being deleted must actually shrink it), which
+    upsert_prospect's merge-only logic can't do since it always unions with
+    whatever is already stored. Kept private: every other caller should go
+    through upsert_prospect so the merge rule is never accidentally
+    bypassed."""
     row = p.model_dump(mode="json")
     row["imported_at"] = _iso(p.imported_at or utcnow())
     conn.upsert("prospects", [row], on_conflict="research_domain")
@@ -139,9 +172,16 @@ def get_prospect(conn: SupabaseConn, domain: str) -> Optional[ImportedProspect]:
 
 
 def list_prospects(conn: SupabaseConn, run_id: Optional[str] = None) -> list[ImportedProspect]:
+    """All cached prospects, or only those imported at some point from
+    `run_id`. Filters on membership in `research_run_ids` (PostgREST's `cs.`
+    "contains" operator for a JSONB array column), NOT equality against the
+    single `research_run_id` column -- a prospect re-imported under a newer
+    run must still show up when a person is viewing an older run that also
+    imported it. See upsert_prospect's docstring for why the two fields
+    diverge."""
     params: dict[str, Any] = {"order": "score.desc.nullslast"}
     if run_id:
-        params["research_run_id"] = f"eq.{run_id}"
+        params["research_run_ids"] = f'cs.["{run_id}"]'
     rows = conn.select("prospects", **params)
     return [ImportedProspect(**r) for r in rows]
 
@@ -194,8 +234,16 @@ def delete_by_research_run(conn: SupabaseConn, run_id: str) -> dict[str, int]:
     from and would otherwise linger forever as an orphan.
 
     Deletes, in dependency order: outreach_events -> outreach_items ->
-    campaigns (all scoped to this run_id), then prospects scoped to this
-    run_id. Returns counts for the caller's response/logging."""
+    campaigns (all scoped to this run_id), then prospects touched by this
+    run_id. A prospect that was ALSO imported from some other still-live run
+    (research_run_ids has more than this one entry -- see upsert_prospect) is
+    not deleted at all: this run_id is just dropped from its membership list,
+    and `research_run_id` (the "current snapshot" pointer) is moved to
+    whatever other run remains if it was this one. Only a prospect whose
+    *sole* recorded run is the one being deleted is actually removed, same
+    as the original single-run behavior this replaces. Returns counts for
+    the caller's response/logging -- `prospects_removed` only counts hard
+    deletes, not the ones merely un-linked from this run."""
     campaigns = [c for c in list_campaigns(conn) if c.research_run_id == run_id]
     items_removed = 0
     for campaign in campaigns:
@@ -206,14 +254,28 @@ def delete_by_research_run(conn: SupabaseConn, run_id: str) -> dict[str, int]:
         items_removed += len(items)
     conn.delete("campaigns", research_run_id=f"eq.{run_id}")
 
-    prospects = list_prospects(conn, run_id=run_id)
-    if prospects:
-        conn.delete("prospects", research_run_id=f"eq.{run_id}")
+    touched = list_prospects(conn, run_id=run_id)
+    removed = 0
+    for p in touched:
+        remaining = [r for r in p.research_run_ids if r != run_id]
+        if not remaining:
+            # This was the only run that ever surfaced this prospect --
+            # nothing left to refresh it from, so it's a true orphan.
+            conn.delete("prospects", research_domain=f"eq.{p.research_domain}")
+            removed += 1
+        else:
+            # Still imported from at least one other live run -- keep the
+            # row, just drop this run from its membership and repoint the
+            # "current snapshot" run if that's the one being deleted.
+            new_current = p.research_run_id if p.research_run_id != run_id else remaining[-1]
+            _write_prospect(conn, p.model_copy(update={
+                "research_run_id": new_current, "research_run_ids": remaining,
+            }))
 
     return {
         "campaigns_removed": len(campaigns),
         "items_removed": items_removed,
-        "prospects_removed": len(prospects),
+        "prospects_removed": removed,
     }
 
 
