@@ -451,6 +451,59 @@ service-role key from a trusted backend, same posture as the Research Agent.
   which is the one that actually governs behavior — treat the YAML list as
   documentation, not a second source of truth to keep byte-for-byte in sync.
 
+## 6. Learning — [learning/](src/outreach/learning/)
+
+The Learning Agent is fully orthogonal to the above: it observes **every** draft
+creation, revision, and redraft; tracks the outcomes from existing `outreach_items`
+and `conversation_messages` data; learns patterns; and feeds active insights back
+into new drafts as structured prompt guidance. It is **completely additive** — if
+it fails for any reason, the core pipeline (1–5 above) runs unchanged.
+
+**Observation:** Every `/revise`, `/redraft`, `/redraft-generic`, and
+conversation-reply operation snapshots the before/after subject+body into
+`draft_versions`, computes observable diffs (subject/opening/CTA/length/
+personalization/formatting changed), and stores them. Writes are wrapped in
+independent `try/except` blocks so a failure never blocks the actual draft
+response.
+
+**Tracking:** `draft_versions` rows are linked to real outcomes (replies,
+positive replies, bookings, stage progression) via live reads from `outreach_items`
+and `conversation_messages` — no duplicated outcome storage. The outcome cache
+on `draft_versions` is refreshed on-demand.
+
+**Learning:** A fixed catalog of pattern detectors runs on-demand (no background
+job):
+- Outcome-linked patterns: "shorter CTAs → higher reply rate," "more
+  personalization → more bookings," etc. (splits draft_versions by a flag, compares
+  linked outcomes).
+- Frequency-only patterns: "72% of human edits shorten the CTA," etc. (no
+  outcome-linking, just counts).
+- Follow-up timing: buckets by follow-up count, compares reply/booking rates.
+
+**Confidence:** Patterns only become "active" when **both** gates pass:
+1. Sample size: ≥20 total emails, ≥10 per group.
+2. Effect size: ≥1.5 percentage-point gap between groups.
+
+Five emails never trigger a high-confidence rule, even with a 50pp difference.
+
+**Guidance:** When drafting a new email, `learning.context.get_learning_context_summary()`
+retrieves active insights and appends them to the personalization prompt as
+structured guidance (e.g., "Based on prior outreach performance, the following
+patterns have been observed: - Shorter CTAs have shown a higher observed reply
+rate (evidence: 184 emails)"). This is fed into every tier of `draft_message()`
+and `revise_message()`, never hard-coded sentences.
+
+**API:** 9 read-only `/learning/*` endpoints expose overview, insights, history,
+human-edits, performance metrics (before/after, campaign comparison, follow-up
+buckets), and recommendations. All wrap database access and pass no errors to the
+caller — missing data renders as empty/insufficient-data states rather than 500s.
+
+**Dashboard:** The new **Learning** tab (under Outreach Agent) shows all of the
+above: overview card counts, before/after performance windows with explicit "Not
+enough data yet" messaging (never fabricated metrics), detected patterns,
+confidence tiers, human-edit trends, and clickable drill-down into the data
+backing each insight. Timestamps and sample counts make every row traceable.
+
 ## Known limitations
 
 - **Scheduling doesn't send.** `scheduled_at` is stored, never acted on.
@@ -460,3 +513,7 @@ service-role key from a trusted backend, same posture as the Research Agent.
 - **No reply tracking.** `waiting`/`replied`/`booked` are set by hand; there
   is no inbox-watching agent yet, by design (see `cli.py`'s own docstring:
   "this agent's job stops at Sent").
+- **Learning recomputation is synchronous.** Acceptable at current volumes but
+  could move to frontend caching or event-driven if `draft_versions` grows large.
+  Confidence thresholds are tunable constants in `learning/engine.py`, not
+  exposed as config.
