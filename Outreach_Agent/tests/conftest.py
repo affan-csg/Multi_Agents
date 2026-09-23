@@ -20,6 +20,7 @@ _KEYS = {
     "learning_events": ("event_id",),
     "campaign_optimization_insights": ("pattern_key",),
     "optimization_recommendation_adoptions": ("adoption_id",),
+    "calendly_events": ("event_uri",),
 }
 
 _UNIQUE = {

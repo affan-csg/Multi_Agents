@@ -170,3 +170,208 @@ def test_manual_booking_has_no_intent_but_still_lists(client, conn):
     entry = client.get("/bookings").json()[0]
     assert entry["booked_by"] == "user"
     assert entry["booked_at"] is not None
+
+
+# --- Calendly integration extension --------------------------------------------
+
+def test_matched_calendly_event_enriches_booking_entry(client, conn):
+    """A booked item with a matched calendly_events row surfaces the real
+    per-booking event data (join link, real start/end time, source) instead
+    of just the account-wide calendly_url."""
+    from outreach.calendly import db as calendly_db
+    from outreach.calendly.models import CalendlyEvent
+
+    _seed(conn, item_id="item-1", domain="acme.com")
+    db.set_stage(conn, "item-1", "booked", actor="calendly")
+    calendly_db.upsert_event(conn, CalendlyEvent(
+        event_uri="https://api.calendly.com/scheduled_events/EV1", event_uuid="EV1",
+        invitee_email="cto@acme.com", invitee_name="Dana", status="active",
+        starts_at=NOW, ends_at=NOW, location="https://zoom.us/j/123",
+        item_id="item-1", research_domain="acme.com",
+    ))
+
+    entry = client.get("/bookings").json()[0]
+    assert entry["calendly_url"] == "https://zoom.us/j/123"
+    assert entry["meeting_starts_at"] is not None
+    assert entry["meeting_status"] == "active"
+    assert entry["booking_source"] == "sync"
+    assert entry["matched"] is True
+
+
+def test_unmatched_calendly_booking_still_appears(client, conn):
+    """A real Calendly booking that could not be matched to any pipeline
+    item (booked through a channel outside this agent's outreach) must still
+    show up on the Bookings page, per the integration's requirement."""
+    from outreach.calendly import db as calendly_db
+    from outreach.calendly.models import CalendlyEvent
+
+    calendly_db.upsert_event(conn, CalendlyEvent(
+        event_uri="https://api.calendly.com/scheduled_events/EV2", event_uuid="EV2",
+        invitee_email="stranger@nowhere.com", invitee_name="Stranger", status="active",
+        starts_at=NOW,
+    ))
+
+    entries = client.get("/bookings").json()
+    assert len(entries) == 1
+    assert entries[0]["item_id"] is None
+    assert entries[0]["contact_email"] == "stranger@nowhere.com"
+    assert entries[0]["booked_by"] == "calendly"
+    assert entries[0]["matched"] is False
+
+
+# --- Phase 1: search/filter/sort/pagination query params -----------------------
+
+def test_bookings_default_matches_current_behavior_exactly(client, conn):
+    """Regression pin, written before the query-param feature landed: calling
+    /bookings with no params at all must keep returning exactly what it does
+    today -- a flat array, active-only, newest-first. Every new query param
+    below is required to be strictly additive/opt-in."""
+    _seed(conn, item_id="item-1", domain="acme.com")
+    db.set_stage(conn, "item-1", "booked", actor="user")
+
+    r = client.get("/bookings")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body, list)
+    assert len(body) == 1
+    assert body[0]["item_id"] == "item-1"
+
+
+def test_bookings_status_canceled_includes_reverted_matched_rows(client, conn):
+    """A matched item that got reverted off `booked` on cancellation is
+    dropped from the default (active) view -- but must reappear when the
+    caller explicitly asks for status=canceled, since that's the whole point
+    of being able to see canceled bookings at all."""
+    from outreach.calendly import db as calendly_db
+    from outreach.calendly.models import CalendlyEvent
+
+    _seed(conn, item_id="item-1", domain="acme.com")
+    db.set_stage(conn, "item-1", "booked", actor="calendly")
+    calendly_db.upsert_event(conn, CalendlyEvent(
+        event_uri="https://api.calendly.com/scheduled_events/EV1", event_uuid="EV1",
+        invitee_email="cto@acme.com", invitee_name="Dana", status="canceled",
+        starts_at=NOW, item_id="item-1", research_domain="acme.com",
+    ))
+    db.set_stage(conn, "item-1", "waiting", actor="calendly")
+
+    default_entries = client.get("/bookings").json()
+    assert default_entries == []
+
+    canceled_entries = client.get("/bookings", params={"status": "canceled"}).json()
+    assert len(canceled_entries) == 1
+    assert canceled_entries[0]["meeting_status"] == "canceled"
+
+
+def test_bookings_date_range_filters_by_meeting_starts_at(client, conn):
+    from datetime import timedelta
+
+    from outreach.calendly import db as calendly_db
+    from outreach.calendly.models import CalendlyEvent
+
+    _seed(conn, item_id="item-early", domain="early.com")
+    db.set_stage(conn, "item-early", "booked", actor="calendly")
+    calendly_db.upsert_event(conn, CalendlyEvent(
+        event_uri="https://api.calendly.com/scheduled_events/EARLY", event_uuid="EARLY",
+        invitee_email="cto@early.com", status="active", starts_at=NOW - timedelta(days=10),
+        item_id="item-early", research_domain="early.com",
+    ))
+
+    _seed(conn, item_id="item-late", domain="late.com")
+    db.set_stage(conn, "item-late", "booked", actor="calendly")
+    calendly_db.upsert_event(conn, CalendlyEvent(
+        event_uri="https://api.calendly.com/scheduled_events/LATE", event_uuid="LATE",
+        invitee_email="cto@late.com", status="active", starts_at=NOW + timedelta(days=10),
+        item_id="item-late", research_domain="late.com",
+    ))
+
+    entries = client.get("/bookings", params={"date_from": NOW.date().isoformat()}).json()
+    assert {e["item_id"] for e in entries} == {"item-late"}
+
+
+def test_bookings_search_matches_company_contact_campaign(client, conn):
+    _seed(conn, item_id="item-1", domain="acme.com")
+    db.set_stage(conn, "item-1", "booked", actor="user")
+    _seed(conn, item_id="item-2", domain="widgets.io")
+    db.set_stage(conn, "item-2", "booked", actor="user")
+
+    entries = client.get("/bookings", params={"search": "acme"}).json()
+    assert {e["item_id"] for e in entries} == {"item-1"}
+
+
+def test_bookings_sort_by_meeting_starts_at_asc(client, conn):
+    from datetime import timedelta
+
+    from outreach.calendly import db as calendly_db
+    from outreach.calendly.models import CalendlyEvent
+
+    _seed(conn, item_id="item-a", domain="a.com")
+    db.set_stage(conn, "item-a", "booked", actor="calendly")
+    calendly_db.upsert_event(conn, CalendlyEvent(
+        event_uri="https://api.calendly.com/scheduled_events/A", event_uuid="A",
+        invitee_email="cto@a.com", status="active", starts_at=NOW + timedelta(days=5),
+        item_id="item-a", research_domain="a.com",
+    ))
+    _seed(conn, item_id="item-b", domain="b.com")
+    db.set_stage(conn, "item-b", "booked", actor="calendly")
+    calendly_db.upsert_event(conn, CalendlyEvent(
+        event_uri="https://api.calendly.com/scheduled_events/B", event_uuid="B",
+        invitee_email="cto@b.com", status="active", starts_at=NOW + timedelta(days=1),
+        item_id="item-b", research_domain="b.com",
+    ))
+
+    entries = client.get("/bookings", params={"sort": "meeting_starts_at", "order": "asc"}).json()
+    assert [e["item_id"] for e in entries] == ["item-b", "item-a"]
+
+
+def test_bookings_no_page_size_returns_flat_array(client, conn):
+    _seed(conn, item_id="item-1", domain="acme.com")
+    db.set_stage(conn, "item-1", "booked", actor="user")
+
+    r = client.get("/bookings", params={"page": 1})
+    assert isinstance(r.json(), list)
+
+
+def test_bookings_pagination_returns_envelope_when_page_size_present(client, conn):
+    for i in range(3):
+        _seed(conn, item_id=f"item-{i}", domain=f"d{i}.com")
+        db.set_stage(conn, f"item-{i}", "booked", actor="user")
+
+    r = client.get("/bookings", params={"page_size": 2})
+    body = r.json()
+    assert set(body.keys()) == {"items", "total", "page", "page_size"}
+    assert body["total"] == 3
+    assert body["page"] == 1
+    assert body["page_size"] == 2
+    assert len(body["items"]) == 2
+
+
+def test_bookings_pagination_page_2_returns_next_slice(client, conn):
+    for i in range(3):
+        _seed(conn, item_id=f"item-{i}", domain=f"d{i}.com")
+        db.set_stage(conn, f"item-{i}", "booked", actor="user")
+
+    page1 = client.get("/bookings", params={"page_size": 2, "page": 1}).json()
+    page2 = client.get("/bookings", params={"page_size": 2, "page": 2}).json()
+    assert len(page2["items"]) == 1
+    assert {e["item_id"] for e in page1["items"]} & {e["item_id"] for e in page2["items"]} == set()
+
+
+def test_booking_without_matched_calendly_event_falls_back_to_account_url(client, conn, monkeypatch):
+    """No calendly_events row at all (classifier-only path, or the
+    integration not configured) -- pre-existing behavior must be unchanged:
+    the shared account-wide calendly_url is used."""
+    from outreach import api as api_module
+
+    class _FakeCfg:
+        calendly_url = "https://calendly.com/affan-careersourcegroup/30min"
+
+    monkeypatch.setattr(api_module, "load_config", lambda: _FakeCfg())
+
+    _seed(conn, item_id="item-1", domain="acme.com")
+    db.set_stage(conn, "item-1", "booked", actor="conversation_agent", detail={"intent": "booked"})
+
+    entry = client.get("/bookings").json()[0]
+    assert entry["calendly_url"] == "https://calendly.com/affan-careersourcegroup/30min"
+    assert entry["meeting_starts_at"] is None
+    assert entry["booking_source"] is None
+    assert entry["matched"] is True

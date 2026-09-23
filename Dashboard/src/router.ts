@@ -12,13 +12,13 @@ export type Route =
   | { name: "outreach-prospects" }
   | { name: "outreach-campaigns" }
   | { name: "outreach-campaign"; campaignId: string; campaignName?: string | null }
-  | { name: "outreach-bookings" }
+  | { name: "outreach-calendly"; tab?: "bookings" | "event-types" }
   | { name: "outreach-analytics" }
   | { name: "outreach-learning" };
 
 const SIMPLE_ROUTES = [
   "research-runs", "research-saved", "research-contacts", "research-analytics", "research-settings",
-  "outreach-prospects", "outreach-campaigns", "outreach-bookings", "outreach-analytics", "outreach-learning",
+  "outreach-prospects", "outreach-campaigns", "outreach-analytics", "outreach-learning",
 ] as const;
 
 // Campaign URLs are `/outreach/campaigns/{slug}-{uuid}` -- the UUID is the
@@ -68,6 +68,17 @@ export function parseRoute(path: string): Route {
     const raw = decodeURIComponent(parts[2]);
     return { name: "outreach-campaign", campaignId: campaignIdFromSlug(raw), campaignName: nameFromSlug(raw) };
   }
+  // /outreach/bookings and /outreach/event-types are kept as URL aliases
+  // into the same merged Calendly page (capsule tabs, no separate
+  // navigation) -- old links/bookmarks and the UpcomingMeetingBanner's
+  // "open bookings" action keep working, just pre-selecting a tab instead
+  // of landing on a standalone page.
+  if (head === "outreach" && (sub === "bookings" || sub === "event-types")) {
+    return { name: "outreach-calendly", tab: sub === "bookings" ? "bookings" : "event-types" };
+  }
+  if (head === "outreach" && sub === "calendly") {
+    return { name: "outreach-calendly" };
+  }
   const joined = sub ? `${head}-${sub}` : head;
   if ((SIMPLE_ROUTES as readonly string[]).includes(joined)) {
     return { name: joined as (typeof SIMPLE_ROUTES)[number] };
@@ -102,8 +113,8 @@ export function routeToPath(route: Route): string {
       return "/outreach/campaigns";
     case "outreach-prospects":
       return "/outreach/prospects";
-    case "outreach-bookings":
-      return "/outreach/bookings";
+    case "outreach-calendly":
+      return route.tab === "event-types" ? "/outreach/event-types" : "/outreach/bookings";
     case "outreach-analytics":
       return "/outreach/analytics";
     case "outreach-learning":

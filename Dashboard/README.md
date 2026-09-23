@@ -83,10 +83,31 @@ of the two backends above isn't running yet — start it and refresh.
   section shows the reply thread, a pending draft to approve/redraft/edit,
   and the original outreach message collapsed below it; Failed is reached
   automatically when a reply is classified as a clear rejection, and is the
-  only column besides Booked a card doesn't leave on its own), Bookings (every prospect
-  currently `booked`, pooled across every campaign, from `GET /bookings` —
-  row click opens the account's Calendly page when one is configured, the
-  campaign otherwise), and Learning & Optimization (observes draft edits,
+  only column besides Booked a card doesn't leave on its own), Calendly (one
+  page, capsule tabs at the top — same tab pattern as the Research Agent's
+  Settings page — instead of separate nav items:
+  - **Bookings tab**: every prospect currently `booked`, pooled across every
+    campaign, from `GET /bookings` — row click opens the specific Calendly
+    event when one is matched (real Calendly API/webhook integration, see
+    [Outreach_Agent/README.md](../Outreach_Agent/README.md#calendly-integration)),
+    the account's shared scheduling page otherwise, or the campaign if
+    neither is available; a "Sync Calendly" button pulls the latest
+    bookings/cancellations on demand; All/Upcoming/Past filter tabs plus
+    search and sort, all server-side via `GET /bookings`'s query params; a
+    per-row menu (any booking with an `event_uri`, matched or not) for
+    Cancel booking, Mark/unmark no-show, and Delete — cancel calls `POST
+    /calendly/events/cancel` and reverts the item's stage the same way an
+    organic cancellation webhook would; delete (`POST
+    /calendly/events/delete`) removes the local row entirely, any status,
+    canceling on Calendly first only if the event is still active/upcoming;
+    unmatched Calendly bookings — made outside this agent's own outreach —
+    appear in the same table.
+  - **Event Types tab**: view-only list of the account's meeting types and
+    availability schedule(s) (Calendly's API has no write endpoint for
+    either), plus a "Get scheduling link" action per event type (a real
+    mutation, `POST /calendly/scheduling-links`).
+  
+  and Learning & Optimization (observes draft edits,
   tracks performance, displays learned patterns, before/after comparisons,
   human-edit trends, campaign comparison, drill-down into the data backing
   each insight, plus the Campaign-Level Optimization layer's own Strategy
@@ -98,9 +119,20 @@ of the two backends above isn't running yet — start it and refresh.
   clients for the Outreach Agent's `/learning/*` and `/optimization/*`
   endpoints, respectively — two independent backend layers, one dashboard
   page.
+- `src/agents/calendly.ts` — typed HTTP client for the Outreach Agent's
+  `/calendly/status`, `/calendly/sync`, `/calendly/events/cancel`,
+  `/calendly/events/delete`, `/calendly/events/no-show`,
+  `/calendly/event-types`, `/calendly/availability`, and
+  `/calendly/scheduling-links` endpoints (the Calendly page's Bookings and
+  Event Types tabs); the webhook receiver itself is server-to-server and
+  never called from here.
 - `App.css`/`index.css` — the shared design system's styles,
-  plus a `.kanban-*` block for the Outreach pipeline board and a `.tabs`
-  block for the Learning & Optimization page's internal section navigation.
+  plus a `.kanban-*` block for the Outreach pipeline board, a `.tabs` block
+  for the Learning & Optimization page's internal section navigation (also
+  used by the Calendly page's own All/Upcoming/Past filter), and a
+  `.settings-tabs` block (originally the Research Agent Settings page's
+  General/Usage switcher) reused by the Calendly page's top-level
+  Bookings/Event Types tabs.
 - `src/hooks/useCachedFetch.ts` — stale-while-revalidate data layer every
   page's `useCachedFetch(key, fetcher)` call goes through: cached data
   renders instantly on remount while a background refetch runs, so revisiting

@@ -144,7 +144,10 @@ project — see each one's own README:
    (checked on every tick, not a background timer). Every reply draft steers
    toward a booked call via a Calendly link, and a real booking (detected
    from the scheduling tool's own confirmation email, not just prospect
-   prose) moves the card straight to **Booked**. A reply that clearly
+   prose) moves the card straight to **Booked**. A separate, optional
+   [Calendly API/webhook integration](Outreach_Agent/README.md#calendly-integration)
+   layers real calendar data onto the same stage — including catching
+   cancellations, which the email-based detection above cannot. A reply that clearly
    declines ("not interested", "no thanks", "remove me", etc.) moves the card
    to the terminal **Failed** stage instead — no automatic follow-up is ever
    sent once a card lands there. It is **off by default per campaign**, and
@@ -166,8 +169,14 @@ project — see each one's own README:
    detected patterns, human-edit trends, campaign comparison, strategy
    insights, adoption tracking, and drill-down into the data behind each
    insight.
-8. **Bookings** (Dashboard) — every prospect currently in `booked`, across
-   every campaign, in one list — see the Dashboard's Bookings page.
+8. **Calendly** (Dashboard) — one page, capsule tabs at the top (Bookings |
+   Event Types), no separate nav items. Bookings: every prospect currently
+   in `booked`, across every campaign, in one list, with All/Upcoming/Past
+   filters, search, sort, and per-booking cancel/mark-no-show/delete actions
+   for real Calendly bookings. Event Types: the account's meeting types and
+   availability (view-only) plus one-off scheduling link generation — see
+   the [Calendly Integration](Outreach_Agent/README.md#calendly-integration)
+   section.
 
 ## Tests
 
@@ -177,7 +186,7 @@ so no live database or API keys are needed to run them:
 
 ```
 cd Research_Agent && pytest    # 295 passed
-cd Outreach_Agent  && pytest   # 412 passed (114 outreach + 155 conversation + 105 learning + 38 optimization)
+cd Outreach_Agent  && pytest   # 584 passed (outreach + conversation + learning + optimization + Calendly)
 ```
 
 The Dashboard has no test suite; its guard rail is the TypeScript compiler:

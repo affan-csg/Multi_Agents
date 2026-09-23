@@ -75,6 +75,25 @@ class Config:
         return (os.environ.get("CALENDLY_URL") or self.personalization.get("calendly_url") or "").strip()
 
     @property
+    def calendly_api_token(self) -> str:
+        """Personal access token for Calendly's REST API (scheduled_events,
+        webhook subscriptions) -- distinct from calendly_url above, which is
+        just the static scheduling link offered in reply text. Env-only, no
+        YAML fallback: a real API token has no sensible value to commit to
+        outreach.yaml. Blank means the sync/webhook features are inert -- see
+        calendly/client.py."""
+        return (os.environ.get("CALENDLY_API_TOKEN") or "").strip()
+
+    @property
+    def calendly_webhook_signing_key(self) -> str:
+        """The signing key Calendly returns when a webhook subscription is
+        created (POST /webhook_subscriptions' response `signing_key`), used
+        to verify the Calendly-Webhook-Signature header on every inbound
+        webhook call. Blank means webhook verification cannot succeed -- see
+        calendly/webhook.py."""
+        return (os.environ.get("CALENDLY_WEBHOOK_SIGNING_KEY") or "").strip()
+
+    @property
     def stages(self) -> dict[str, Any]:
         return self.raw["stages"]
 

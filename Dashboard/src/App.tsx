@@ -20,6 +20,7 @@ import { RunOverlay } from "./components/RunOverlay";
 import { ToastStack, type ToastData } from "./components/Toast";
 import { RunSelector } from "./components/RunSelector";
 import { FailedQualificationsBanner } from "./components/FailedQualificationsBanner";
+import { UpcomingMeetingBanner } from "./components/UpcomingMeetingBanner";
 import { CampaignSelector } from "./components/CampaignSelector";
 import { Home } from "./pages/Home";
 import { RunConfig } from "./pages/research/RunConfig";
@@ -32,7 +33,7 @@ import { Analytics } from "./pages/research/Analytics";
 import { Prospects } from "./pages/outreach/Prospects";
 import { Campaigns } from "./pages/outreach/Campaigns";
 import { CampaignDetail } from "./pages/outreach/CampaignDetail";
-import { Bookings } from "./pages/outreach/Bookings";
+import { Calendly } from "./pages/outreach/Calendly";
 import { Analytics as OutreachAnalytics } from "./pages/outreach/Analytics";
 import { Learning as OutreachLearning } from "./pages/outreach/Learning";
 import { useRoute } from "./router";
@@ -403,6 +404,7 @@ function App() {
       />
 
       <main className="main">
+        <UpcomingMeetingBanner onOpen={() => navigate({ name: "outreach-calendly", tab: "bookings" })} />
         {showResearchSelector && <RunSelector runs={runs} value={scopeRun} onChange={setScopeRun} />}
         {showCampaignSelector && <CampaignSelector campaigns={campaigns} value={scopeCampaign} onChange={setScopeCampaign} />}
 
@@ -500,8 +502,10 @@ function App() {
           />
         )}
 
-        {route.name === "outreach-bookings" && (
-          <Bookings
+        {route.name === "outreach-calendly" && (
+          <Calendly
+            activeTab={route.tab === "event-types" ? "event-types" : "bookings"}
+            onTabChange={(tab) => navigate({ name: "outreach-calendly", tab })}
             onOpenCampaign={(id, campaignName) => navigate({ name: "outreach-campaign", campaignId: id, campaignName })}
           />
         )}

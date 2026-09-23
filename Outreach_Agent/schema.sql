@@ -368,4 +368,60 @@ CREATE TABLE IF NOT EXISTS optimization_recommendation_adoptions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_opt_adoptions_pattern  ON optimization_recommendation_adoptions(pattern_key);
+
+-- ===========================================================================
+-- CALENDLY INTEGRATION
+--
+-- Additive, same contract as the Feedback Learning / Optimization tables
+-- above: no existing table is altered here, only outreach_items.stage is
+-- ever written (via db.set_stage, same audit-trail path every other stage
+-- move uses) once a booking is matched to an item -- see
+-- src/outreach/calendly/sync.py. Re-running this whole file on an existing
+-- project is safe: every statement below is IF NOT EXISTS. See
+-- migrations/008_calendly_integration.sql for the full rationale.
+--
+-- calendly_events: one row per (event, invitee) pair as reported by either a
+-- REST API sync pull or a webhook delivery -- the raw record of a real
+-- Calendly booking, independent of whether it could be matched to a
+-- pipeline item. event_uri is Calendly's own resource identifier and the
+-- idempotency key: a sync re-run or a webhook re-delivery of the same event
+-- updates this one row (e.g. status flipping active -> canceled) rather than
+-- creating a duplicate -- see calendly/db.py's upsert_event.
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS calendly_events (
+    event_uri        TEXT PRIMARY KEY,
+    event_uuid        TEXT NOT NULL,
+    invitee_uri       TEXT,
+    invitee_email     TEXT,
+    invitee_name      TEXT,
+    status            TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'canceled'
+    event_type_name   TEXT,
+    starts_at         TIMESTAMPTZ,
+    ends_at           TIMESTAMPTZ,
+    location          TEXT,   -- join URL / meeting location, when Calendly provides one
+    cancel_reason     TEXT,
+    source            TEXT NOT NULL DEFAULT 'sync',    -- 'sync' | 'webhook' -- which path most recently wrote this row
+    -- Matching outcome against outreach_items, by invitee email vs to_email
+    -- (see calendly/sync.py's match_item) -- both NULL when no item's
+    -- to_email matches this booking's invitee at all. ON DELETE SET NULL
+    -- (not CASCADE): deleting a campaign/item must not destroy the record
+    -- that a real Calendly booking happened, only un-link it -- it then
+    -- reappears as an unmatched entry on the Bookings page rather than
+    -- vanishing.
+    item_id           TEXT REFERENCES outreach_items(item_id) ON DELETE SET NULL,
+    research_domain   TEXT REFERENCES prospects(research_domain) ON DELETE SET NULL,
+    raw               JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at        TIMESTAMPTZ NOT NULL,
+    updated_at        TIMESTAMPTZ NOT NULL,
+    -- Set via POST/DELETE /invitee_no_shows (calendly/client.py's
+    -- mark_no_show/unmark_no_show) -- an annotation on a past event, not a
+    -- booking-status transition, so it never touches item_id's pipeline
+    -- stage the way status=canceled does.
+    no_show           BOOLEAN NOT NULL DEFAULT false,
+    no_show_uri       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_calendly_events_item   ON calendly_events(item_id);
+CREATE INDEX IF NOT EXISTS idx_calendly_events_email  ON calendly_events(invitee_email);
+CREATE INDEX IF NOT EXISTS idx_calendly_events_status ON calendly_events(status);
 CREATE INDEX IF NOT EXISTS idx_opt_adoptions_campaign ON optimization_recommendation_adoptions(campaign_id);

@@ -23,6 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from . import db, ingest, personalize, pipeline
+from .calendly import db as calendly_db
+from .calendly.routes import router as calendly_router
 from .config import load_config
 from .conversation.routes import router as conversation_router
 from .learning.routes import router as learning_router
@@ -65,6 +67,13 @@ app.include_router(learning_router)
 # of, and does not modify, the Feedback Learning Agent above. See
 # src/outreach/optimization/__init__.py.
 app.include_router(optimization_router)
+
+# Calendly integration -- real API sync + webhook receiver, layered on top of
+# the pre-existing classifier-only booking detection. Self-contained in
+# calendly/; this mount is its only hook into this app (GET /bookings below
+# is extended separately to surface its data). See
+# src/outreach/calendly/__init__.py.
+app.include_router(calendly_router)
 
 
 # ----------------------------------------------------------------------------
@@ -444,88 +453,252 @@ def analytics(campaign_id: str = "all") -> dict[str, Any]:
 
 
 @app.get("/bookings")
-def list_bookings() -> list[dict[str, Any]]:
+def list_bookings(
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    sort: str = "booked_at",
+    order: str = "desc",
+    page: int = 1,
+    page_size: Optional[int] = None,
+) -> Any:
     """Every prospect currently in the `booked` stage, across every
     campaign, for the Bookings page -- the Conversation Agent's (or a
-    person's) end result: a prospect who agreed to a call.
+    person's) end result: a prospect who agreed to a call. Plus any Calendly
+    booking synced/webhooked in that could not be matched to a pipeline item
+    at all (a booking made through some channel outside this agent's
+    outreach) -- these still appear, per the Bookings page's requirement to
+    show every real booking, matched or not.
 
-    Each entry pairs the pipeline item with the campaign it belongs to, the
-    cached prospect/contact it's for, and the exact stage-change event that
-    moved it to `booked` (see db.set_stage -- every transition is recorded in
-    outreach_events, so this is the same audit trail the item drawer already
-    reads from, not a separate booking record). `booked_at` and
-    `booked_detail` come from that event and are None only for a booking
-    made before this endpoint existed (nothing here can retroactively invent
-    history for an item that predates it).
+    Each matched entry pairs the pipeline item with the campaign it belongs
+    to, the cached prospect/contact it's for, and the exact stage-change
+    event that moved it to `booked` (see db.set_stage -- every transition is
+    recorded in outreach_events, so this is the same audit trail the item
+    drawer already reads from, not a separate booking record). `booked_at`
+    and `booked_detail` come from that event and are None only for a booking
+    made before this endpoint existed. When a real calendly_events row is
+    also matched to the item (see calendly/sync.py), its event-specific
+    fields (meeting_starts_at/ends_at, join location, source) are merged in,
+    replacing the one-size-fits-all account-wide `calendly_url` with the
+    booking's own real data where available.
 
-    Sorted most-recently-booked first. No pagination -- the number of booked
-    prospects at any time is small relative to the campaign's full pipeline,
-    the same assumption /analytics already makes for the whole item set."""
+    All query params are optional and strictly additive: calling this with
+    none of them reproduces the exact pre-Phase-1 behavior (flat array,
+    active-only, most-recently-booked first) -- see test_bookings.py's
+    test_bookings_default_matches_current_behavior_exactly, a regression pin
+    written before this signature grew params, specifically to guarantee
+    that.
+
+    `status`: 'active' (default omitted-behavior) or 'canceled'. A matched
+    item that got reverted off `booked` on cancellation is normally skipped
+    entirely (see the `continue` below) since it's no longer a live booking
+    -- but status=canceled explicitly opts into seeing those, which is the
+    whole point of being able to look at canceled bookings at all.
+    `date_from`/`date_to`: ISO date strings, filtered against
+    meeting_starts_at falling back to booked_at (the same `whenOf` semantics
+    the Bookings page already used client-side pre-Phase-1).
+    `search`: substring match against company/contact/email/campaign name.
+    `sort`/`order`: 'booked_at' (default) or 'meeting_starts_at'; 'desc'
+    (default) or 'asc'.
+    `page`/`page_size`: pagination is opt-in -- passing `page_size` switches
+    the response from a flat list to a `{items, total, page, page_size}`
+    envelope; omitting it keeps the flat-array shape today's one real
+    consumer (Dashboard's listBookings()) depends on."""
     conn = db.connect()
     try:
         items = db.list_items(conn, stage="booked")
-        if not items:
-            return []
 
-        # The account's own Calendly scheduling page -- there is no
-        # per-booking event URL to link to: the "New Event" notification
-        # Calendly sends carries the invitee's address in Reply-To (see
-        # matcher.py strategy 4) but no stable, generically-parseable
-        # join/manage link in a header this agent reads. Same URL on every
-        # row; still useful as "go see/manage this booking in Calendly".
+        # The account's own Calendly scheduling page -- the fallback link for
+        # any booking that has no matched calendly_events row (e.g. the
+        # classifier's email-heuristic path, or the sync/webhook integration
+        # not being configured at all). A matched calendly_events row's own
+        # `location` (its real join/meeting link) takes precedence per-entry.
         calendly_url = load_config().calendly_url or None
 
-        campaigns_by_id = {c.campaign_id: c for c in db.list_campaigns(conn)}
-        domains = list({i.research_domain for i in items})
-        prospects_by_domain = db.prospects_by_domain(conn, domains)
+        calendly_events_by_item = {
+            e.item_id: e for e in calendly_db.list_events(conn) if e.item_id
+        }
+        want_canceled = status == "canceled"
 
         entries: list[dict[str, Any]] = []
-        for item in items:
-            campaign = campaigns_by_id.get(item.campaign_id)
-            prospect = prospects_by_domain.get(item.research_domain)
+        if items:
+            campaigns_by_id = {c.campaign_id: c for c in db.list_campaigns(conn)}
+            domains = list({i.research_domain for i in items})
+            prospects_by_domain = db.prospects_by_domain(conn, domains)
 
-            # The event that actually moved this item to `booked` -- may not
-            # be the LAST event on the item (a person could add a note-like
-            # event afterward in the future), so this finds the most recent
-            # transition landing on `booked` specifically, not just the
-            # latest event of any kind.
-            booked_event = next(
-                (e for e in reversed(db.list_events(conn, item.item_id))
-                 if e.event_type == "stage_change" and e.to_stage == "booked"),
-                None,
-            )
+            for item in items:
+                campaign = campaigns_by_id.get(item.campaign_id)
+                prospect = prospects_by_domain.get(item.research_domain)
 
+                # The event that actually moved this item to `booked` -- may
+                # not be the LAST event on the item (a person could add a
+                # note-like event afterward in the future), so this finds the
+                # most recent transition landing on `booked` specifically,
+                # not just the latest event of any kind.
+                booked_event = next(
+                    (e for e in reversed(db.list_events(conn, item.item_id))
+                     if e.event_type == "stage_change" and e.to_stage == "booked"),
+                    None,
+                )
+                cal_event = calendly_events_by_item.get(item.item_id)
+                # A matched item's own calendly_events row can be canceled
+                # even while the item itself is still `booked` (a cancel
+                # made moments ago hasn't reverted the stage yet, or the
+                # revert legitimately doesn't happen for every actor path) --
+                # keep the default (active) view showing only non-canceled
+                # meetings, matching what "currently booked" should mean.
+                if (cal_event.status if cal_event else "active") != ("canceled" if want_canceled else "active"):
+                    continue
+
+                entries.append({
+                    "item_id": item.item_id,
+                    "campaign_id": item.campaign_id,
+                    "campaign_name": campaign.name if campaign else None,
+                    "research_domain": item.research_domain,
+                    "company_name": prospect.name if prospect else None,
+                    "contact_name": prospect.contact_name if prospect else None,
+                    "contact_email": prospect.contact_email if prospect else item.to_email,
+                    "contact_position": prospect.contact_position if prospect else None,
+                    "industry": prospect.industry if prospect else None,
+                    "sent_at": item.sent_at.isoformat() if item.sent_at else None,
+                    "booked_at": booked_event.created_at.isoformat() if booked_event and booked_event.created_at else None,
+                    # 'reason' from db.set_stage's detail (e.g. "reply classified
+                    # as booked") and, when the Conversation Agent made the move,
+                    # the classified intent and the inbound message's provider_message_id.
+                    "booked_detail": booked_event.detail if booked_event else {},
+                    "booked_by": booked_event.actor if booked_event else None,
+                    "calendly_url": (cal_event.location if cal_event else None) or calendly_url,
+                    "meeting_starts_at": cal_event.starts_at.isoformat() if cal_event and cal_event.starts_at else None,
+                    "meeting_ends_at": cal_event.ends_at.isoformat() if cal_event and cal_event.ends_at else None,
+                    "meeting_status": cal_event.status if cal_event else None,
+                    "booking_source": cal_event.source if cal_event else None,
+                    "event_uri": cal_event.event_uri if cal_event else None,
+                    "no_show": cal_event.no_show if cal_event else False,
+                    "matched": True,
+                })
+
+        # Real Calendly bookings that never matched any pipeline item --
+        # someone booked through a channel outside this agent's outreach
+        # (e.g. the account-wide scheduling link shared elsewhere). Still
+        # shown, per the requirement that unmatched bookings must appear.
+        matched_item_ids = {e["item_id"] for e in entries}
+        for cal_event in calendly_db.list_events(conn):
+            if cal_event.item_id and cal_event.item_id in matched_item_ids:
+                continue
+            if cal_event.item_id:
+                # Matched to an item, but that item isn't in this view's
+                # entries -- either its stage isn't `booked` at all, or (see
+                # the `continue` above the matched-loop's append) its status
+                # doesn't match what this call is asking for. A reverted
+                # matched booking still needs to surface when the caller
+                # explicitly asked for status=canceled -- that's the entire
+                # point of the filter -- so only skip it in the active
+                # (default) view.
+                if not (want_canceled and cal_event.status == "canceled"):
+                    continue
+                # Unlike a genuinely unmatched booking, this one still has a
+                # real item/campaign/prospect to show -- a canceled booking
+                # a caller explicitly asked to see should keep its context,
+                # not collapse to a bare "unmatched" row.
+                reverted_item = db.get_item(conn, cal_event.item_id)
+                reverted_campaign = db.list_campaigns(conn) if reverted_item else []
+                campaign = next((c for c in reverted_campaign if c.campaign_id == reverted_item.campaign_id), None) if reverted_item else None
+                prospect = db.prospects_by_domain(conn, [reverted_item.research_domain]).get(reverted_item.research_domain) if reverted_item else None
+                entries.append({
+                    "item_id": reverted_item.item_id if reverted_item else None,
+                    "campaign_id": reverted_item.campaign_id if reverted_item else None,
+                    "campaign_name": campaign.name if campaign else None,
+                    "research_domain": reverted_item.research_domain if reverted_item else None,
+                    "company_name": prospect.name if prospect else None,
+                    "contact_name": prospect.contact_name if prospect else cal_event.invitee_name,
+                    "contact_email": prospect.contact_email if prospect else cal_event.invitee_email,
+                    "contact_position": prospect.contact_position if prospect else None,
+                    "industry": prospect.industry if prospect else None,
+                    "sent_at": reverted_item.sent_at.isoformat() if reverted_item and reverted_item.sent_at else None,
+                    "booked_at": cal_event.created_at.isoformat() if cal_event.created_at else None,
+                    "booked_detail": {"event_uri": cal_event.event_uri},
+                    "booked_by": "calendly",
+                    "calendly_url": cal_event.location or calendly_url,
+                    "meeting_starts_at": cal_event.starts_at.isoformat() if cal_event.starts_at else None,
+                    "meeting_ends_at": cal_event.ends_at.isoformat() if cal_event.ends_at else None,
+                    "meeting_status": cal_event.status,
+                    "booking_source": cal_event.source,
+                    "event_uri": cal_event.event_uri,
+                    "no_show": cal_event.no_show,
+                    "matched": reverted_item is not None,
+                })
+                continue
+            elif cal_event.status != ("canceled" if want_canceled else "active"):
+                continue
             entries.append({
-                "item_id": item.item_id,
-                "campaign_id": item.campaign_id,
-                "campaign_name": campaign.name if campaign else None,
-                "research_domain": item.research_domain,
-                "company_name": prospect.name if prospect else None,
-                "contact_name": prospect.contact_name if prospect else None,
-                "contact_email": prospect.contact_email if prospect else item.to_email,
-                "contact_position": prospect.contact_position if prospect else None,
-                "industry": prospect.industry if prospect else None,
-                "sent_at": item.sent_at.isoformat() if item.sent_at else None,
-                "booked_at": booked_event.created_at.isoformat() if booked_event and booked_event.created_at else None,
-                # 'reason' from db.set_stage's detail (e.g. "reply classified
-                # as booked") and, when the Conversation Agent made the move,
-                # the classified intent and the inbound message's provider_message_id.
-                "booked_detail": booked_event.detail if booked_event else {},
-                "booked_by": booked_event.actor if booked_event else None,
-                "calendly_url": calendly_url,
+                "item_id": None,
+                "campaign_id": None,
+                "campaign_name": None,
+                "research_domain": None,
+                "company_name": None,
+                "contact_name": cal_event.invitee_name,
+                "contact_email": cal_event.invitee_email,
+                "contact_position": None,
+                "industry": None,
+                "sent_at": None,
+                "booked_at": cal_event.created_at.isoformat() if cal_event.created_at else None,
+                "booked_detail": {"event_uri": cal_event.event_uri},
+                "booked_by": "calendly",
+                "calendly_url": cal_event.location or calendly_url,
+                "meeting_starts_at": cal_event.starts_at.isoformat() if cal_event.starts_at else None,
+                "meeting_ends_at": cal_event.ends_at.isoformat() if cal_event.ends_at else None,
+                "meeting_status": cal_event.status,
+                "booking_source": cal_event.source,
+                "event_uri": cal_event.event_uri,
+                "no_show": cal_event.no_show,
+                "matched": False,
             })
 
-        # Stable sort, newest first. `enumerate` breaks ties on identical
-        # `booked_at` values by insertion order rather than leaving Python's
-        # sort to (stably, but silently) leave same-timestamp entries in
-        # whatever order db.list_items returned them -- two bookings can
-        # legitimately land in the same tick and end up with an identical
-        # timestamp down to the microsecond (observed on this machine: two
-        # back-to-back db.set_stage calls can resolve to the same wall-clock
-        # reading), so relying on strict inequality alone is not safe.
+        if date_from:
+            entries = [e for e in entries if (e["meeting_starts_at"] or e["booked_at"] or "") >= date_from]
+        if date_to:
+            # A bare date (no time) as an inclusive upper bound must still
+            # catch a same-day timestamp with a later time-of-day -- compare
+            # against the end of that day rather than its start.
+            date_to_bound = date_to if len(date_to) > 10 else f"{date_to}T23:59:59"
+            entries = [e for e in entries if (e["meeting_starts_at"] or e["booked_at"] or "") <= date_to_bound]
+        if search:
+            needle = search.strip().lower()
+            if needle:
+                def _matches(e: dict[str, Any]) -> bool:
+                    haystack = " ".join(str(e.get(f) or "") for f in (
+                        "company_name", "research_domain", "contact_name", "contact_email", "campaign_name",
+                    )).lower()
+                    return needle in haystack
+                entries = [e for e in entries if _matches(e)]
+
+        # Stable sort. `enumerate` breaks ties on identical sort-key values
+        # by insertion order rather than leaving Python's sort to (stably,
+        # but silently) leave same-timestamp entries in whatever order
+        # db.list_items returned them -- two bookings can legitimately land
+        # in the same tick and end up with an identical timestamp down to
+        # the microsecond (observed on this machine: two back-to-back
+        # db.set_stage calls can resolve to the same wall-clock reading), so
+        # relying on strict inequality alone is not safe.
+        sort_field = "meeting_starts_at" if sort == "meeting_starts_at" else "booked_at"
+        reverse = order != "asc"
         indexed = list(enumerate(entries))
-        indexed.sort(key=lambda pair: (pair[1]["booked_at"] or "", -pair[0]), reverse=True)
-        return [entry for _, entry in indexed]
+        indexed.sort(key=lambda pair: (pair[1][sort_field] or "", -pair[0] if reverse else pair[0]), reverse=reverse)
+        sorted_entries = [entry for _, entry in indexed]
+
+        if page_size is None:
+            return sorted_entries
+
+        page = max(page, 1)
+        page_size = max(page_size, 1)
+        start = (page - 1) * page_size
+        return {
+            "items": sorted_entries[start:start + page_size],
+            "total": len(sorted_entries),
+            "page": page,
+            "page_size": page_size,
+        }
     finally:
         conn.close()
 

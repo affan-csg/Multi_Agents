@@ -249,10 +249,13 @@ export interface TickResult {
 // One prospect currently in the Booked stage -- Bookings page. See the
 // Outreach Agent's GET /bookings.
 export interface BookingEntry {
-  item_id: string;
-  campaign_id: string;
+  /** Null for a real Calendly booking that never matched a pipeline item
+   *  (see `matched` below) -- it still appears, it just has no item/campaign
+   *  to open. */
+  item_id: string | null;
+  campaign_id: string | null;
   campaign_name: string | null;
-  research_domain: string;
+  research_domain: string | null;
   company_name: string | null;
   contact_name: string | null;
   contact_email: string | null;
@@ -263,12 +266,50 @@ export interface BookingEntry {
    *  only for a booking made before this endpoint existed. */
   booked_at: string | null;
   booked_detail: Record<string, unknown>;
-  /** 'conversation_agent' | 'user' | null -- who moved the card. */
+  /** 'conversation_agent' | 'user' | 'calendly' | null -- who moved the card
+   *  ('calendly' is the real API sync/webhook integration; see
+   *  calendly/sync.py's ACTOR). */
   booked_by: string | null;
-  /** The account's Calendly scheduling page, from config/CALENDLY_URL --
-   *  same link on every row (no per-booking event URL is captured), null
-   *  if never configured. */
+  /** The specific booking's own join/meeting link when a real Calendly
+   *  event is matched (see meeting_starts_at etc below); otherwise the
+   *  account's shared Calendly scheduling page from config/CALENDLY_URL,
+   *  same link on every such row; null if neither is available. */
   calendly_url: string | null;
+  /** Real per-booking data from the Calendly API/webhook integration --
+   *  null on a booking with no matched calendly_events row (the classifier-
+   *  only path, or the integration not configured). */
+  meeting_starts_at: string | null;
+  meeting_ends_at: string | null;
+  /** 'active' | 'canceled' | null */
+  meeting_status: string | null;
+  /** 'sync' | 'webhook' | null -- which Calendly integration path reported
+   *  this booking, null if none did. */
+  booking_source: string | null;
+  /** Calendly's own resource URI for the matched calendly_events row, or
+   *  null if none is matched -- the key calendlyApi.cancel() needs to
+   *  cancel this specific booking. */
+  event_uri: string | null;
+  /** Set via calendlyApi.markNoShow/unmarkNoShow -- independent of
+   *  meeting_status (which stays 'active'/'canceled'); only meaningful once
+   *  the meeting's start time has passed. */
+  no_show: boolean;
+  /** False only for a real Calendly booking with no matching pipeline item
+   *  (item_id is then also null). True for every classifier/manual booking
+   *  and every matched Calendly booking. */
+  matched: boolean;
+}
+
+// Query params for the filtered/sorted Bookings variant (calendlyApi's
+// companion on GET /bookings) -- see api.py's list_bookings. All optional;
+// omitting page/page_size (this type has neither) keeps the response a flat
+// array, same as the zero-arg listBookings() below.
+export interface BookingsQuery {
+  status?: "active" | "canceled";
+  dateFrom?: string;
+  dateTo?: string;
+  search?: string;
+  sort?: "booked_at" | "meeting_starts_at";
+  order?: "asc" | "desc";
 }
 
 export interface ConversationSettingsUpdate {
@@ -471,7 +512,25 @@ export const outreachApi = {
     ),
 
   // Every prospect currently in the Booked stage, across every campaign.
+  // Unfiltered -- kept exactly as-is (zero args, flat array) since it's what
+  // the reminder banner uses; the Bookings page itself uses
+  // listBookingsFiltered below for real search/filter/sort.
   listBookings: () => req<BookingEntry[]>("/bookings"),
+
+  // Server-side filtered/sorted bookings -- same /bookings route,
+  // differentiated by query params (see api.py's list_bookings). No
+  // page/page_size here, so the response stays the flat-array shape.
+  listBookingsFiltered: (query: BookingsQuery) => {
+    const params = new URLSearchParams();
+    if (query.status) params.set("status", query.status);
+    if (query.dateFrom) params.set("date_from", query.dateFrom);
+    if (query.dateTo) params.set("date_to", query.dateTo);
+    if (query.search) params.set("search", query.search);
+    if (query.sort) params.set("sort", query.sort);
+    if (query.order) params.set("order", query.order);
+    const qs = params.toString();
+    return req<BookingEntry[]>(`/bookings${qs ? `?${qs}` : ""}`);
+  },
 
   jobStatus: (jobId: string) => req<JobSnapshot>(`/jobs/${jobId}`),
 

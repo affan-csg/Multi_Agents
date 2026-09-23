@@ -7,7 +7,11 @@ sibling layers that observe outcomes and feed guidance back into future
 drafts: the **Feedback Learning Agent** (learns from individual draft edits)
 and **Campaign-Level Optimization** (compares whole campaigns and strategies
 against each other). Neither modifies or routes through the other, and
-either can be removed without affecting anything else in this agent.
+either can be removed without affecting anything else in this agent. A third
+sibling, the **[Calendly Integration](#calendly-integration)**, layers a real
+Calendly API sync + webhook receiver onto the Dashboard's Calendly page
+(Bookings tab) — optional, and the page behaves exactly as before without it
+configured.
 
 **It never touches the Research Agent's database.** It pulls qualified
 companies over HTTP from Research's own API, caches them locally, selects the
@@ -353,12 +357,12 @@ prospect already proposed. Left unconfigured, the reply asks for a few times
 that work instead of linking anywhere. See
 [prompts/conversation_reply.md](prompts/conversation_reply.md).
 
-### Bookings page
+### Bookings tab
 
 Every item in `booked`, across every campaign, also shows up on the
-Dashboard's **Bookings** page — company, contact, campaign, when it was
-booked, and whether the Conversation Agent or a person moved the card
-(`GET /bookings`, [api.py](src/outreach/api.py)). It reads the same
+Dashboard's **Calendly** page (Bookings tab) — company, contact, campaign,
+when it was booked, and whether the Conversation Agent or a person moved the
+card (`GET /bookings`, [api.py](src/outreach/api.py)). It reads the same
 `outreach_events` audit trail the item drawer does, so there's no separate
 booking record to fall out of sync.
 
@@ -390,7 +394,11 @@ code changes needed to adjust it:
 - `personalization` — LLM prompt/behavior for drafting emails.
   `personalization.calendly_url` (or the `CALENDLY_URL` env var, which wins
   if both are set) is the scheduling link a Conversation Agent reply offers
-  once the prospect is interested.
+  once the prospect is interested. Separate from, and independent of,
+  `CALENDLY_API_TOKEN`/`CALENDLY_WEBHOOK_SIGNING_KEY` (env-only, no YAML
+  equivalent) — those enable the real API/webhook integration described in
+  [Calendly Integration](#calendly-integration); this is just a link in
+  outbound text.
 - `stages.order` — the pipeline's stage sequence (defaults to
   needs_review → pending → sent → waiting → replied → booked → not_interested;
   `failed`, the Outreach Agent's own send-error stage, is separate -- see
@@ -407,9 +415,12 @@ code changes needed to adjust it:
 pytest
 ```
 
-412 tests, no network (a fake in-memory PostgREST fixture in
-[tests/conftest.py](tests/conftest.py) stands in for Supabase) — 114 Outreach +
-155 Conversation + 105 Learning + 38 Campaign-Level Optimization tests:
+524 tests, no network (a fake in-memory PostgREST fixture in
+[tests/conftest.py](tests/conftest.py) stands in for Supabase; the Calendly
+suite additionally never calls `api.calendly.com` — `httpx.Client.get/post`
+is monkeypatched per test, same convention as the Gemini/Anthropic/Tavily
+tests) — 114 Outreach + 155 Conversation + 105 Learning + 38 Campaign-Level
+Optimization + 60 Calendly Integration tests, roughly:
 
 - [test_ingest.py](tests/test_ingest.py) — importing prospects from
   Research's API response shape; that a tier-matching company with no
@@ -580,6 +591,47 @@ campaigns/strategies against each other rather than diffing single edits.
   deterministic synthetic dataset exercising the segmentation and
   confidence-gating logic end to end.
 
+### Calendly Integration
+
+- [test_calendly_client.py](tests/test_calendly_client.py) — the httpx
+  wrapper's request shaping (filters, pagination token passthrough, UUID
+  extraction from a full resource URI), cancellation request shaping
+  (`POST /scheduled_events/{uuid}/cancellation`, with and without a reason),
+  and error handling for an unset token, an unreachable API, and a 4xx/5xx
+  status.
+- [test_calendly_webhook_verify.py](tests/test_calendly_webhook_verify.py) —
+  HMAC-SHA256 signature verification: a valid signature passes; a missing
+  header, missing signing key, wrong key, tampered body, stale timestamp
+  (replay), and malformed header/timestamp are all rejected; plus payload
+  normalization for `invitee.created`/`invitee.canceled`.
+- [test_calendly_sync.py](tests/test_calendly_sync.py) — prospect matching by
+  invitee email (case-insensitive, most-recent-send tiebreak across
+  campaigns, no match still recorded not discarded); idempotent
+  create/update on repeated `apply_event` calls for the same `event_uri` (no
+  duplicate rows, no redundant stage-change event on an already-`booked`
+  item); cancellation reverting a `booked` item to `waiting` (and being a
+  no-op on a non-booked item); `run_sync`'s full pagination loop across
+  multiple pages; graceful (not exception-raising) reporting when
+  `CALENDLY_API_TOKEN` is unset; webhook ingestion for both handled and
+  unrecognized event types, and duplicate-delivery idempotency;
+  `cancel_booking` — cancels in Calendly before touching the local row,
+  reverts a matched item's stage, raises for an unknown/already-canceled
+  event or a missing token, and leaves the local row untouched if the
+  Calendly API call itself fails.
+- [test_calendly_routes.py](tests/test_calendly_routes.py) — `POST
+  /calendly/webhook` end to end against the real signature header (missing,
+  bad, and valid signatures), matched and unmatched bookings, cancellation
+  handling, and ignoring an unhandled event type without erroring; `POST
+  /calendly/sync` and `GET /calendly/status`; `POST /calendly/events/cancel`
+  end to end (cancels and reverts stage, 404 for an unknown event, 502 on a
+  Calendly API failure).
+- [test_bookings.py](tests/test_bookings.py) (extended) — a matched
+  `calendly_events` row enriching a booking entry with real join
+  link/meeting time; an unmatched Calendly booking still appearing on the
+  page; and, critically, that a booking with **no** `calendly_events` row at
+  all (the pre-existing classifier-only path) is completely unchanged —
+  falls back to the shared account-wide `calendly_url` exactly as before.
+
 ## Feedback Learning Agent
 
 The Learning Agent observes everything: captures AI-original vs. human-edited
@@ -683,6 +735,107 @@ No CLI commands. Access via:
   `POST /optimization/adoptions` (see
   [src/outreach/optimization/routes.py](src/outreach/optimization/routes.py)).
 
+## Calendly Integration
+
+A real Calendly API integration for the Dashboard's Calendly page (Bookings
+tab), layered on top of (not replacing) the pre-existing classifier-only
+booking detection — see
+[src/outreach/calendly/\_\_init\_\_.py](src/outreach/calendly/__init__.py)
+for the full module map. Optional: with no `CALENDLY_API_TOKEN` configured,
+the Bookings tab behaves exactly as it always did.
+
+### How it works
+
+1. **Webhook receiver** — `POST /calendly/webhook` accepts Calendly's
+   `invitee.created`/`invitee.canceled` deliveries. Every request is verified
+   against the `Calendly-Webhook-Signature` header (HMAC-SHA256 over
+   `{timestamp}.{raw body}`, constant-time compared, with a 5-minute
+   staleness tolerance against replay) before the body is even parsed — an
+   unverified request is rejected with 401 and never written anywhere. See
+   [calendly/webhook.py](src/outreach/calendly/webhook.py).
+2. **API sync (backfill)** — `POST /calendly/sync` (or `outreach calendly
+   sync`) paginates `GET /scheduled_events` for the whole account over a
+   configurable lookback window (default 90 days), fetching each event's
+   invitees, for bookings made before a webhook subscription existed or made
+   through any channel a webhook delivery might have missed. See
+   [calendly/sync.py](src/outreach/calendly/sync.py).
+3. **Prospect matching** — both paths match a booking to a pipeline item by
+   invitee email against `outreach_items.to_email` (the address outreach was
+   actually sent to — a stronger signal than the cached prospect's
+   `contact_email`, which can drift). The same-person-in-multiple-campaigns
+   tiebreak matches `conversation/matcher.py`'s own address strategies: most
+   recently sent wins. **A booking with no matching item still appears** on
+   the Bookings tab (`matched: false`, no item/campaign), never discarded.
+4. **Stage sync** — a matched, active booking moves the item to `booked`
+   (any live conversation stage → booked); a matched cancellation reverts a
+   `booked` item to `waiting` (the meeting fell through, but the
+   conversation is still live) — something the classifier-only path could
+   never do, since it has no way to learn a booking was later canceled. Both
+   go through the same `db.set_stage` audit-trail path every other stage
+   move uses, with a new actor, `"calendly"`, so the drawer/Bookings tab can
+   always tell a Calendly-confirmed move apart from a classified-reply move
+   or a person's manual override. See `calendly/sync.py`'s `_sync_item_stage`.
+5. **Idempotency** — both the webhook and the sync path funnel through the
+   same `apply_event()`, upserting one `calendly_events` row keyed on
+   Calendly's own `event_uri`. A sync re-run or a webhook retry/re-delivery
+   updates that one row (e.g. `active` → `canceled`) rather than duplicating
+   it or re-advancing an already-`booked` item a second time.
+6. **Canceling a booking** — the Bookings tab's "Cancel booking" action,
+   `POST /calendly/events/cancel` (`{event_uri, reason?}`), cancels the event
+   in Calendly itself (`POST /scheduled_events/{uuid}/cancellation`) — not a
+   local row delete, which would desync from Calendly and silently
+   reappear on the next sync/webhook — then applies the same
+   status-flip/stage-revert path a real `invitee.canceled` webhook would
+   (see `calendly/sync.py`'s `cancel_booking`). If the Calendly API call
+   itself fails, the local row is left untouched so a failed cancel never
+   lies about the booking's real status; 404 if the event isn't known
+   locally or is already canceled, 502 on a Calendly API failure.
+7. **Deleting a booking** — the Bookings tab's "Delete" action (available on
+   any booking, any status), `POST /calendly/events/delete`
+   (`{event_uri}`), permanently removes the local `calendly_events` row so
+   it stops appearing anywhere in the dashboard. If the event is still
+   active/upcoming on Calendly, it's canceled there first (same call as
+   above); a past or already-canceled event has nothing left to cancel, so
+   that step is skipped. Unlike cancel, this never leaves a row behind, and
+   it never touches the matched pipeline item (only unlinked, never
+   deleted) — see `calendly/sync.py`'s `delete_booking`.
+
+### Setup
+
+1. Create a Calendly Personal Access Token (Integrations → API & Webhooks)
+   with at least `scheduled_events:read`, and set `CALENDLY_API_TOKEN` in
+   `.env` — see [.env.example](.env.example). Add `scheduled_events:write`
+   too if you want the Bookings tab's per-row cancel/delete actions to
+   work — without it, `POST /calendly/events/cancel` (or `/delete` when the
+   event is still active) fails with a 502 ("Insufficient scope") that names
+   the exact scope to add; sync/viewing is unaffected either way.
+2. Run [migrations/008_calendly_integration.sql](migrations/008_calendly_integration.sql)
+   against an existing project (a fresh project's `schema.sql` already has
+   it) — purely additive, one new table (`calendly_events`), safe to re-run.
+3. Optional, for live updates instead of only manual/scheduled syncs: run
+   `outreach calendly register-webhook https://your-public-host/calendly/webhook`
+   (needs the token's `webhooks:write` scope). **Save the printed
+   `signing_key` immediately** as `CALENDLY_WEBHOOK_SIGNING_KEY` in `.env` —
+   Calendly returns it exactly once and never shows it again.
+4. Without step 3, `POST /calendly/sync` (or the Bookings tab's "Sync
+   Calendly" button, or `outreach calendly sync`) is still a complete,
+   correct way to keep the page current — just not real-time.
+
+### Using it
+
+- Dashboard: **Outreach Agent → Calendly → Bookings tab → Sync Calendly**
+  button; matched and unmatched bookings both appear in the same table. The
+  **Event Types** tab on the same page shows the account's meeting types and
+  availability (view-only) and lets you generate one-off scheduling links.
+- CLI: `outreach calendly register-webhook <url>`, `outreach calendly sync
+  [--lookback-days N]`.
+- API: `POST /calendly/webhook` (Calendly calls this, not the Dashboard),
+  `POST /calendly/sync`, `GET /calendly/status` (see
+  [src/outreach/calendly/routes.py](src/outreach/calendly/routes.py)).
+  `GET /bookings` is extended (not replaced) to merge in any matched
+  `calendly_events` row's real join link/meeting time, and to list unmatched
+  Calendly bookings alongside pipeline-matched ones.
+
 ## Known limitations
 
 - **Reply checking is manual.** The Conversation Agent runs on a button click
@@ -690,14 +843,25 @@ No CLI commands. Access via:
   flow has been exercised against real mail.
 - **Email only.** The Conversation Agent reads and replies over IMAP/SMTP.
   LinkedIn and other channels are not handled.
-- **Meeting detection has no real calendar integration.** A `booked`
-  classification comes from either the reply's wording (a prospect proposing
-  a time in prose) or recognizing a scheduling tool's own confirmation
-  email (Calendly, Google Calendar) by sender/subject shape — not from
-  actually querying Calendly's API for the booking. There is also no
-  per-booking event URL captured from that notification email, so the
-  Dashboard's Bookings page links every row to the same account-wide
-  Calendly scheduling page rather than the specific event.
+- **Meeting detection has two independent paths, not fully unified.** A
+  `booked` classification still comes from either the reply's wording (a
+  prospect proposing a time in prose) or recognizing a scheduling tool's own
+  confirmation email by sender/subject shape, exactly as before — see
+  [conversation/classifier.py](src/outreach/conversation/classifier.py). On
+  top of that, a real Calendly integration
+  ([src/outreach/calendly/](src/outreach/calendly/)) now exists: a
+  `POST /calendly/webhook` receiver (signature-verified) and a
+  `POST /calendly/sync` backfill pull against Calendly's own API, both
+  matching bookings to pipeline items by invitee email and moving/reverting
+  the `booked` stage from real calendar fact (including catching
+  cancellations, which the email-heuristic path cannot). The two paths do
+  not know about each other — a booking either classifier-detected or
+  Calendly-confirmed both just land on `booked`, and the Bookings tab shows
+  whichever data is available (the real per-booking join link/time when a
+  `calendly_events` row is matched, the shared account-wide scheduling link
+  otherwise). Setup (API token, optional webhook registration via
+  `outreach calendly register-webhook`) is required for the new path; without
+  it the page behaves exactly as before.
 - Sending real email requires a working SMTP relay and, for Gmail
   specifically, an App Password rather than the account password. A message
   that sends successfully can still land in spam if the From domain's

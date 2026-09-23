@@ -29,9 +29,11 @@ app = typer.Typer(add_completion=False, help="CSG Outreach Agent")
 campaign_app = typer.Typer(add_completion=False, help="Manage outreach campaigns")
 item_app = typer.Typer(add_completion=False, help="Manage individual outreach items")
 conversation_app = typer.Typer(add_completion=False, help="Conversation Agent (replies, follow-ups)")
+calendly_app = typer.Typer(add_completion=False, help="Calendly integration (real API sync + webhook)")
 app.add_typer(campaign_app, name="campaign")
 app.add_typer(item_app, name="item")
 app.add_typer(conversation_app, name="conversation")
+app.add_typer(calendly_app, name="calendly")
 
 console = Console()
 
@@ -318,6 +320,66 @@ def conversation_tick(
                 console.print(f"  classified: {r.classified}")
             for domain, err in r.errors.items():
                 console.print(f"  [red]{domain}[/red]: {err}")
+    finally:
+        conn.close()
+
+
+@calendly_app.command("register-webhook")
+def calendly_register_webhook(
+    callback_url: str = typer.Argument(..., help="Public HTTPS URL Calendly should POST to, e.g. https://your-host/calendly/webhook"),
+    config: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """One-time setup: create a Calendly webhook subscription for
+    invitee.created/invitee.canceled pointed at this app's /calendly/webhook.
+
+    Prints the signing_key Calendly returns -- SAVE IT as
+    CALENDLY_WEBHOOK_SIGNING_KEY in .env immediately, Calendly never shows it
+    again. Requires CALENDLY_API_TOKEN with the webhooks:write scope."""
+    from .calendly.client import CalendlyClient, CalendlyClientError
+
+    cfg = _cfg(config)
+    client = CalendlyClient(cfg)
+    if not client.configured:
+        console.print("[red]CALENDLY_API_TOKEN is not set -- see .env.example[/red]")
+        raise typer.Exit(1)
+    try:
+        sub = client.create_webhook_subscription(
+            callback_url, events=["invitee.created", "invitee.canceled"],
+        )
+        console.print(f"[green]webhook subscription created:[/green] {sub['uri']}")
+        console.print(f"[bold yellow]signing_key (save this NOW, shown once):[/bold yellow] {sub['signing_key']}")
+        console.print("Set CALENDLY_WEBHOOK_SIGNING_KEY to this value in .env.")
+    except CalendlyClientError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    finally:
+        client.close()
+
+
+@calendly_app.command("sync")
+def calendly_sync_cmd(
+    lookback_days: int = typer.Option(90, "--lookback-days"),
+    config: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Backfill-pull scheduled events from Calendly's API and match them to
+    pipeline items -- for bookings made before a webhook subscription
+    existed, or made while the app was down."""
+    from .calendly import sync as calendly_sync
+
+    cfg = _cfg(config)
+    conn = db.connect()
+    try:
+        result = calendly_sync.run_sync(conn, cfg, lookback_days=lookback_days)
+        console.print(
+            f"fetched={result.fetched} created={result.created} updated={result.updated} "
+            f"matched={result.matched} unmatched={result.unmatched}"
+        )
+        console.print(
+            f"advanced_to_booked={result.advanced_to_booked} "
+            f"reverted_from_booked={result.reverted_from_booked}"
+        )
+        for err in result.errors:
+            console.print(f"[red]{err}[/red]")
     finally:
         conn.close()
 
