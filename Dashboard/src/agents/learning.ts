@@ -99,6 +99,7 @@ export interface CampaignPerformance {
   positive_reply_rate: number;
   booking_rate: number;
   no_reply_rate: number;
+  failure_rate: number;
 }
 
 export interface FollowupBucket {

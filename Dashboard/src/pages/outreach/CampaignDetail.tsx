@@ -28,7 +28,8 @@ const STAGE_LABEL: Record<Stage, string> = {
   waiting: "No Reply / Waiting",
   replied: "Replied",
   booked: "Booked",
-  failed: "Failed",
+  not_interested: "Failed",
+  failed: "Send Failed",
 };
 
 const STAGE_STAT_LABEL: Record<Stage, string> = {
@@ -38,7 +39,8 @@ const STAGE_STAT_LABEL: Record<Stage, string> = {
   waiting: "Waiting",
   replied: "Replied",
   booked: "Booked",
-  failed: "Failed",
+  not_interested: "Failed",
+  failed: "Send Failed",
 };
 
 const STAGE_SUBLABEL: Record<Stage, string> = {
@@ -48,6 +50,7 @@ const STAGE_SUBLABEL: Record<Stage, string> = {
   waiting: "Follow-up due",
   replied: "Needs attention",
   booked: "Meetings",
+  not_interested: "Rejected, no further outreach",
   failed: "Send failed",
 };
 
@@ -58,6 +61,7 @@ const STAGE_ICON: Record<Stage, IconName> = {
   waiting: "clock",
   replied: "mail",
   booked: "calendar",
+  not_interested: "close",
   failed: "close",
 };
 
@@ -68,6 +72,7 @@ const STAGE_TONE: Record<Stage, "accent" | "mint" | "amber" | "violet"> = {
   waiting: "amber",
   replied: "mint",
   booked: "violet",
+  not_interested: "amber",
   failed: "amber",
 };
 
@@ -78,6 +83,7 @@ const STAGE_EMPTY: Record<Stage, string> = {
   waiting: "No pending follow-ups",
   replied: "No replies yet",
   booked: "No meetings booked yet",
+  not_interested: "No rejections yet",
   failed: "No failed sends",
 };
 
@@ -88,6 +94,7 @@ const STAGE_EMPTY_SUB: Record<Stage, string> = {
   waiting: "Replies will appear here once prospects respond or reach their follow-up date.",
   replied: "Replies will appear here once prospects respond.",
   booked: "Booked meetings will appear here once prospects confirm a time.",
+  not_interested: "Prospects who clearly declined will land here automatically -- no follow-up is sent.",
   failed: "Failed sends will appear here if delivery errors out.",
 };
 
@@ -241,7 +248,7 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
     setDraftReviseError(null);
     setExpandedQuotes(new Set());
     if (!selected) return;
-    if (!["sent", "waiting", "replied", "booked"].includes(selected.stage)) return;
+    if (!["sent", "waiting", "replied", "booked", "not_interested"].includes(selected.stage)) return;
 
     let cancelled = false;
     setThreadLoading(true);
@@ -424,7 +431,7 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
   // buttons and the drag-and-drop columns react instantly instead of
   // waiting on the API round trip + refetch. Rolled back via invalidate()
   // (forces a real refetch) if the request turns out to have failed.
-  function advanceStage(item: OutreachItem, stage: "waiting" | "replied" | "booked") {
+  function advanceStage(item: OutreachItem, stage: "waiting" | "replied" | "booked" | "not_interested") {
     const itemsKey = `campaign-items:${campaignId}`;
     patch<OutreachItem[]>(itemsKey, (cur) =>
       (cur ?? []).map((i) => (i.item_id === item.item_id ? { ...i, stage } : i)),
@@ -439,14 +446,14 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
   }
 
   // Drag-and-drop between the manual post-send columns (Waiting/Replied/
-  // Booked), as an alternative to opening a card and picking a stage button.
-  // Only these three are droppable -- pending/sent/needs_review stay
+  // Booked/Failed), as an alternative to opening a card and picking a stage
+  // button. Only these four are droppable -- pending/sent/needs_review stay
   // agent-owned (see AGENT_OWNED_STAGES) and are never set by dragging.
   function handleCardDrop(item: OutreachItem, stage: Stage) {
     setDragOverStage(null);
     setDraggingId(null);
     if (item.stage === stage) return;
-    if (stage !== "waiting" && stage !== "replied" && stage !== "booked") return;
+    if (stage !== "waiting" && stage !== "replied" && stage !== "booked" && stage !== "not_interested") return;
     advanceStage(item, stage);
   }
 
@@ -661,7 +668,7 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
               {isDraft ? "Draft" : "Active"}
             </span>
           </h1>
-          <p>6-stage pipeline for research-based outreach.</p>
+          <p>7-stage pipeline for research-based outreach.</p>
         </div>
         <div className="page-head-actions">
           {/* Conversation Agent toggle. Switching it on never sends anything
@@ -922,7 +929,9 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
                   {byStage(stage).map((item) => {
                     const prospect = prospectByDomain.get(item.research_domain);
                     const ready = Boolean(prospect?.pain_summary || prospect?.recommended_angle);
-                    const draggable = stage === "sent" || stage === "waiting" || stage === "replied" || stage === "booked";
+                    const draggable =
+                      stage === "sent" || stage === "waiting" || stage === "replied" ||
+                      stage === "booked" || stage === "not_interested";
                     return (
                       <button
                         type="button"
@@ -998,7 +1007,7 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
         const displaySubject = selected.subject || preview?.subject;
         const displayBody = selected.body || preview?.body;
         const isLiveDraft = selected.stage === "needs_review" || selected.stage === "pending"; // not sent yet -- still editable
-        const isConversationStage = ["sent", "waiting", "replied", "booked"].includes(selected.stage);
+        const isConversationStage = ["sent", "waiting", "replied", "booked", "not_interested"].includes(selected.stage);
 
         // The "Message preview/sent" section -- extracted so it can render
         // in its original place for a pre-send item, or further down
@@ -1249,7 +1258,7 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
                 </>
               )}
 
-              {["sent", "waiting", "replied", "booked"].includes(selected.stage) && (
+              {["sent", "waiting", "replied", "booked", "not_interested"].includes(selected.stage) && (
                 <>
                   <div className="drawer-section-head">
                     <h3 className="drawer-section-title">Conversation</h3>

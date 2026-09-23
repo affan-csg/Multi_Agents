@@ -450,3 +450,29 @@ def test_manual_stage_route_still_works(client, seeded):
 
 def test_manual_stage_route_still_rejects_agent_owned_stages(client, seeded):
     assert client.post("/items/item-1/stage", json={"stage": "pending"}).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# not_interested ("Failed") via the manual stage route
+# ---------------------------------------------------------------------------
+
+def test_manual_stage_route_accepts_not_interested(client, seeded):
+    """A person can manually mark a card Failed -- e.g. a rejection that
+    arrived by phone rather than email."""
+    r = client.post("/items/item-1/stage", json={"stage": "not_interested"})
+    assert r.status_code == 200
+    assert db.get_item(seeded, "item-1").stage == "not_interested"
+
+
+def test_manual_stage_route_can_reopen_a_failed_item(client, seeded, conn):
+    """The explicit manual escape hatch: not_interested is terminal for the
+    Conversation Agent's own automated moves, but a person can always
+    reclassify a wrongly-marked rejection back to an open stage through this
+    same route -- it is not bound by CONVERSATION_TRANSITIONS."""
+    db.set_stage(conn, "item-1", "not_interested", actor="conversation_agent")
+    assert db.get_item(conn, "item-1").stage == "not_interested"
+
+    r = client.post("/items/item-1/stage", json={"stage": "replied"})
+
+    assert r.status_code == 200
+    assert db.get_item(seeded, "item-1").stage == "replied"

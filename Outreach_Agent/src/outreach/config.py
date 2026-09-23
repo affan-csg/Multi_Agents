@@ -80,7 +80,9 @@ class Config:
 
     @property
     def stage_order(self) -> list[str]:
-        return list(self.stages.get("order") or ["pending", "sent", "waiting", "replied", "booked"])
+        return list(self.stages.get("order") or [
+            "needs_review", "pending", "sent", "waiting", "replied", "booked", "not_interested",
+        ])
 
     @property
     def conversation(self) -> dict[str, Any]:

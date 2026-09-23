@@ -1,0 +1,34 @@
+-- Migration 007 -- add the Conversation Agent's terminal not_interested stage
+--
+-- Run this ONCE in the Outreach project's Supabase SQL editor if that
+-- project was provisioned before this migration existed. A freshly
+-- provisioned project does not need this file -- schema.sql already
+-- documents the new value. Nothing to run here -- see "Why no ALTER" below.
+--
+-- Why: the pipeline gained a 7th stage, `not_interested` (shown as "Failed"
+-- in the Dashboard, distinct from the pre-existing `failed` value which
+-- means the Outreach Agent's own send attempt errored -- see schema.sql's
+-- outreach_items comment). It is the Conversation Agent's terminal
+-- rejection outcome, reached automatically when an inbound reply is
+-- classified as a clear "not interested" (see src/outreach/conversation/
+-- classifier.py's existing `not_interested` ReplyIntent -- this migration
+-- adds no new classification logic, it only changes which stage that
+-- existing intent routes a card to; see conversation/engine.py's
+-- _INTENT_STAGE). A person can still manually set or clear it via
+-- POST /items/{id}/stage, same as waiting/replied/booked.
+--
+-- Why no ALTER: outreach_items.stage has always been a plain TEXT column
+-- with no CHECK constraint or Postgres ENUM type (see schema.sql) --
+-- validity is enforced entirely in the Python layer (models.Stage's
+-- Literal type, and models.CONVERSATION_TRANSITIONS for the Conversation
+-- Agent's own automated moves). A new stage value is therefore already
+-- writable on every existing Outreach project without any DDL; this file
+-- exists only so the migration history stays a complete, ordered record of
+-- every pipeline change, matching this project's convention of one file per
+-- feature (see 001-006).
+--
+-- Backfill: none needed or possible -- no existing row can retroactively be
+-- known to have been a rejection that was previously mis-filed as `replied`.
+-- Existing `replied` items keep reading as `replied`; only a NEW reply
+-- classified as `not_interested` from this point forward lands in the new
+-- stage. This is a forward-only behavior change, not a data correction.

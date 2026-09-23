@@ -153,7 +153,7 @@ def test_created_items_with_research_data_start_pending(conn, monkeypatch):
     LLM call, only on ingest.py's stage-gating logic."""
     monkeypatch.setattr(
         ingest, "draft_message",
-        lambda cfg, p: DraftedMessage(subject="Hi", body="body", personalized_from="pain_summary"),
+        lambda cfg, p, **kwargs: DraftedMessage(subject="Hi", body="body", personalized_from="pain_summary"),
     )
     cfg = load_config()
     _seed(conn, "acme.com", "A", 80, qualified=True)

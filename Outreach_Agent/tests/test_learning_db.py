@@ -112,6 +112,29 @@ def test_outreach_outcome_summary_missing_item_omitted(conn):
     assert summary == {}
 
 
+def test_outreach_outcome_summary_not_interested_is_failed_and_replied(conn):
+    """A clear rejection (the not_interested/"Failed" stage) is flagged
+    `failed` -- and still counts as `replied`, since a human did reply, same
+    convention `booked` already gets."""
+    _seed_item(conn, item_id="item-1", stage="not_interested")
+    conn.tables.setdefault("conversation_messages", []).append({
+        "message_id": "m1", "item_id": "item-1", "direction": "inbound",
+        "intent": "not_interested", "created_at": "2026-01-02T00:00:00",
+    })
+    summary = learning_db.outreach_outcome_summary(conn, ["item-1"])
+
+    assert summary["item-1"]["failed"] is True
+    assert summary["item-1"]["replied"] is True
+    assert summary["item-1"]["positive_reply"] is False
+    assert summary["item-1"]["booked"] is False
+
+
+def test_outreach_outcome_summary_booked_is_not_failed(conn):
+    _seed_item(conn, item_id="item-1", stage="booked")
+    summary = learning_db.outreach_outcome_summary(conn, ["item-1"])
+    assert summary["item-1"]["failed"] is False
+
+
 def test_refresh_draft_version_outcomes_backfills_columns(conn):
     _seed_item(conn, item_id="item-1", stage="replied")
     conn.tables.setdefault("conversation_messages", []).append({

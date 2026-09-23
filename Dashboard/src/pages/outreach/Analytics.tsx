@@ -33,6 +33,7 @@ const STAGE_COLORS: Record<Stage, string> = {
   waiting: "#e8a33d",
   replied: "#23c08b",
   booked: "#6f63f2",
+  not_interested: "#e8734a",
   failed: "#e8734a",
 };
 
@@ -43,7 +44,8 @@ const STAGE_LABEL: Record<Stage, string> = {
   waiting: "Waiting",
   replied: "Replied",
   booked: "Booked",
-  failed: "Failed",
+  not_interested: "Failed",
+  failed: "Send Failed",
 };
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -154,6 +156,7 @@ export function Analytics({ campaignId, campaigns }: Props) {
         <StatCard icon="check" tone="mint" value={data.sent_total.toLocaleString()} label="Messages sent" />
         <StatCard icon="mail" tone="violet" value={`${data.reply_rate}%`} label="Reply rate" />
         <StatCard icon="calendar" tone="amber" value={`${data.booking_rate}%`} label="Booking rate" />
+        <StatCard icon="close" tone="amber" value={`${data.failure_rate}%`} label="Failure rate" />
       </div>
 
       <div className="chart-grid">
@@ -162,7 +165,7 @@ export function Analytics({ campaignId, campaigns }: Props) {
             <Icon name="chart" size={16} />
             Pipeline funnel
           </h3>
-          <p className="card-sub">Where every prospect currently sits in the 5-stage pipeline.</p>
+          <p className="card-sub">Where every prospect currently sits in the 7-stage pipeline.</p>
           <ResponsiveContainer width="100%" height={260}>
             <BarChart
               data={data.stage_funnel}

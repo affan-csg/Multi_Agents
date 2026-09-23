@@ -194,9 +194,10 @@ def test_bounce_does_not_move_the_card(conn, cfg, monkeypatch):
     assert db.get_item(conn, "item-1").stage == "sent"
 
 
-def test_not_interested_moves_to_replied_but_sends_nothing(conn, cfg, monkeypatch):
-    """A rejection is a real reply, so the card moves -- but the agent never
-    answers it. The respectful response to "no" is silence."""
+def test_not_interested_moves_to_failed_stage_but_sends_nothing(conn, cfg, monkeypatch):
+    """A rejection is a real reply, so the card moves -- to the terminal
+    not_interested stage ("Failed" in the UI), not to replied -- but the
+    agent never answers it. The respectful response to "no" is silence."""
     _seed(conn)
     set_settings(conn, "camp-1", enabled=True, auto_reply=True)
     _fixed_intent(monkeypatch, "not_interested")
@@ -204,7 +205,7 @@ def test_not_interested_moves_to_replied_but_sends_nothing(conn, cfg, monkeypatc
 
     result = engine.tick(conn, cfg, "camp-1", emails=[_reply("Not interested, remove me.")], now=NOW)
 
-    assert db.get_item(conn, "item-1").stage == "replied"
+    assert db.get_item(conn, "item-1").stage == "not_interested"
     assert result.replies_sent == 0
     assert result.replies_drafted == 0
 
@@ -261,3 +262,171 @@ def test_never_touches_outreach_owned_items(conn, cfg, monkeypatch, stage):
     assert db.get_item(conn, "item-1").stage == stage
     assert result.matched == 0
     assert result.advanced == 0
+
+
+# ---------------------------------------------------------------------------
+# not_interested ("Failed") -- terminal stage, different rejection wordings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("body", [
+    "Not interested, thanks.",
+    "We're not looking for this right now.",
+    "No thanks, please don't contact us again.",
+    "We don't need your services.",
+    "Please remove me from this list.",
+    "Not a fit for us, sorry.",
+    "Unsubscribe me please.",
+    "We already have a vendor for this.",
+])
+def test_various_rejection_wordings_reach_failed_stage(conn, cfg, monkeypatch, body):
+    """A range of real-world rejection phrasings, all classified by the
+    (monkeypatched, here) classifier as not_interested, all land on the same
+    terminal stage. The classifier's own wording judgment is exercised
+    separately in test_conversation_classifier.py -- this test is about the
+    engine's routing once that judgment is made."""
+    _seed(conn)
+    set_settings(conn, "camp-1", enabled=True)
+    _fixed_intent(monkeypatch, "not_interested")
+
+    engine.tick(conn, cfg, "camp-1", emails=[_reply(body)], now=NOW)
+
+    assert db.get_item(conn, "item-1").stage == "not_interested"
+
+
+@pytest.mark.parametrize("from_stage", ["sent", "waiting", "replied"])
+def test_not_interested_reachable_from_every_open_stage(conn, cfg, monkeypatch, from_stage):
+    """A rejection can arrive at any point in the open conversation -- right
+    after the first send, after a follow-up nudge, or even after a prior
+    positive-sounding reply cools off -- and always reaches the same terminal
+    stage, per CONVERSATION_TRANSITIONS."""
+    _seed(conn, stage=from_stage)
+    set_settings(conn, "camp-1", enabled=True)
+    _fixed_intent(monkeypatch, "not_interested")
+
+    engine.tick(conn, cfg, "camp-1", emails=[_reply("Not interested.")], now=NOW)
+
+    assert db.get_item(conn, "item-1").stage == "not_interested"
+
+
+def test_not_interested_is_terminal_for_the_agent(conn, cfg, monkeypatch):
+    """Once a card is Failed, the Conversation Agent's own automated moves
+    can never take it anywhere else -- CONVERSATION_TRANSITIONS gives
+    not_interested no destinations, same as booked."""
+    _seed(conn, stage="not_interested")
+    set_settings(conn, "camp-1", enabled=True)
+    _fixed_intent(monkeypatch, "interested")
+    _fixed_draft(monkeypatch)
+
+    result = engine.tick(
+        conn, cfg, "camp-1",
+        emails=[_reply("Actually, let's talk after all.", message_id="<reply-9@acme.com>")],
+        now=NOW,
+    )
+
+    assert db.get_item(conn, "item-1").stage == "not_interested"
+    assert result.advanced == 0
+
+
+def test_not_interested_item_receives_no_automated_followup(conn, cfg, monkeypatch):
+    """A Failed prospect must never get a follow-up nudge -- should_send_followup
+    and should_move_to_waiting both gate on the item's exact stage, and
+    not_interested is neither 'sent' nor 'waiting', so a Failed item is
+    structurally excluded from the follow-up pass regardless of how much
+    silence has passed."""
+    _seed(conn, stage="not_interested", sent_days_ago=30)
+    set_settings(conn, "camp-1", enabled=True, followup_after_days=1, max_followups=2)
+    _fixed_draft(monkeypatch)
+
+    result = engine.tick(conn, cfg, "camp-1", emails=[], now=NOW)
+
+    assert db.get_item(conn, "item-1").stage == "not_interested"
+    assert result.followups_sent == 0
+    assert result.followups_drafted == 0
+    assert result.moved_to_waiting == 0
+
+
+def test_end_to_end_rejection_flow_sent_waiting_failed(conn, cfg, monkeypatch):
+    """The rejection funnel across two ticks: silence moves the card to
+    Waiting exactly like the happy path, then a rejection reply moves it to
+    the terminal Failed stage instead of Replied/Booked."""
+    _seed(conn, sent_days_ago=5)
+    set_settings(conn, "camp-1", enabled=True, followup_after_days=3, max_followups=0)
+    _fixed_draft(monkeypatch)
+
+    # 1. Silence past the threshold -> waiting, same as the happy path.
+    engine.tick(conn, cfg, "camp-1", emails=[], now=NOW)
+    assert db.get_item(conn, "item-1").stage == "waiting"
+
+    # 2. They reply with a clear rejection -> Failed, not Replied.
+    _fixed_intent(monkeypatch, "not_interested")
+    result = engine.tick(conn, cfg, "camp-1", emails=[_reply("Not interested, remove me.")], now=NOW)
+    assert db.get_item(conn, "item-1").stage == "not_interested"
+    assert result.replies_sent == 0
+    assert result.replies_drafted == 0
+
+    stages = [e.to_stage for e in db.list_events(conn, "item-1") if e.event_type == "stage_change"]
+    assert stages == ["waiting", "not_interested"]
+
+
+def test_not_interested_preserves_message_and_audit_trail(conn, cfg, monkeypatch):
+    """The rejection email itself, its classification, and the stage-change
+    event (with reason/intent/provider_message_id) are all preserved -- a
+    Failed card is not a dead end for the record, only for further outreach."""
+    _seed(conn)
+    set_settings(conn, "camp-1", enabled=True)
+    _fixed_intent(monkeypatch, "not_interested")
+
+    engine.tick(
+        conn, cfg, "camp-1",
+        emails=[_reply("Not a fit for us, please remove me.", message_id="<reply-42@acme.com>")],
+        now=NOW,
+    )
+
+    messages = db.list_conversation_messages(conn, "item-1")
+    inbound = [m for m in messages if m.direction == "inbound"]
+    assert len(inbound) == 1
+    assert inbound[0].body == "Not a fit for us, please remove me."
+    assert inbound[0].intent == "not_interested"
+    assert inbound[0].provider_message_id == "<reply-42@acme.com>"
+    assert inbound[0].received_at == NOW
+
+    events = [e for e in db.list_events(conn, "item-1") if e.event_type == "stage_change"]
+    failed_event = next(e for e in events if e.to_stage == "not_interested")
+    assert failed_event.from_stage == "sent"
+    assert failed_event.actor == "conversation_agent"
+    assert failed_event.detail.get("intent") == "not_interested"
+    assert failed_event.detail.get("provider_message_id") == "<reply-42@acme.com>"
+
+
+def test_not_interested_respects_auto_reply_off(conn, cfg, monkeypatch):
+    """Even with auto_reply on, a rejection never gets an automated reply --
+    responder._REPLYABLE excludes not_interested outright, so this holds
+    regardless of the auto_reply switch. Verified here with auto_reply off,
+    the more common default configuration."""
+    _seed(conn)
+    set_settings(conn, "camp-1", enabled=True, auto_reply=False)
+    _fixed_intent(monkeypatch, "not_interested")
+    _fixed_draft(monkeypatch)
+
+    result = engine.tick(conn, cfg, "camp-1", emails=[_reply("No thanks.")], now=NOW)
+
+    assert db.get_item(conn, "item-1").stage == "not_interested"
+    assert result.replies_sent == 0
+    assert result.replies_drafted == 0
+    # No draft was even composed for this intent -- should_reply("not_interested") is False.
+    outbound = [m for m in db.list_conversation_messages(conn, "item-1") if m.direction == "outbound"]
+    assert outbound == []
+
+
+def test_disabled_agent_never_sets_not_interested(conn, cfg, monkeypatch):
+    """The master switch is a complete no-op, including for rejections --
+    same guarantee test_conversation_toggle.py exercises for every other
+    stage move."""
+    _seed(conn)
+    set_settings(conn, "camp-1", enabled=False)
+    _fixed_intent(monkeypatch, "not_interested")
+
+    result = engine.tick(conn, cfg, "camp-1", emails=[_reply("Not interested.")], now=NOW)
+
+    assert db.get_item(conn, "item-1").stage == "sent"
+    assert result.enabled is False

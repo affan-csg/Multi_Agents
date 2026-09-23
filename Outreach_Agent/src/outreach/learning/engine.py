@@ -197,7 +197,7 @@ def _detect_followup_timing(conn: SupabaseConn) -> Optional[LearningInsight]:
     """Not draft_versions-based -- reads outreach_items.followup_count +
     outcome directly (rl_prompt.md's "follow-up performance"/"number of
     follow-ups")."""
-    items = conn.select("outreach_items", stage="in.(sent,waiting,replied,booked)")
+    items = conn.select("outreach_items", stage="in.(sent,waiting,replied,booked,not_interested)")
     if not items:
         return None
     item_ids = [i["item_id"] for i in items]

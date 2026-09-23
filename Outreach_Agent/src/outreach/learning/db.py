@@ -94,7 +94,7 @@ def outreach_outcome_summary(conn: SupabaseConn, item_ids: list[str]) -> dict[st
     """Read-only join over the EXISTING outreach_items/conversation_messages
     tables -- the canonical source of truth for outcomes. Never writes
     either. Returns {item_id: {"stage", "replied", "positive_reply",
-    "booked"}} for each id in `item_ids` that exists."""
+    "booked", "failed"}} for each id in `item_ids` that exists."""
     if not item_ids:
         return {}
     item_rows = conn.select("outreach_items", item_id=f"in.({','.join(item_ids)})")
@@ -105,6 +105,10 @@ def outreach_outcome_summary(conn: SupabaseConn, item_ids: list[str]) -> dict[st
             "replied": False,
             "positive_reply": False,
             "booked": row.get("stage") == "booked",
+            # Terminal rejection (not_interested stage, "Failed" in the UI) --
+            # a negative outcome, kept separate from `replied` which stays
+            # true for a rejection too (a human did reply).
+            "failed": row.get("stage") == "not_interested",
         }
     msg_rows = conn.select(
         "conversation_messages", item_id=f"in.({','.join(item_ids)})", direction="eq.inbound",

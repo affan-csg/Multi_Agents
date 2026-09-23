@@ -2,9 +2,12 @@
 
 Personalizes and sends outreach to prospects qualified by the Research Agent,
 and — via the **Conversation Agent** bundled in this project — handles what
-happens after the send. Also includes the **Feedback Learning / Optimization
-Agent**, which observes draft edits, tracks performance, and learns patterns
-that feed back into future drafts.
+happens after the send. Also includes two independent, fully additive
+sibling layers that observe outcomes and feed guidance back into future
+drafts: the **Feedback Learning Agent** (learns from individual draft edits)
+and **Campaign-Level Optimization** (compares whole campaigns and strategies
+against each other). Neither modifies or routes through the other, and
+either can be removed without affecting anything else in this agent.
 
 **It never touches the Research Agent's database.** It pulls qualified
 companies over HTTP from Research's own API, caches them locally, selects the
@@ -142,7 +145,7 @@ failure reason in a tooltip) in the Qualified column, separate from both
 outreach import-prospects --run <run_id>   # pull qualified prospects from Research
 outreach campaign create --limit 25        # select top-N cached prospects into a campaign
 outreach campaign send <campaign_id>       # draft + send email for pending items
-outreach campaign pipeline <campaign_id>   # the 5-stage pipeline board, as a table
+outreach campaign pipeline <campaign_id>   # the 7-stage pipeline board, as a table
 outreach item set-stage <item_id> <stage>  # manually advance past 'sent'
 ```
 
@@ -222,9 +225,11 @@ Replied → Booked). Cards from Sent onward are drag-and-drop between columns
 
 ## Conversation Agent (Agent 3)
 
-Owns the pipeline after Sent: `sent → waiting → replied → booked`. It lives in
-[src/outreach/conversation/](src/outreach/conversation/) and runs inside this
-same backend process, against this same Supabase project.
+Owns the pipeline after Sent: `sent → waiting → replied → booked`, plus the
+terminal `not_interested` stage (shown as "Failed" in the Dashboard) reached
+from any of those three when a reply is classified as a clear rejection. It
+lives in [src/outreach/conversation/](src/outreach/conversation/) and runs
+inside this same backend process, against this same Supabase project.
 
 **It is off by default, per campaign.** Deploying it changes nothing until
 you switch it on for a specific campaign — every existing campaign keeps
@@ -387,7 +392,9 @@ code changes needed to adjust it:
   if both are set) is the scheduling link a Conversation Agent reply offers
   once the prospect is interested.
 - `stages.order` — the pipeline's stage sequence (defaults to
-  pending → sent → waiting → replied → booked).
+  needs_review → pending → sent → waiting → replied → booked → not_interested;
+  `failed`, the Outreach Agent's own send-error stage, is separate -- see
+  `owned_by_this_agent`).
 - `conversation` — the Conversation Agent's defaults for a campaign that has
   never been configured (both switches off). The live switch is per campaign
   and lives in the database, not here. `followup_after_days` (default `1`)
@@ -400,9 +407,9 @@ code changes needed to adjust it:
 pytest
 ```
 
-374 tests, no network (a fake in-memory PostgREST fixture in
+412 tests, no network (a fake in-memory PostgREST fixture in
 [tests/conftest.py](tests/conftest.py) stands in for Supabase) — 114 Outreach +
-155 Conversation + 105 Learning Agent tests:
+155 Conversation + 105 Learning + 38 Campaign-Level Optimization tests:
 
 - [test_ingest.py](tests/test_ingest.py) — importing prospects from
   Research's API response shape; that a tier-matching company with no
@@ -450,16 +457,21 @@ pytest
   items, events) when the Research Agent deletes a run, including the
   idempotent no-op case.
 
-Conversation Agent (155 of the 254), all driven through two injectable seams —
+Conversation Agent (197 of the 464), all driven through two injectable seams —
 a supplied batch of `InboundEmail` instead of IMAP, and a supplied clock —
 so the full reply path runs with no mailbox, no LLM, and no waiting:
 
 - [test_conversation_engine.py](tests/test_conversation_engine.py) — the
-  funnel `sent → waiting → replied → booked`; that autoresponders and bounces
-  never move a card; forward-only transitions; that items in
-  `pending`/`needs_review`/`failed` are never even loaded; and an end-to-end
-  regression (real classifier + real matcher, nothing mocked) for a Calendly
-  "New Event" notification moving a card straight to `booked`.
+  funnel `sent → waiting → replied → booked`, and the rejection funnel
+  `sent → waiting → not_interested` ("Failed"); that autoresponders and
+  bounces never move a card; forward-only transitions, including that
+  `not_interested` is terminal for the agent's own moves but always
+  reopenable by a person; that a Failed item never gets an automated
+  follow-up; that the original message/classification/audit trail survive a
+  move to Failed; that items in `pending`/`needs_review`/`failed` are never
+  even loaded; and an end-to-end regression (real classifier + real matcher,
+  nothing mocked) for a Calendly "New Event" notification moving a card
+  straight to `booked`.
 - [test_conversation_toggle.py](tests/test_conversation_toggle.py) — OFF is a
   complete no-op (asserted as no stage write, no stored message, no send —
   not just a zeroed counter); manual moves still work while off; toggling off
@@ -508,7 +520,7 @@ so the full reply path runs with no mailbox, no LLM, and no waiting:
   (including a same-microsecond tie on Windows), and the Calendly link
   included on each row.
 
-### Feedback Learning / Optimization Agent (105 of the 374)
+### Feedback Learning Agent (105 of the 412)
 
 Data-driven pattern detection without ML or causal claims, fed back into future drafts.
 
@@ -538,7 +550,37 @@ Data-driven pattern detection without ML or causal claims, fed back into future 
   must not create active insight; 30-edit fixture with exact 73% shorten-CTA
   pattern).
 
-## Feedback Learning / Optimization Agent
+### Campaign-Level Optimization (38 of the 412)
+
+Independent sibling layer to the Feedback Learning Agent above — compares whole
+campaigns/strategies against each other rather than diffing single edits.
+
+- [test_optimization_strategy.py](tests/test_optimization_strategy.py) —
+  rule-based strategy classification (length bucket, subject/opening/CTA
+  style, personalization level, email style) from stored subject/body text,
+  no LLM, no DB.
+- [test_optimization_engine.py](tests/test_optimization_engine.py) —
+  dimension-comparison insight computation; confidence gating shared with the
+  Learning Agent's exact thresholds; global vs. segmented (ICP tier/industry)
+  computation staying independent of each other; metric fallback
+  (booking → positive-reply → reply rate) when booked events are too sparse
+  to support a booking-rate claim.
+- [test_optimization_tracking.py](tests/test_optimization_tracking.py) —
+  recommendation-adoption outcome reporting: insufficient-data states when no
+  adoption is recorded or either side of the comparison is too small, and
+  that a real comparison always carries the `causality_note` disclaimer.
+- [test_optimization_routes.py](tests/test_optimization_routes.py) — all
+  `/optimization/*` endpoints, including that the one write endpoint
+  (`POST /optimization/adoptions`) 404s against a nonexistent campaign.
+- [test_optimization_failure_isolation.py](tests/test_optimization_failure_isolation.py) —
+  the same critical spec requirement as the Learning Agent's own isolation
+  test: optimization layer failures never block drafting, sending, or any
+  other existing behavior.
+- [test_optimization_fixtures.py](tests/test_optimization_fixtures.py) —
+  deterministic synthetic dataset exercising the segmentation and
+  confidence-gating logic end to end.
+
+## Feedback Learning Agent
 
 The Learning Agent observes everything: captures AI-original vs. human-edited
 drafts, tracks performance (reply rates, positive replies, bookings), and learns
@@ -568,17 +610,78 @@ as structured guidance. Fully additive — if it fails, the pipeline works norma
 No additional setup beyond the main Outreach schema. New Learning Agent tables are
 in [schema.sql](schema.sql); the migration [005_learning_agent.sql](migrations/005_learning_agent.sql)
 is idempotent. Once applied, the agent observes drafts automatically and exposes
-9 read-only `/learning/*` endpoints. The Dashboard's **Learning** tab (new Outreach
-section) displays overview, performance metrics, detected patterns, human-edit
-trends, campaign comparison, and clickable drill-down.
+9 read-only `/learning/*` endpoints. The Dashboard's **Learning & Optimization**
+tab (Outreach section) displays overview, performance metrics, detected patterns,
+human-edit trends, campaign comparison, and clickable drill-down.
 
 ### Using it
 
 No CLI commands — the agent works silently in the background. Access insights via:
-- Dashboard: **Outreach Agent → Learning** tab (requires at least one draft to
-  have been created/edited).
+- Dashboard: **Outreach Agent → Learning & Optimization** tab (requires at least
+  one draft to have been created/edited).
 - API: `GET /learning/overview`, `GET /learning/insights`, `GET /learning/performance/*`,
   `GET /learning/human-edits`, etc. (see [src/outreach/learning/routes.py](src/outreach/learning/routes.py)).
+
+## Campaign-Level Optimization
+
+An independent sibling layer to the Feedback Learning Agent above — same
+evidence-gated, no-causal-claims philosophy, extended from single-edit diffs up
+to whole-campaign and strategy-level comparisons. It runs inside this same
+backend process and Supabase project, reusing the Learning Agent's
+`draft_versions` for style evidence, but it does **not** modify, subclass, or
+route through anything in [src/outreach/learning/](src/outreach/learning/) —
+each layer can be removed independently without affecting the other. See
+[src/outreach/optimization/\_\_init\_\_.py](src/outreach/optimization/__init__.py)
+for the full module map and invariants.
+
+### How it works
+
+1. **Extract strategy** — every sent item's stored subject/body is classified,
+   on-demand and rule-based (no LLM), into `length_bucket`, `subject_style`,
+   `opening_style`, `cta_style`, `personalization_level`, `email_style`. This
+   covers every sent item, not just ones a human later edited — the one signal
+   source the Learning Agent's edit-diffing alone can't produce.
+2. **Compare dimensions** — splits sent items into two comparable groups per
+   dimension (e.g. direct vs. soft CTA, short vs. long) and compares reply,
+   positive-reply, booking, and no-reply rates, picking whichever metric the
+   data can actually support as the headline number.
+3. **Segment by ICP** — every dimension is compared both globally and within
+   every ICP segment (`prospects.tier`, `prospects.industry`) that
+   independently has enough evidence — a segment's pattern is never inferred
+   from the global number, or vice versa.
+4. **Gate with confidence** — reuses the Learning Agent's exact thresholds
+   (imported, not re-declared): sample size ≥20, effect size ≥1.5pp. A
+   pattern with too little evidence stays `insufficient_data`, never a
+   fabricated `low`.
+5. **Feed guidance to new drafts** — active insights are appended to campaign/
+   draft prompts as a short bullet-list blurb, independently of (never merged
+   with) the Learning Agent's own blurb.
+6. **Track adoption** — a person can explicitly mark a campaign as "built
+   following pattern X" (`POST /optimization/adoptions`); the outcome endpoint
+   then reports that campaign's observed rates next to all other campaigns',
+   always labeled an observed association, never a proven cause.
+
+### Setup
+
+No additional setup beyond the main Outreach schema. New tables are in
+[schema.sql](schema.sql); the migration
+[006_campaign_optimization.sql](migrations/006_campaign_optimization.sql) is
+idempotent and purely additive — both new tables only reference `campaigns`,
+never the reverse, so they can be dropped cleanly if this layer is ever
+removed. Once applied, the layer observes automatically and exposes read-only
+`/optimization/*` endpoints (plus the one opt-in adoption-recording write).
+The Dashboard's Learning & Optimization tab's **Strategy Insights** and
+**Adoption Tracking** sections display it.
+
+### Using it
+
+No CLI commands. Access via:
+- Dashboard: **Outreach Agent → Learning & Optimization → Strategy Insights /
+  Adoption Tracking**.
+- API: `GET /optimization/overview`, `/insights`, `/insights/{pattern_key}`,
+  `/recommendations`, `/adoptions`, `/adoptions/{pattern_key}/outcome`, and
+  `POST /optimization/adoptions` (see
+  [src/outreach/optimization/routes.py](src/outreach/optimization/routes.py)).
 
 ## Known limitations
 
@@ -605,8 +708,22 @@ No CLI commands — the agent works silently in the background. Access insights 
   and the Research Agent's automatic hand-off) each only call it once per
   run in practice, so this has not been a live problem, but nothing in this
   codebase actually prevents a duplicate.
-- **Learning insight recomputation is synchronous per-request.** Acceptable
-  at current volumes but could move to frontend caching or event-driven if
-  `draft_versions` tables grow very large. Confidence thresholds and the
-  minimum-evidence gate are tunable constants in [src/outreach/learning/engine.py](src/outreach/learning/engine.py),
-  not yet exposed as config.
+- **Learning and Optimization insight recomputation are synchronous
+  per-request.** Acceptable at current volumes but could move to frontend
+  caching or event-driven if `draft_versions`/`outreach_items` grow very
+  large. Confidence thresholds and the minimum-evidence gate are tunable
+  constants in [src/outreach/learning/engine.py](src/outreach/learning/engine.py)
+  (Optimization imports the same ones — see
+  [src/outreach/optimization/engine.py](src/outreach/optimization/engine.py) —
+  rather than declaring a separate, looser bar), not yet exposed as config.
+- **Optimization segmentation is fixed to two ICP dimensions.** Only
+  `prospects.tier` and `prospects.industry` are enumerable segments today
+  ([src/outreach/optimization/engine.py](src/outreach/optimization/engine.py)'s
+  `SEGMENT_DIMENSIONS`) — adding a new segment axis means adding it there
+  explicitly, not something the data auto-discovers.
+- **Adoption-outcome comparisons are not controlled experiments.** Campaigns
+  are chosen by whoever creates them, not randomly assigned to a strategy, so
+  every reported before/after or adopting-vs-other comparison is an observed
+  association only — other differences between campaigns (timing, ICP mix,
+  sender, follow-up cadence) are not accounted for. Every such response
+  includes an explicit `causality_note` saying so.

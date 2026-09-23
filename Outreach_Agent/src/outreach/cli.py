@@ -9,8 +9,8 @@ been sent -- no API calls.
 The Outreach Agent's own job stops at Sent. Everything after that belongs to
 the Conversation Agent (`conversation` commands below, see
 src/outreach/conversation/), which is off by default per campaign -- until it
-is switched on, waiting/replied/booked are set by hand via `item set-stage`
-or the Dashboard board, exactly as before.
+is switched on, waiting/replied/booked/not_interested are set by hand via
+`item set-stage` or the Dashboard board, exactly as before.
 """
 
 from __future__ import annotations
@@ -184,14 +184,14 @@ def campaign_pipeline(campaign_id: str = typer.Argument(...)) -> None:
 @item_app.command("set-stage")
 def item_set_stage(
     item_id: str = typer.Argument(...),
-    stage: str = typer.Argument(..., help="waiting|replied|booked (pending/sent/failed are agent-owned)"),
+    stage: str = typer.Argument(..., help="waiting|replied|booked|not_interested (pending/sent/failed are agent-owned)"),
 ) -> None:
-    """Manually advance an item past 'sent', as a person.
+    """Manually advance (or re-open) an item past 'sent', as a person.
 
     Always available, whether or not the Conversation Agent is switched on
     for the campaign -- a person's move always overrides the agent's."""
-    if stage not in ("waiting", "replied", "booked"):
-        console.print("[red]only waiting/replied/booked can be set manually here[/red]")
+    if stage not in ("waiting", "replied", "booked", "not_interested"):
+        console.print("[red]only waiting/replied/booked/not_interested can be set manually here[/red]")
         raise typer.Exit(1)
     conn = db.connect()
     try:

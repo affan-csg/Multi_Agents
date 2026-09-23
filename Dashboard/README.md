@@ -1,4 +1,4 @@
-# CSG Unified Dashboard
+# CSG Multi Agents
 
 A single dashboard across every CSG agent (Research, Outreach, and future
 agents like Marketing/Follow-up). It has **no database and no backend of its
@@ -77,23 +77,30 @@ of the two backends above isn't running yet — start it and refresh.
   standalone frontend by design): Prospects (import from Research),
   Campaigns (select top-N, create — or create a fixed **Test Campaign** for
   QA, see below), Campaign Detail (Kanban pipeline board: Needs Review →
-  Pending → Sent → Waiting → Replied → Booked; cards from Sent onward are
-  drag-and-drop between columns, in addition to the item drawer's stage
-  buttons — both paths call the same API; the drawer's Conversation section
-  shows the reply thread, a pending draft to approve/redraft/edit, and the
-  original outreach message collapsed below it), Bookings (every prospect
+  Pending → Sent → Waiting → Replied → Booked → Failed; cards from Sent
+  onward are drag-and-drop between columns, in addition to the item drawer's
+  stage buttons — both paths call the same API; the drawer's Conversation
+  section shows the reply thread, a pending draft to approve/redraft/edit,
+  and the original outreach message collapsed below it; Failed is reached
+  automatically when a reply is classified as a clear rejection, and is the
+  only column besides Booked a card doesn't leave on its own), Bookings (every prospect
   currently `booked`, pooled across every campaign, from `GET /bookings` —
   row click opens the account's Calendly page when one is configured, the
-  campaign otherwise), and Learning (new tab — observes draft edits, tracks
-  performance, displays learned patterns, before/after comparisons, human-edit
-  trends, and drill-down into the data backing each insight).
+  campaign otherwise), and Learning & Optimization (observes draft edits,
+  tracks performance, displays learned patterns, before/after comparisons,
+  human-edit trends, campaign comparison, drill-down into the data backing
+  each insight, plus the Campaign-Level Optimization layer's own Strategy
+  Insights and Adoption Tracking sections — six tabs total on one page,
+  `src/pages/outreach/Learning.tsx`).
 - `src/components/` — shared UI (`ui.tsx` design system, Nav, drawers,
   modals) — one visual system for every agent's pages.
-- `src/agents/learning.ts` — typed HTTP client for the new `/learning/*`
-  endpoints on the Outreach Agent.
+- `src/agents/learning.ts` / `src/agents/optimization.ts` — typed HTTP
+  clients for the Outreach Agent's `/learning/*` and `/optimization/*`
+  endpoints, respectively — two independent backend layers, one dashboard
+  page.
 - `App.css`/`index.css` — the shared design system's styles,
   plus a `.kanban-*` block for the Outreach pipeline board and a `.tabs`
-  block for the Learning page's internal section navigation.
+  block for the Learning & Optimization page's internal section navigation.
 - `src/hooks/useCachedFetch.ts` — stale-while-revalidate data layer every
   page's `useCachedFetch(key, fetcher)` call goes through: cached data
   renders instantly on remount while a background refetch runs, so revisiting

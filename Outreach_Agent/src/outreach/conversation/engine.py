@@ -62,10 +62,17 @@ _LOCK_STALE_AFTER = timedelta(minutes=10)
 
 # Where a reply lands, by intent. out_of_office and bounce are absent on
 # purpose: mail arrived, but no human replied, so the card must not move.
+#
+# not_interested routes to its own terminal stage (labeled "Failed" in the
+# UI), not to replied: a clear rejection is a different outcome from a reply
+# that is still open, and conflating the two would hide rejections inside
+# the Replied column's counts everywhere they're used (analytics, learning,
+# optimization). responder._REPLYABLE already excludes not_interested, so no
+# automated reply is ever sent once a card lands here.
 _INTENT_STAGE: dict[str, Stage] = {
     "interested": "replied",
     "unclear": "replied",
-    "not_interested": "replied",
+    "not_interested": "not_interested",
     "booked": "booked",
 }
 

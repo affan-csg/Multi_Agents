@@ -6,13 +6,21 @@ import { agentBaseUrl } from "./registry";
 
 const BASE = agentBaseUrl("outreach");
 
-export type Stage = "needs_review" | "pending" | "sent" | "waiting" | "replied" | "booked" | "failed";
+export type Stage =
+  | "needs_review" | "pending" | "sent" | "waiting" | "replied" | "booked" | "not_interested" | "failed";
 
 // needs_review sits before pending: an item lands there instead of pending
 // when it was drafted from the generic template_only fallback (no
 // meaningful research to personalize from) -- see Outreach_Agent's
 // ingest.create_campaign_from_prospects and api.approve_item.
-export const STAGE_ORDER: Stage[] = ["needs_review", "pending", "sent", "waiting", "replied", "booked"];
+//
+// 'not_interested' (labeled "Failed" in this UI) is the Conversation Agent's
+// terminal rejection outcome, placed after 'booked'. It is a DIFFERENT
+// concept from 'failed' below, which is the Outreach Agent's send-error
+// stage (SMTP/delivery failure) -- see models.py's Stage comment on the
+// backend for the full rationale. 'failed' (send errors) is intentionally
+// left out of this UI-facing order -- see AGENT_OWNED_STAGES below.
+export const STAGE_ORDER: Stage[] = ["needs_review", "pending", "sent", "waiting", "replied", "booked", "not_interested"];
 
 // Stages the Outreach Agent sets on its own (pending -> sent, or -> failed on
 // a send error; needs_review -> pending happens on a successful re-draft too).
@@ -21,8 +29,14 @@ export const AGENT_OWNED_STAGES: Stage[] = ["needs_review", "pending", "sent", "
 // Stages after Sent. Owned by the Conversation Agent when it is switched on
 // for the campaign, and by a person otherwise -- drag-and-drop stays enabled
 // either way, and a person's move always overrides the agent's.
-export const MANUAL_STAGES: Array<"waiting" | "replied" | "booked"> = ["waiting", "replied", "booked"];
-export const CONVERSATION_STAGES: Stage[] = ["sent", "waiting", "replied", "booked"];
+//
+// not_interested is included here (unlike the Outreach Agent's own 'failed')
+// so a person can manually mark a rejection, or re-open a misclassified one
+// back to Waiting/Replied/Booked -- see api.set_item_stage, which is not
+// bound by CONVERSATION_TRANSITIONS and always allows a manual override.
+export const MANUAL_STAGES: Array<"waiting" | "replied" | "booked" | "not_interested"> =
+  ["waiting", "replied", "booked", "not_interested"];
+export const CONVERSATION_STAGES: Stage[] = ["sent", "waiting", "replied", "booked", "not_interested"];
 
 /** A Tier A/B company left out of an import or campaign because Hunter found
  *  no contact for it -- see Outreach_Agent's ingest.create_campaign_from_prospects
@@ -118,8 +132,16 @@ export interface OutreachAnalytics {
   sent_total: number;
   reply_rate: number;
   booking_rate: number;
+  /** Share of sent items that ended in a clear rejection (the terminal
+   *  not_interested stage, "Failed" in this UI). A negative campaign-outcome
+   *  metric alongside booking_rate -- reply_rate still counts a rejection as
+   *  "replied", same convention the Learning/Optimization agents use. */
+  failure_rate: number;
   stage_funnel: Array<{ stage: Stage; count: number }>;
+  /** Outreach Agent send-error count (SMTP/delivery failure) -- distinct
+   *  from not_interested_count below; see the Stage comment in outreach.ts. */
   failed_count: number;
+  not_interested_count: number;
   needs_review_count: number;
   tiers: Array<{ tier: string; count: number }>;
   industries: Array<{ industry: string; count: number }>;
@@ -385,7 +407,7 @@ export const outreachApi = {
   deleteItem: (itemId: string) =>
     req<{ status: string }>(`/items/${itemId}`, { method: "DELETE" }),
 
-  setItemStage: (itemId: string, stage: "waiting" | "replied" | "booked") =>
+  setItemStage: (itemId: string, stage: "waiting" | "replied" | "booked" | "not_interested") =>
     req<{ status: string }>(`/items/${itemId}/stage`, {
       method: "POST",
       body: JSON.stringify({ stage }),

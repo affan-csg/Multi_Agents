@@ -269,13 +269,16 @@ def revise_draft(message_id: str, req: ReviseDraftRequest) -> dict[str, Any]:
             learning_ctx = get_learning_context_summary(conn)
         except Exception:
             pass  # learning unavailable -- draft proceeds unmodified, see rl_prompt.md section 12
+        from ..optimization.context import fetch_optimization_context_safely
+        optimization_ctx = fetch_optimization_context_safely(conn)
+        combined_ctx = "\n\n".join(c for c in (learning_ctx, optimization_ctx) if c) or None
         before_subject, before_body = message.subject, message.body
         try:
             subject, body = responder.revise_reply(
                 cfg, item, prospect,
                 latest_reply=latest_inbound,
                 current_subject=message.subject, current_body=message.body,
-                instruction=req.instruction, learning_context=learning_ctx,
+                instruction=req.instruction, learning_context=combined_ctx,
             )
         except RuntimeError as exc:
             raise HTTPException(502, str(exc))
@@ -329,10 +332,13 @@ def redraft_draft(message_id: str) -> dict[str, Any]:
             learning_ctx = get_learning_context_summary(conn)
         except Exception:
             pass  # learning unavailable -- draft proceeds unmodified, see rl_prompt.md section 12
+        from ..optimization.context import fetch_optimization_context_safely
+        optimization_ctx = fetch_optimization_context_safely(conn)
+        combined_ctx = "\n\n".join(c for c in (learning_ctx, optimization_ctx) if c) or None
         before_subject, before_body = message.subject, message.body
         composed = responder.compose_reply(
             cfg, item, prospect, thread, latest_inbound, latest_inbound.intent or "unclear",
-            learning_context=learning_ctx,
+            learning_context=combined_ctx,
         )
         if composed is None:
             raise HTTPException(

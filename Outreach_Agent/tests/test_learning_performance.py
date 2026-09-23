@@ -81,6 +81,35 @@ def test_before_after_no_reply_rate_metric(conn):
     assert result["after"]["value"] == 100.0
 
 
+def _mark_not_interested(conn, item_id):
+    """A clear rejection: moves the item to the terminal not_interested
+    stage AND records the rejection intent -- unlike _mark_replied's
+    positive=False case, which only sets intent and leaves stage untouched
+    (not a real rejection outcome as far as outcome_summary's `failed` flag
+    is concerned)."""
+    for row in conn.tables["outreach_items"]:
+        if row["item_id"] == item_id:
+            row["stage"] = "not_interested"
+    conn.tables.setdefault("conversation_messages", []).append({
+        "message_id": f"m-{item_id}", "item_id": item_id, "direction": "inbound",
+        "intent": "not_interested", "created_at": "2026-01-03T00:00:00",
+    })
+
+
+def test_before_after_failure_rate_metric(conn):
+    _seed_campaign(conn)
+    for i in range(60):
+        _seed_item(conn, f"item-{i}", "camp1", f"2026-{(i // 28) + 1:02d}-{(i % 28) + 1:02d}T00:00:00")
+    # Before group (first 30): 3 rejections (10%). After group (last 30): none.
+    for i in range(3):
+        _mark_not_interested(conn, f"item-{i}")
+
+    result = performance.before_after_comparison(conn, metric="failure_rate", window=30)
+    assert result["insufficient_data"] is False
+    assert result["before"]["value"] == 10.0
+    assert result["after"]["value"] == 0.0
+
+
 # --- campaign_comparison --------------------------------------------------------
 
 def test_campaign_comparison_computes_per_campaign_rates(conn):
@@ -115,6 +144,21 @@ def test_campaign_comparison_skips_campaigns_with_no_sent_items(conn):
     _seed_campaign(conn, "camp1")
     results = performance.campaign_comparison(conn)
     assert results == []
+
+
+def test_campaign_comparison_includes_failure_rate(conn):
+    _seed_campaign(conn, "camp1", "Campaign One")
+    for i in range(10):
+        _seed_item(conn, f"c1-{i}", "camp1", "2026-01-01T00:00:00")
+    for i in range(4):
+        _mark_not_interested(conn, f"c1-{i}")
+
+    results = performance.campaign_comparison(conn)
+    by_id = {r["campaign_id"]: r for r in results}
+    assert by_id["camp1"]["failure_rate"] == 40.0
+    # A rejection still counts as a reply -- reply_rate and failure_rate
+    # are not mutually exclusive views of the same items.
+    assert by_id["camp1"]["reply_rate"] == 40.0
 
 
 # --- followup_performance -------------------------------------------------------

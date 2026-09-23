@@ -41,7 +41,13 @@ send`/the Send button) still has to trigger step 4.
                                             v
  [4] SEND (email, pending only, ALWAYS a manual trigger) ──> sent | failed
                                             |
-                          [manual, or future agent] waiting -> replied -> booked
+                    [Conversation Agent, when enabled -- else manual]
+                                            v
+                          waiting -> replied -> booked
+                                            |
+                              [clear rejection reply]
+                                            v
+                                    not_interested ("Failed" in the UI)
 ```
 
 Everything this agent decides on its own lives in
@@ -88,8 +94,11 @@ A Research run happens → Import + campaign (by hand, or automatic) → review 
 4. **Send** — **always a manual trigger**, regardless of how the campaign was
    created. `campaign send` emails every `pending` item, rate-limited,
    skipping anything already sent so a retried run is safe.
-5. **Track** — `waiting → replied → booked` are set by a person (or, later,
-   a reply-tracking agent); this agent never sets them itself.
+5. **Track** — `waiting → replied → booked`, and the terminal `not_interested`
+   stage ("Failed" in the Dashboard) reached from a clear rejection reply, are
+   set by the Conversation Agent when it's switched on for a campaign (see
+   [6. Conversation Agent](#6-conversation-agent--conversation) below), or by
+   a person otherwise; this agent (steps 1–4) never sets them itself.
 
 The sections below go through each stage in full detail.
 
@@ -339,11 +348,17 @@ same call — callers are told to never `PATCH outreach_items.stage` directly,
 so every transition is guaranteed an audit trail. `mark_sent`/`mark_failed`
 both call through it.
 
-`waiting`, `replied`, `booked` are the only stages this agent never sets
-itself (`POST /items/{id}/stage` enforces that — 400 on anything else). They
-exist so the pipeline board has somewhere to show a reply or a booked
-meeting, set by a person today and potentially by a future reply-tracking
-agent later.
+`waiting`, `replied`, `booked`, `not_interested` are the only stages the core
+pipeline (this section) never sets itself (`POST /items/{id}/stage` enforces
+that — 400 on anything else). They exist so the pipeline board has somewhere
+to show a reply, a booked meeting, or a clear rejection ("Failed" in the
+Dashboard) — set by the Conversation Agent
+([section 6](#6-conversation-agent--conversation)) when it's enabled for a
+campaign, or by a person through this same endpoint otherwise. Unlike the
+other three, `not_interested` is terminal for the Conversation Agent's own
+automated moves (see `CONVERSATION_TRANSITIONS`); a person can still re-open
+it through this same endpoint, since the manual path is not bound by that
+whitelist.
 
 In the Dashboard, a person can trigger this same endpoint two ways — the item
 drawer's stage buttons, or dragging a card between kanban columns (Sent
@@ -362,9 +377,11 @@ a real, UI-visible gap, not an oversight to route around: treat
 ## Analytics — `_aggregate_analytics()` in [api.py](src/outreach/api.py)
 
 `GET /analytics?campaign_id=all|<id>` computes the stage funnel across all
-seven stages, reply/booking rates (a `booked` item counts as both a reply and
-a booking — booking implies a reply happened), tier/industry/personalization-source
-breakdowns, and sends-over-time. Deliberately mirrors the Research Agent's own
+eight stages, reply/booking/failure rates (`booked` and `not_interested` both
+count as a reply — booking or rejection both imply a reply happened; only
+`booked` counts toward `booking_rate`, only `not_interested` toward
+`failure_rate`), tier/industry/personalization-source breakdowns, and
+sends-over-time. Deliberately mirrors the Research Agent's own
 `_aggregate_analytics` shape so the two agents' analytics pages read as the
 same product in the Dashboard.
 
@@ -446,12 +463,60 @@ service-role key from a trusted backend, same posture as the Research Agent.
   `sender_name`, and a full multi-line `sender_signature` block (not just a
   name).
 - `stages` — a human-readable `order` list and an `owned_by_this_agent` /
-  `manual_or_future_agent` split, mirroring (but shorter than) the
+  `owned_by_conversation_agent` split, mirroring (but shorter than) the
   authoritative `Stage`/`STAGE_ORDER` in [models.py](src/outreach/models.py),
   which is the one that actually governs behavior — treat the YAML list as
   documentation, not a second source of truth to keep byte-for-byte in sync.
+- `conversation` — the Conversation Agent's defaults for a campaign that has
+  never been configured (`enabled`/`auto_reply` both off, `followup_after_days`).
+  The live per-campaign switch lives in the database, not here — see
+  [section 6](#6-conversation-agent--conversation).
 
-## 6. Learning — [learning/](src/outreach/learning/)
+## 6. Conversation Agent — [conversation/](src/outreach/conversation/)
+
+Owns everything after Sent: `sent → waiting → replied → booked`. It runs
+inside this same backend process and Supabase project, mounted onto this
+agent's FastAPI app by one `include_router` line in
+[api.py](src/outreach/api.py) — removing that line removes the Conversation
+Agent from the API entirely and leaves steps 1–5 above exactly as they were.
+
+**Off by default, per campaign** — two independent switches (`enabled` and
+`auto_reply`), not one, because "watch the inbox and keep the board current"
+and "reply to prospects unattended" are different levels of trust:
+
+| Switch | Off (default) | On |
+|---|---|---|
+| `enabled` | No inbox reads, no card moves, no sends. | Detects replies, classifies them, moves cards, drafts replies, handles follow-ups. |
+| `auto_reply` | Drafts every outgoing reply and waits for approval. | Sends them itself. |
+
+**A tick** (`outreach conversation tick <campaign_id>`, or the Dashboard's
+"Check replies" button) does, in order: (1) refuses unless `enabled`; (2)
+loads only conversation-stage items — `pending`/`needs_review` items are
+never even queried; (3) fetches recent mail and matches it to an item via
+four strategies (threading headers → threading headers against a prior
+outbound message → sender address → `Reply-To`, the last one specifically
+for scheduling-tool notifications like Calendly, where the actual invitee's
+address is in `Reply-To`, not `From`/`To`); (4) classifies each new message —
+a scheduling tool's own confirmation is recognized deterministically as
+`booked` before any LLM call runs; (5) moves items silent 24h to `waiting`
+and nudges `waiting` items within the follow-up cap.
+
+**Safety properties**: idempotent (`UNIQUE(item_id, provider_message_id)`,
+IMAP `\Seen` flags are not trusted); forward-only transitions
+(`models.CONVERSATION_TRANSITIONS` whitelist); `enabled` re-read immediately
+before every send, not once per tick; an advisory lock
+(`conversation_locked_at`, reclaimable after 10 minutes) prevents two
+overlapping ticks from double-processing; autoresponders/bounces are
+detected deterministically and never move a card or count as engagement;
+every reply/follow-up carries real `In-Reply-To`/`References` headers so it
+threads in the prospect's mail client.
+
+Reply checking is manual today (button or CLI tick) — there is no background
+poller yet, by design, until the flow has been exercised against real mail.
+See [README.md's Conversation Agent section](README.md#conversation-agent-agent-3)
+for full setup (IMAP credentials, schema) and CLI reference.
+
+## 7. Learning — [learning/](src/outreach/learning/)
 
 The Learning Agent is fully orthogonal to the above: it observes **every** draft
 creation, revision, and redraft; tracks the outcomes from existing `outreach_items`
@@ -498,11 +563,85 @@ human-edits, performance metrics (before/after, campaign comparison, follow-up
 buckets), and recommendations. All wrap database access and pass no errors to the
 caller — missing data renders as empty/insufficient-data states rather than 500s.
 
-**Dashboard:** The new **Learning** tab (under Outreach Agent) shows all of the
-above: overview card counts, before/after performance windows with explicit "Not
-enough data yet" messaging (never fabricated metrics), detected patterns,
-confidence tiers, human-edit trends, and clickable drill-down into the data
-backing each insight. Timestamps and sample counts make every row traceable.
+**Dashboard:** The **Learning & Optimization** tab (under Outreach Agent) shows
+all of the above: overview card counts, before/after performance windows with
+explicit "Not enough data yet" messaging (never fabricated metrics), detected
+patterns, confidence tiers, human-edit trends, and clickable drill-down into
+the data backing each insight. Timestamps and sample counts make every row
+traceable.
+
+## 8. Campaign-Level Optimization — [optimization/](src/outreach/optimization/)
+
+A second, independent additive layer, sibling to Learning rather than built
+on top of it — it does not modify, subclass, or route through anything in
+`learning/`. Where the Learning Agent diffs a human's edit against the prior
+draft version, Optimization compares whole *campaigns and strategies*
+against each other: ICP/company type, email style, subject/opening style, CTA
+style, length, personalization level, and follow-up count/timing, each
+against reply rate, positive-reply rate, booking rate, and no-reply rate.
+Read-only against everything but its own two tables (plus one opt-in write —
+recording an adoption); every call site wraps it in `try/except` so a failure
+here can never block drafting, sending, or any Research/Outreach/Conversation/
+Learning behavior.
+
+**Strategy extraction** ([strategy.py](src/outreach/optimization/strategy.py)):
+pure, rule-based classification of a sent item's stored subject/body into
+`length_bucket`, `subject_style`, `opening_style`, `cta_style`,
+`personalization_level`, `email_style` — no LLM calls, recomputed on-demand
+from the current `outreach_items` snapshot, never stored as its own row, so it
+can never drift out of sync with an edited draft. This is the one genuinely
+new signal source this layer needs: the Learning Agent only ever diffs a
+human edit against its prior version, so it has nothing to say about a
+campaign that was never edited at all — strategy extraction lets every sent
+item be classified and compared, edited or not.
+
+**Insight computation** ([engine.py](src/outreach/optimization/engine.py)):
+for each dimension, splits sent items into two comparable groups (e.g. direct
+vs. soft CTA) and compares their outcome rates, picking whichever of
+booking/positive-reply/reply rate the data can actually support as the
+primary metric. Reuses the Learning Agent's exact confidence thresholds
+(imported, not re-declared) — "how much evidence is enough" means the same
+thing everywhere in this codebase. Every dimension is computed both globally
+and within every ICP segment (`prospects.tier`, `prospects.industry`) that
+independently has enough data — a segment is only ever reported "active" on
+its own evidence, so a real per-segment effect can't be flattened into a
+misleading global number, and vice versa.
+
+**Guidance** ([context.py](src/outreach/optimization/context.py)):
+`fetch_optimization_context_safely()` builds a short bullet-list blurb from
+active insights and is appended alongside (never merged with) the Learning
+Agent's own blurb in `revise_item`/`redraft_item`/`redraft_generic_items`
+(see [api.py](src/outreach/api.py)) — two separate, independently-optional
+guidance sections in the same prompt.
+
+**Adoption tracking** ([tracking.py](src/outreach/optimization/tracking.py)):
+`POST /optimization/adoptions` is a purely human-initiated marker — "this
+campaign was built following pattern X" — never inferred or auto-tagged.
+`GET /optimization/adoptions/{pattern_key}/outcome` then reports the
+adopting campaign(s)' observed outcome rates side by side with all other
+campaigns' rates over the same data, always with an explicit
+`causality_note`: this is an observed association, not a controlled
+experiment, since campaigns are chosen by whoever creates them, not assigned
+by this layer.
+
+**Every insight is worded as a correlation, never a cause** ("associated
+with", "observed" — never "causes" or "improves"), and a pattern with too
+little evidence stays `insufficient_data` rather than being labeled with a
+confidence tier its sample size doesn't support.
+
+**API:** `GET /optimization/overview`, `/insights`, `/insights/{pattern_key}`,
+`/recommendations`, `/adoptions`, `/adoptions/{pattern_key}/outcome`, plus
+`POST /optimization/adoptions` — see
+[routes.py](src/outreach/optimization/routes.py).
+
+**Dashboard:** the Learning & Optimization tab's **Strategy Insights** and
+**Adoption Tracking** sections.
+
+**Setup:** no additional setup beyond the main schema. New tables are in
+[schema.sql](schema.sql); the migration
+[006_campaign_optimization.sql](migrations/006_campaign_optimization.sql) is
+idempotent and purely additive (both new tables only FK *out* to `campaigns`,
+so dropping them is always a clean, isolated removal).
 
 ## Known limitations
 
@@ -510,10 +649,16 @@ backing each insight. Timestamps and sample counts make every row traceable.
 - **One channel.** Only email is implemented; `channels.send()` is written to
   dispatch by name so a second channel is a new module + dispatch entry, not
   a rearchitecture.
-- **No reply tracking.** `waiting`/`replied`/`booked` are set by hand; there
-  is no inbox-watching agent yet, by design (see `cli.py`'s own docstring:
-  "this agent's job stops at Sent").
-- **Learning recomputation is synchronous.** Acceptable at current volumes but
-  could move to frontend caching or event-driven if `draft_versions` grows large.
-  Confidence thresholds are tunable constants in `learning/engine.py`, not
-  exposed as config.
+- **Reply checking is manual.** The Conversation Agent runs on a button click
+  or a CLI tick — there is no background poller yet, by design, until the
+  flow has been exercised against real mail.
+- **Learning and Optimization recomputation are synchronous per-request.**
+  Acceptable at current volumes but could move to frontend caching or
+  event-driven if `draft_versions`/`outreach_items` grow very large.
+  Confidence thresholds are tunable constants in `learning/engine.py`
+  (Optimization imports the same ones, not a separate set), not yet exposed
+  as config.
+- **Optimization segmentation is fixed to two ICP dimensions.** Only
+  `prospects.tier` and `prospects.industry` are enumerable segments today
+  (`engine.py`'s `SEGMENT_DIMENSIONS`) — adding a new segment axis means
+  adding it there explicitly, not something the data auto-discovers.

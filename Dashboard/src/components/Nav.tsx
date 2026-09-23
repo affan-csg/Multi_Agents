@@ -44,7 +44,7 @@ function useSections(): NavSection[] {
         { route: { name: "outreach-campaigns" }, label: "Campaigns", icon: "send" },
         { route: { name: "outreach-bookings" }, label: "Bookings", icon: "calendar" },
         { route: { name: "outreach-analytics" }, label: "Analytics", icon: "analytics" },
-        { route: { name: "outreach-learning" }, label: "Learning", icon: "brain" },
+        { route: { name: "outreach-learning" }, label: "Learning & Optimization", icon: "brain" },
       ],
     },
   ];
@@ -92,7 +92,7 @@ export function Nav({ currentRoute, onNavigate, collapsed, onToggle, apiStatus }
         <span className="nav-logo">
           <Icon name="database" size={19} />
         </span>
-        <span className="nav-brand-name">CSG Unified Dashboard</span>
+        <span className="nav-brand-name">CSG Multi Agents</span>
       </div>
 
       <div className="nav-scroll">

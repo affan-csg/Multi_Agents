@@ -84,9 +84,9 @@ personalization:
 # authoritative order is Stage/STAGE_ORDER in src/outreach/models.py, and the
 # ownership split is OUTREACH_STAGES/CONVERSATION_STAGES there.
 stages:
-  order: [needs_review, pending, sent, waiting, replied, booked]
+  order: [needs_review, pending, sent, waiting, replied, booked, not_interested]
   owned_by_this_agent: [needs_review, pending, sent, failed]
-  owned_by_conversation_agent: [waiting, replied, booked]
+  owned_by_conversation_agent: [waiting, replied, booked, not_interested]
 
 # --- Conversation Agent (Agent 3) -------------------------------------------
 # Defaults for a campaign that has never been configured. The real switch is

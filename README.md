@@ -7,7 +7,7 @@ pipeline, plus one shared dashboard to operate them:
 |---|---|---|
 | [Research_Agent](Research_Agent/README.md) | Discovers US companies, scores/tiers them as staffing prospects, finds contacts, and (optionally) runs an LLM qualification pass (`csg qualify`). | `:8000` |
 | [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent** (replies/follow-ups after send) and the **Feedback Learning / Optimization Agent** (learns from performance, edits, outcomes; feeds insights back into drafts). | `:8001` |
-| [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser. No database or backend of its own. Includes a dedicated Learning tab under Outreach Agent. | `:5173` |
+| [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser. No database or backend of its own. Includes a dedicated Learning & Optimization tab under Outreach Agent. | `:5173` |
 
 ```
                     ┌─────────────────┐        HTTP only        ┌──────────────────────────┐
@@ -20,6 +20,32 @@ pipeline, plus one shared dashboard to operate them:
                               └───────────────  Dashboard  ───────────────┘
                                   (browser-only, no DB, no backend)
 ```
+
+Inside the Outreach Agent process, two more sibling layers sit alongside the
+Conversation Agent — both read-only against outcomes, never in the request
+path of import/draft/send itself:
+
+```
++-------------------------------------------------------------+
+|   Outreach Agent :8001                                      |
+|                                                             |
+|   outreach_items / conversation_messages  (read by both)    |
+|               |                          |                  |
+|               v                          v                  |
+|       Learning Agent            Campaign-Level Optimization |
+|   (per-edit diffs, human       (whole-campaign/strategy     |
+|    vs. AI-original drafts)      comparisons, ICP segments)  |
+|               |                          |                  |
+|               +------------+-------------+                  |
+|                            v                                |
+|         structured guidance appended to the next            |
+|         personalize.draft_message() / revise_message() call |
++-------------------------------------------------------------+
+```
+
+Both layers are fully additive — if either fails, drafting/sending/
+Conversation Agent behavior is unaffected, and either can be deleted without
+touching the other or the core pipeline.
 
 **Research and Outreach own separate Supabase projects.** They never share a
 database, a table, or a direct DB connection — the only link between them is
@@ -34,7 +60,9 @@ so there is nothing to copy across a boundary, and a second database would
 mean two sources of truth for one card's stage. The two agents are isolated
 from each other by **stage ownership** instead — Outreach writes
 `needs_review/pending → sent/failed`, Conversation writes
-`sent → waiting → replied → booked`, and neither queries the other's stages.
+`sent → waiting → replied → booked → not_interested` (the last one shown as
+"Failed" in the Dashboard, reached automatically from a clear rejection
+reply), and neither queries the other's stages.
 It remains a self-contained package
 ([src/outreach/conversation/](Outreach_Agent/src/outreach/conversation/)) that
 can be switched off per campaign or removed entirely without touching the
@@ -116,19 +144,27 @@ project — see each one's own README:
    (checked on every tick, not a background timer). Every reply draft steers
    toward a booked call via a Calendly link, and a real booking (detected
    from the scheduling tool's own confirmation email, not just prospect
-   prose) moves the card straight to **Booked**. It is **off by default per
-   campaign**, and even when on it only *drafts* outgoing email unless
-   `auto_reply` is also enabled. With it off, those stages are moved by hand
-   exactly as before. See
+   prose) moves the card straight to **Booked**. A reply that clearly
+   declines ("not interested", "no thanks", "remove me", etc.) moves the card
+   to the terminal **Failed** stage instead — no automatic follow-up is ever
+   sent once a card lands there. It is **off by default per campaign**, and
+   even when on it only *drafts* outgoing email unless `auto_reply` is also
+   enabled. With it off, those stages are moved by hand exactly as before.
+   See
    [Outreach_Agent/README.md](Outreach_Agent/README.md#conversation-agent-agent-3).
-7. **Learn** (Feedback Learning / Optimization Agent) — observes everything:
-   snapshots AI-original vs. human-final drafts, tracks performance metrics
-   (reply/positive-reply/booking rates), and computes confidence-scored
-   patterns from the observed data (never causal inference). Active insights
-   are fed back into future draft generation as structured guidance. Fully
-   additive — if it fails, the pipeline keeps working. See the Dashboard's
-   new **Learning** tab for overview, performance comparisons, detected
-   patterns, human-edit trends, and drill-down into the data behind each
+7. **Learn** (Feedback Learning Agent + Campaign-Level Optimization) —
+   two independent, fully additive sibling layers that observe everything and
+   feed guidance back into future drafts, neither causal, neither able to
+   block the pipeline if it fails. The Learning Agent snapshots AI-original
+   vs. human-final drafts and computes confidence-scored patterns from
+   single-edit diffs; Optimization extends the same evidence-gating
+   philosophy to whole-campaign/strategy comparisons (ICP segment, email/
+   subject/CTA style, length, personalization, follow-up count) and lets a
+   person explicitly mark a campaign as having adopted a recommendation, then
+   reports its observed before/after performance. See the Dashboard's
+   **Learning & Optimization** tab for overview, performance comparisons,
+   detected patterns, human-edit trends, campaign comparison, strategy
+   insights, adoption tracking, and drill-down into the data behind each
    insight.
 8. **Bookings** (Dashboard) — every prospect currently in `booked`, across
    every campaign, in one list — see the Dashboard's Bookings page.
@@ -141,7 +177,7 @@ so no live database or API keys are needed to run them:
 
 ```
 cd Research_Agent && pytest    # 295 passed
-cd Outreach_Agent  && pytest   # 374 passed (114 outreach + 155 conversation + 105 learning)
+cd Outreach_Agent  && pytest   # 412 passed (114 outreach + 155 conversation + 105 learning + 38 optimization)
 ```
 
 The Dashboard has no test suite; its guard rail is the TypeScript compiler:
@@ -163,11 +199,21 @@ in CI.
   automatic hand-off) each only call it once per run in practice, but
   nothing in the code itself prevents a duplicate. See
   [Outreach_Agent/README.md](Outreach_Agent/README.md#known-limitations).
-- Learning insight recomputation is synchronous per-request; fine at current
-  volumes but could move to frontend caching or event-driven if `draft_versions`
-  grows very large. Confidence thresholds (20/50/150 samples; 1.5pp effect size)
+- Learning and Optimization insight recomputation are synchronous per-request;
+  fine at current volumes but could move to frontend caching or event-driven
+  if `draft_versions`/`outreach_items` grow very large. Confidence thresholds
+  (20/50/150 samples; 1.5pp effect size) are shared between the two layers
+  (Optimization imports, not re-declares, the Learning Agent's constants) and
   are tunable constants, not yet exposed as config. `learning_era_comparison`
   endpoint exists but is not yet surfaced on the Dashboard.
+- Optimization's ICP segmentation is fixed to `prospects.tier` and
+  `prospects.industry` — adding a new segment axis means editing
+  `optimization/engine.py`'s `SEGMENT_DIMENSIONS` explicitly.
+- Optimization's adoption-outcome comparisons are observed associations, not
+  controlled experiments — campaigns are chosen by whoever creates them, not
+  randomly assigned, so other differences between an adopting campaign and
+  the comparison set (timing, ICP mix, sender) are not accounted for. Every
+  such API response includes an explicit `causality_note` saying so.
 - The Dashboard has one pre-existing, unrelated TypeScript error in
   `src/pages/research/UsageTab.tsx` (a JSX element assigned where a `string`
   prop is expected) — tracked, not yet fixed; everything else type-checks

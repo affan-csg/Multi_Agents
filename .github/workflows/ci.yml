@@ -28,7 +28,7 @@ jobs:
         run: pytest -q
 
   outreach-agent:
-    name: Outreach Agent tests (Outreach + Conversation + Learning)
+    name: Outreach Agent tests (Outreach + Conversation + Learning + Optimization)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -40,7 +40,7 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -e .
-      - name: Run tests (374 total)
+      - name: Run tests (412 total)
         run: pytest -q
 
   dashboard:

@@ -27,6 +27,7 @@ from .config import load_config
 from .conversation.routes import router as conversation_router
 from .learning.routes import router as learning_router
 from .models import STAGE_ORDER
+from .optimization.routes import router as optimization_router
 from .research_client import ResearchClient, ResearchClientError
 
 _MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
@@ -57,6 +58,13 @@ app.include_router(conversation_router)
 # its own three tables. Self-contained in learning/; this mount is its only
 # hook into this app. See src/outreach/learning/__init__.py.
 app.include_router(learning_router)
+
+# Campaign-Level Optimization layer -- read-only against everything but its
+# own two tables (plus one opt-in adoption-recording write). Self-contained
+# in optimization/; this mount is its only hook into this app. Independent
+# of, and does not modify, the Feedback Learning Agent above. See
+# src/outreach/optimization/__init__.py.
+app.include_router(optimization_router)
 
 
 # ----------------------------------------------------------------------------
@@ -119,7 +127,7 @@ class CampaignCreateRequest(BaseModel):
 
 
 class SetStageRequest(BaseModel):
-    stage: str  # waiting | replied | booked -- see item_app.set-stage in cli.py
+    stage: str  # waiting | replied | booked | not_interested -- see item_app.set-stage in cli.py
 
 
 class ScheduleRequest(BaseModel):
@@ -340,7 +348,9 @@ def _aggregate_analytics(campaigns: list, items: list, prospects_by_domain: dict
     analytics pages feel like the same product."""
     from collections import defaultdict
 
-    stage_counts: dict[str, int] = {s: 0 for s in ("needs_review", "pending", "sent", "waiting", "replied", "booked", "failed")}
+    stage_counts: dict[str, int] = {
+        s: 0 for s in ("needs_review", "pending", "sent", "waiting", "replied", "booked", "not_interested", "failed")
+    }
     tiers: dict[str, int] = {"A": 0, "B": 0, "C": 0, "D": 0}
     industries: dict[str, dict[str, Any]] = {}
     personalized_from: dict[str, int] = {}
@@ -367,9 +377,20 @@ def _aggregate_analytics(campaigns: list, items: list, prospects_by_domain: dict
             bucket["count"] += 1
 
     total = len(items)
-    sent_total = stage_counts["sent"] + stage_counts["waiting"] + stage_counts["replied"] + stage_counts["booked"]
+    # sent_total is every item past Sent, including the two terminal outcomes
+    # (Booked and Not Interested/Failed) -- both are still items that were
+    # sent and got a resolution, just opposite ones.
+    sent_total = (
+        stage_counts["sent"] + stage_counts["waiting"] + stage_counts["replied"]
+        + stage_counts["booked"] + stage_counts["not_interested"]
+    )
     booked = stage_counts["booked"]
-    replied = stage_counts["replied"] + stage_counts["booked"]  # booked implies a reply happened
+    not_interested = stage_counts["not_interested"]
+    # replied counts any item that got a human reply at all, positive or
+    # negative -- booked and not_interested both imply a reply happened, same
+    # convention the Learning/Optimization agents' outcome_summary() already
+    # uses (see optimization/db.py and learning/db.py).
+    replied = stage_counts["replied"] + stage_counts["booked"] + stage_counts["not_interested"]
 
     top_industries = sorted(industries.values(), key=lambda x: x["count"], reverse=True)[:8]
 
@@ -380,8 +401,13 @@ def _aggregate_analytics(campaigns: list, items: list, prospects_by_domain: dict
         "sent_total": sent_total,
         "reply_rate": round((replied / sent_total) * 100, 1) if sent_total else 0.0,
         "booking_rate": round((booked / sent_total) * 100, 1) if sent_total else 0.0,
+        # Share of sent items that ended in a clear rejection -- a negative
+        # campaign-outcome metric alongside booking_rate, not a replacement
+        # for reply_rate (which still counts a rejection as "replied").
+        "failure_rate": round((not_interested / sent_total) * 100, 1) if sent_total else 0.0,
         "stage_funnel": [{"stage": s, "count": stage_counts[s]} for s in STAGE_ORDER],
         "failed_count": stage_counts["failed"],
+        "not_interested_count": not_interested,
         "needs_review_count": stage_counts["needs_review"],
         "tiers": [{"tier": k, "count": v} for k, v in sorted(tiers.items())],
         "industries": top_industries,
@@ -601,10 +627,13 @@ def revise_item(item_id: str, req: ReviseRequest) -> dict[str, Any]:
             learning_ctx = get_learning_context_summary(conn)
         except Exception:
             pass  # learning unavailable -- draft proceeds unmodified, see rl_prompt.md section 12
+        from .optimization.context import fetch_optimization_context_safely
+        optimization_ctx = fetch_optimization_context_safely(conn)
+        combined_ctx = "\n\n".join(c for c in (learning_ctx, optimization_ctx) if c) or None
         try:
             draft = personalize.revise_message(
                 cfg, prospect, current_subject=item.subject, current_body=item.body,
-                instruction=req.instruction, learning_context=learning_ctx,
+                instruction=req.instruction, learning_context=combined_ctx,
             )
         except RuntimeError as exc:
             raise HTTPException(502, str(exc))
@@ -673,8 +702,11 @@ def redraft_item(item_id: str) -> dict[str, Any]:
             learning_ctx = get_learning_context_summary(conn)
         except Exception:
             pass  # learning unavailable -- draft proceeds unmodified, see rl_prompt.md section 12
+        from .optimization.context import fetch_optimization_context_safely
+        optimization_ctx = fetch_optimization_context_safely(conn)
+        combined_ctx = "\n\n".join(c for c in (learning_ctx, optimization_ctx) if c) or None
         before_subject, before_body = item.subject, item.body
-        draft = personalize.draft_message(cfg, prospect, use_web_search=True, learning_context=learning_ctx)
+        draft = personalize.draft_message(cfg, prospect, use_web_search=True, learning_context=combined_ctx)
         db.update_item_fields(
             conn, item_id, subject=draft.subject, body=draft.body,
             personalized_from=draft.personalized_from,
@@ -734,6 +766,9 @@ def redraft_generic_items(campaign_id: str) -> dict[str, Any]:
             learning_ctx = get_learning_context_summary(conn)
         except Exception:
             pass  # learning unavailable -- drafts proceed unmodified, see rl_prompt.md section 12
+        from .optimization.context import fetch_optimization_context_safely
+        optimization_ctx = fetch_optimization_context_safely(conn)
+        combined_ctx = "\n\n".join(c for c in (learning_ctx, optimization_ctx) if c) or None
         upgraded = 0
         still_generic = 0
         for item in items:
@@ -741,7 +776,7 @@ def redraft_generic_items(campaign_id: str) -> dict[str, Any]:
             if not prospect:
                 continue
             before_subject, before_body = item.subject, item.body
-            draft = personalize.draft_message(cfg, prospect, use_web_search=True, learning_context=learning_ctx)
+            draft = personalize.draft_message(cfg, prospect, use_web_search=True, learning_context=combined_ctx)
             db.update_item_fields(
                 conn, item.item_id, subject=draft.subject, body=draft.body,
                 personalized_from=draft.personalized_from,
@@ -818,18 +853,21 @@ def delete_item(item_id: str) -> dict[str, str]:
 
 @app.post("/items/{item_id}/stage")
 def set_item_stage(item_id: str, req: SetStageRequest) -> dict[str, str]:
-    """Manually advance an item past 'sent', as a person.
+    """Manually advance (or re-open) an item past 'sent', as a person.
 
     The Outreach Agent never calls this itself -- pending/sent/failed are the
-    only stages it sets (see pipeline.send_campaign). waiting/replied/booked
-    belong to the Conversation Agent when it is switched on for the campaign
-    (see conversation/engine.py), and to a person otherwise.
+    only stages it sets (see pipeline.send_campaign). waiting/replied/booked/
+    not_interested belong to the Conversation Agent when it is switched on
+    for the campaign (see conversation/engine.py), and to a person otherwise.
 
     This route stays available either way, deliberately: dragging a card by
     hand is exactly how you drive the pipeline with the agent switched off,
-    and an `actor="user"` move is always allowed to override the agent's."""
-    if req.stage not in ("waiting", "replied", "booked"):
-        raise HTTPException(400, "only waiting/replied/booked can be set via this route")
+    and an `actor="user"` move is always allowed to override the agent's --
+    including moving a card OUT of not_interested (e.g. a misclassified
+    rejection) since this route is not bound by CONVERSATION_TRANSITIONS,
+    only the Conversation Agent's own automated moves are."""
+    if req.stage not in ("waiting", "replied", "booked", "not_interested"):
+        raise HTTPException(400, "only waiting/replied/booked/not_interested can be set via this route")
     conn = db.connect()
     try:
         db.set_stage(conn, item_id, req.stage, actor="user")

@@ -184,8 +184,26 @@ def create_campaign_from_prospects(
     )
     db.create_campaign(conn, campaign)
 
+    # Fetch guidance from the Feedback Learning Agent and the Campaign-Level
+    # Optimization layer before drafting -- both optional, both wrapped in
+    # try/except so a failure in either can never block campaign creation.
+    # Neither was previously wired into this specific call site (the very
+    # first draft at campaign-creation time); see learning/__init__.py and
+    # optimization/__init__.py invariant 2.
+    learning_ctx = None
+    try:
+        from .learning.context import get_learning_context_summary
+        learning_ctx = get_learning_context_summary(conn)
+    except Exception:
+        pass  # learning unavailable -- drafting proceeds unmodified
+
+    from .optimization.context import fetch_optimization_context_safely
+    optimization_ctx = fetch_optimization_context_safely(conn)
+
+    combined_context = "\n\n".join(c for c in (learning_ctx, optimization_ctx) if c) or None
+
     for p in top:
-        draft = draft_message(cfg, p)
+        draft = draft_message(cfg, p, learning_context=combined_context)
         # has_contact is guaranteed True for everything in `top` now; the only
         # remaining "not enough to trust a send" gate is personalization.
         # draft_message already tries an LLM against pain_summary/
@@ -251,7 +269,7 @@ _TEST_PROSPECTS: list[dict[str, Any]] = [
             "Hi Affan,\n\n"
             "This is a test email from the CSG Outreach Agent's test pipeline, "
             "seeded directly into Manual Review to verify the review/approve "
-            "step of the 6-stage pipeline.\n\n"
+            "step of the 7-stage pipeline.\n\n"
             "This draft should stay in Manual Review until manually approved.\n\n"
             "Best,\n{{signature}}"
         ),

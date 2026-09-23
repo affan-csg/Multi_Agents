@@ -18,6 +18,8 @@ _KEYS = {
     "draft_versions": ("version_id",),
     "learning_insights": ("pattern_key",),
     "learning_events": ("event_id",),
+    "campaign_optimization_insights": ("pattern_key",),
+    "optimization_recommendation_adoptions": ("adoption_id",),
 }
 
 _UNIQUE = {

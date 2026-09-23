@@ -207,7 +207,7 @@ export function Campaigns({ onOpenCampaign }: Props) {
           <h3 className="card-title">Create a campaign</h3>
           <p className="card-sub">
             {isTestMode
-              ? "Creates a fixed Test Campaign with two synthetic prospects — one in Pending, one in Manual Review — to safely exercise campaign creation, sending, and the full 6-stage pipeline. Nothing is sent automatically, and these never mix with real prospects."
+              ? "Creates a fixed Test Campaign with two synthetic prospects — one in Pending, one in Manual Review — to safely exercise campaign creation, sending, and the full 7-stage pipeline. Nothing is sent automatically, and these never mix with real prospects."
               : "Selects the configured top-N cached prospects (by Research's own score, descending) and creates a pending outreach item for each. Import prospects first from the Prospects page."}
           </p>
           <div className="field-row">

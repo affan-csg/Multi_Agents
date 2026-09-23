@@ -231,3 +231,20 @@ def test_send_pending_draft_forwards_the_drafts_own_in_reply_to(cfg, item, conn,
     responder.send_pending_draft(conn, cfg, item, draft)
 
     assert captured["in_reply_to"] == "<their-reply@acme.com>"
+
+
+# ---------------------------------------------------------------------------
+# should_reply -- the gate that keeps a rejection from ever getting an
+# automated answer, regardless of auto_reply
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("intent,expected", [
+    ("interested", True),
+    ("booked", True),
+    ("unclear", True),
+    ("not_interested", False),
+    ("out_of_office", False),
+    ("bounce", False),
+])
+def test_should_reply(intent, expected):
+    assert responder.should_reply(intent) is expected

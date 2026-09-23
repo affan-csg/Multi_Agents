@@ -90,7 +90,7 @@ def test_never_moves_to_waiting_once_they_replied():
 
 
 def test_only_sent_items_move_to_waiting():
-    for stage in ("replied", "booked", "waiting", "pending"):
+    for stage in ("replied", "booked", "waiting", "pending", "not_interested"):
         assert followup.should_move_to_waiting(_item(stage=stage), _settings(), now=NOW) is False
 
 
@@ -118,6 +118,14 @@ def test_respects_the_max_followups_cap():
 def test_max_followups_zero_disables_nudges_entirely():
     item = _item(stage="waiting", sent_at=NOW - timedelta(days=30), followup_count=0)
     assert followup.should_send_followup(item, _settings(max_followups=0), None, now=NOW) is False
+
+
+def test_only_waiting_items_get_a_followup_not_failed_ones():
+    """A Failed (not_interested) prospect must never be nudged -- same
+    stage-gate guarantee as pending/replied/booked, exercised directly here
+    since it's the specific case a rejection must respect."""
+    item = _item(stage="not_interested", sent_at=NOW - timedelta(days=30), followup_count=0)
+    assert followup.should_send_followup(item, _settings(), None, now=NOW) is False
 
 
 def test_consecutive_followups_are_spaced_out():

@@ -88,16 +88,26 @@ CREATE TABLE IF NOT EXISTS campaigns (
 
 -- ---------------------------------------------------------------------------
 -- outreach_items: the actual pipeline unit -- one row per (prospect,
--- campaign). `stage` is the 5-stage pipeline. This agent only ever writes
--- pending -> sent (and failed, on a send error); waiting/replied/booked are
--- advanced by a person in the UI today and by a future reply-tracking agent
--- later -- see stage_history for who/what moved it and when.
+-- campaign). `stage` is the pipeline. This agent only ever writes
+-- pending -> sent (and failed, on a send error); waiting/replied/booked/
+-- not_interested are advanced by the Conversation Agent (see below) when
+-- it's switched on for a campaign, and by a person in the UI otherwise --
+-- see outreach_events for who/what moved it and when.
+--
+-- not_interested (added by migrations/007_conversation_not_interested_stage.sql,
+-- shown as "Failed" in the Dashboard) is a DIFFERENT concept from the
+-- `failed` value already in this column: `failed` means the Outreach Agent's
+-- own send attempt errored (SMTP/delivery failure, the prospect never saw
+-- the email); `not_interested` means the email was delivered and the
+-- prospect explicitly declined. No CHECK constraint enforces the value set
+-- here -- see that migration file for why, and models.Stage (Python) for the
+-- authoritative list.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS outreach_items (
     item_id            TEXT PRIMARY KEY,
     campaign_id        TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
     research_domain    TEXT NOT NULL REFERENCES prospects(research_domain) ON DELETE CASCADE,
-    stage              TEXT NOT NULL DEFAULT 'pending',  -- needs_review|pending|sent|waiting|replied|booked|failed
+    stage              TEXT NOT NULL DEFAULT 'pending',  -- needs_review|pending|sent|waiting|replied|booked|not_interested|failed
     channel            TEXT NOT NULL DEFAULT 'email',
     subject            TEXT,
     body               TEXT,
@@ -142,10 +152,12 @@ CREATE INDEX IF NOT EXISTS idx_events_item ON outreach_events(item_id);
 -- above. The Conversation Agent runs in the SAME Supabase project as the
 -- Outreach Agent (deliberately, unlike the Research/Outreach split) because
 -- it operates on the very same outreach_items rows: it owns the stages the
--- Outreach Agent explicitly does not (sent -> waiting -> replied -> booked),
--- while the Outreach Agent keeps owning needs_review/pending -> sent/failed.
--- Ownership is by STAGE, not by table, which is what keeps the two agents
--- from racing each other -- see src/outreach/conversation/engine.py.
+-- Outreach Agent explicitly does not (sent -> waiting -> replied -> booked,
+-- plus the terminal not_interested stage added later by migrations/
+-- 007_conversation_not_interested_stage.sql), while the Outreach Agent keeps
+-- owning needs_review/pending -> sent/failed. Ownership is by STAGE, not by
+-- table, which is what keeps the two agents from racing each other -- see
+-- src/outreach/conversation/engine.py.
 --
 -- Re-running this whole file on an existing project is safe: every statement
 -- below is IF NOT EXISTS / ADD COLUMN IF NOT EXISTS.
@@ -310,3 +322,50 @@ CREATE TABLE IF NOT EXISTS learning_events (
 
 CREATE INDEX IF NOT EXISTS idx_learning_events_pattern ON learning_events(pattern_key);
 CREATE INDEX IF NOT EXISTS idx_learning_events_created ON learning_events(created_at);
+
+-- ===========================================================================
+-- CAMPAIGN-LEVEL OPTIMIZATION LAYER
+--
+-- Everything below is ADDITIVE -- it does not alter or re-key any table
+-- above, and no existing agent (Outreach, Conversation, or the Feedback
+-- Learning Agent above) ever reads or writes these two tables. This layer
+-- only ever READS campaigns/prospects/outreach_items/conversation_messages
+-- and the Learning Agent's own draft_versions (for style evidence); it never
+-- writes to any of them and never changes a stage. See
+-- src/outreach/optimization/__init__.py.
+--
+-- Re-running this whole file on an existing project is safe: every statement
+-- below is IF NOT EXISTS. See migrations/006_campaign_optimization.sql for
+-- the full rationale behind each table.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS campaign_optimization_insights (
+    pattern_key      TEXT PRIMARY KEY,
+    pattern_label    TEXT NOT NULL,
+    dimension        TEXT NOT NULL,
+    segment          TEXT NOT NULL DEFAULT '',
+    description      TEXT NOT NULL,
+    evidence_count   INT NOT NULL DEFAULT 0,
+    metric_comparison JSONB NOT NULL DEFAULT '{}'::jsonb,
+    confidence        TEXT NOT NULL DEFAULT 'low',
+    status             TEXT NOT NULL DEFAULT 'insufficient_data',
+    evidence_campaign_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    evidence_item_ids      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    first_observed_at       TIMESTAMPTZ NOT NULL,
+    last_updated_at          TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_opt_insights_status    ON campaign_optimization_insights(status);
+CREATE INDEX IF NOT EXISTS idx_campaign_opt_insights_dimension ON campaign_optimization_insights(dimension);
+CREATE INDEX IF NOT EXISTS idx_campaign_opt_insights_segment   ON campaign_optimization_insights(segment);
+
+CREATE TABLE IF NOT EXISTS optimization_recommendation_adoptions (
+    adoption_id   TEXT PRIMARY KEY,
+    pattern_key   TEXT NOT NULL,
+    campaign_id   TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    note          TEXT,
+    created_at    TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_opt_adoptions_pattern  ON optimization_recommendation_adoptions(pattern_key);
+CREATE INDEX IF NOT EXISTS idx_opt_adoptions_campaign ON optimization_recommendation_adoptions(campaign_id);

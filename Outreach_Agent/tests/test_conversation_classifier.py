@@ -162,6 +162,72 @@ def test_empty_body_is_unclear(cfg, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# not_interested -- the intent that routes a card to the terminal Failed
+# stage (see conversation/engine.py's _INTENT_STAGE). The judgment call of
+# "is this wording a rejection" is the LLM's job and cannot be exercised
+# offline; what's tested here is that classify() correctly carries whatever
+# the model decides through to the returned intent, for the range of
+# rejection phrasings the prompt itself calls out as examples (see
+# prompts/classify_reply.md) -- i.e. the parsing/routing plumbing does not
+# lose or mangle a rejection call the model already made correctly.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("body", [
+    "Not interested, thanks.",
+    "We're not looking for this right now.",
+    "No thanks, please don't contact us again.",
+    "We don't need your services at this time.",
+    "Please remove me from this list.",
+    "Not a fit for us, sorry.",
+    "Unsubscribe me please.",
+    "We already have a vendor for this.",
+])
+def test_classify_returns_not_interested_for_rejection_replies(cfg, monkeypatch, body):
+    """Simulates the model correctly judging each of these as a rejection --
+    classify() must carry that verdict through unchanged."""
+    monkeypatch.setattr(classifier, "_call_llm", lambda p: "INTENT: not_interested")
+    assert classifier.classify(cfg, _email(body=body)) == "not_interested"
+
+
+@pytest.mark.parametrize("body,model_verdict", [
+    # A referral keeps the conversation alive with someone else -- interested,
+    # not a rejection, per the prompt's own explicit instruction.
+    ("Please talk to our Head of Talent, cc'd here.", "interested"),
+    # Deferral, not decline -- the prompt explicitly calls this out as
+    # interested, since the door is left open.
+    ("Not right now, check back in six months.", "interested"),
+    # A genuine open question is active engagement, not a decline.
+    ("What's your pricing model look like?", "interested"),
+    # A polite acknowledgement with no forward motion is unclear, not a
+    # rejection -- the prompt explicitly reserves not_interested for a CLEAR
+    # no.
+    ("Thanks for reaching out.", "unclear"),
+])
+def test_ambiguous_or_positive_replies_do_not_become_not_interested(cfg, monkeypatch, body, model_verdict):
+    """The flip side of the above: simulates the model correctly judging each
+    of these as NOT a rejection (per prompts/classify_reply.md's own
+    examples), and confirms classify() does not somehow coerce them into
+    not_interested -- these must remain in the normal Replied flow, never the
+    terminal Failed stage."""
+    monkeypatch.setattr(classifier, "_call_llm", lambda p: f"INTENT: {model_verdict}")
+    assert classifier.classify(cfg, _email(body=body)) == model_verdict
+    assert classifier.classify(cfg, _email(body=body)) != "not_interested"
+
+
+def test_classify_reply_prompt_reserves_not_interested_for_a_clear_no():
+    """Guards the prompt itself, not just the parser: the instructions the
+    model is given must keep steering ambiguous replies away from
+    not_interested (this is the actual safeguard against misclassifying a
+    genuine question or a neutral reply as a rejection, since the parsing
+    logic alone has no way to know)."""
+    template = classifier._PROMPT_PATH.read_text(encoding="utf-8")
+    assert "a clear no" in template
+    assert "referral" in template.lower()
+    assert "check back" in template.lower()
+    assert "Err toward `unclear`" in template
+
+
+# ---------------------------------------------------------------------------
 # quoted-text stripping
 # ---------------------------------------------------------------------------
 

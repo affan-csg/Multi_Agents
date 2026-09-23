@@ -14,7 +14,9 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-Stage = Literal["needs_review", "pending", "sent", "waiting", "replied", "booked", "failed"]
+Stage = Literal[
+    "needs_review", "pending", "sent", "waiting", "replied", "booked", "failed", "not_interested",
+]
 Channel = Literal["email"]
 
 # Pipeline order, mirrors Dashboard/src/agents/outreach.ts STAGE_ORDER -- keep
@@ -24,7 +26,18 @@ Channel = Literal["email"]
 # personalize from (not even industry/description/open_reqs), or every LLM
 # call failed. See personalize.draft_message, ingest.create_campaign_from_prospects,
 # and api.approve_item.
-STAGE_ORDER: list[Stage] = ["needs_review", "pending", "sent", "waiting", "replied", "booked", "failed"]
+#
+# 'not_interested' (displayed as "Failed" in the UI -- see Dashboard's
+# STAGE_LABEL) is the Conversation Agent's terminal rejection outcome, placed
+# after 'booked'. It is a DIFFERENT concept from 'failed', which is the
+# Outreach Agent's send-error stage (SMTP/delivery failure, never reached the
+# prospect at all) -- the two names collide in plain English but never in
+# code: 'failed' stays in OUTREACH_STAGES, 'not_interested' lives in
+# CONVERSATION_STAGES below, and CONVERSATION_TRANSITIONS keeps the Outreach
+# Agent's 'failed' completely out of the Conversation Agent's reach.
+STAGE_ORDER: list[Stage] = [
+    "needs_review", "pending", "sent", "waiting", "replied", "booked", "not_interested", "failed",
+]
 
 # --- Stage ownership, split between the two agents ---------------------------
 # This split is the core safety property of running both agents against the
@@ -41,17 +54,25 @@ STAGE_ORDER: list[Stage] = ["needs_review", "pending", "sent", "waiting", "repli
 # (as the start of its own). Nothing else overlaps, and the Conversation
 # Agent never writes 'sent'.
 OUTREACH_STAGES: list[Stage] = ["needs_review", "pending", "sent", "failed"]
-CONVERSATION_STAGES: list[Stage] = ["sent", "waiting", "replied", "booked"]
+CONVERSATION_STAGES: list[Stage] = ["sent", "waiting", "replied", "booked", "not_interested"]
 
 # Forward-only transitions the Conversation Agent is permitted to make. Any
 # move not in this map is rejected before it reaches the database -- a
 # classifier that returns nonsense can never send a card backwards, skip
 # 'replied' on the way to 'booked', or resurrect a booked prospect.
+#
+# 'not_interested' is terminal (empty outbound list, same as 'booked') except
+# for the manual escape hatch: a person can always re-open a card via
+# api.set_item_stage / the drawer's stage buttons, which calls db.set_stage
+# directly with actor="user" and is not bound by this whitelist -- see
+# WORKFLOW.md's "manual override always wins" guarantee. This map only limits
+# what the Conversation Agent may do on its own.
 CONVERSATION_TRANSITIONS: dict[Stage, list[Stage]] = {
-    "sent": ["waiting", "replied", "booked"],
-    "waiting": ["replied", "booked"],
-    "replied": ["booked"],
+    "sent": ["waiting", "replied", "booked", "not_interested"],
+    "waiting": ["replied", "booked", "not_interested"],
+    "replied": ["booked", "not_interested"],
     "booked": [],
+    "not_interested": [],
 }
 
 
@@ -190,7 +211,11 @@ class OutreachEvent(BaseModel):
 # What an inbound reply means, as decided by conversation/classifier.py.
 #   interested     -- wants to talk; worth a reply
 #   booked         -- has accepted/proposed a concrete meeting -> Booked
-#   not_interested -- a clear no; stop following up, leave in Replied
+#   not_interested -- a clear no ("not interested", "no thanks", "remove me",
+#                     "not a fit", ...) -> the terminal Not Interested stage
+#                     (labeled "Failed" in the UI); stop following up, no
+#                     automated reply is ever sent for this intent (see
+#                     responder._REPLYABLE)
 #   out_of_office  -- an autoresponder, NOT a real reply; item stays put
 #   bounce         -- undeliverable; not a reply either
 #   unclear        -- a genuine human reply the model could not categorize

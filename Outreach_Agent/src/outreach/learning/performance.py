@@ -18,7 +18,7 @@ from typing import Any, Optional
 from ..db import SupabaseConn
 from . import db as learning_db
 
-_METRICS = ("reply_rate", "positive_reply_rate", "booking_rate", "no_reply_rate")
+_METRICS = ("reply_rate", "positive_reply_rate", "booking_rate", "no_reply_rate", "failure_rate")
 
 
 def _rate(n: int, total: int) -> float:
@@ -37,6 +37,8 @@ def _metric_value(metric: str, outcomes: dict[str, Any], item_ids: list[str]) ->
         n = sum(1 for i in item_ids if outcomes.get(i, {}).get("booked"))
     elif metric == "no_reply_rate":
         n = sum(1 for i in item_ids if not outcomes.get(i, {}).get("replied"))
+    elif metric == "failure_rate":
+        n = sum(1 for i in item_ids if outcomes.get(i, {}).get("failed"))
     else:
         raise ValueError(f"unknown metric: {metric}")
     return _rate(n, total)
@@ -137,6 +139,7 @@ def campaign_comparison(conn: SupabaseConn, campaign_ids: Optional[list[str]] = 
             "positive_reply_rate": _metric_value("positive_reply_rate", outcomes, item_ids),
             "booking_rate": _metric_value("booking_rate", outcomes, item_ids),
             "no_reply_rate": _metric_value("no_reply_rate", outcomes, item_ids),
+            "failure_rate": _metric_value("failure_rate", outcomes, item_ids),
         })
     return results
 

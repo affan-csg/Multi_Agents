@@ -4,6 +4,7 @@ The Outreach Agent's job ends when an email leaves the building. This package
 picks it up there and drives the rest of the funnel:
 
     sent -> waiting -> replied -> booked
+                    \-> not_interested ("Failed" in the Dashboard, terminal)
 
 It runs inside the Outreach Agent's own backend process and against the same
 Supabase project, reusing its db.py, config.py, models.py, personalize.py and

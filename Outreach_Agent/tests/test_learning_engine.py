@@ -195,3 +195,46 @@ def test_human_edit_pattern_frequency(conn):
 def test_empty_draft_versions_returns_no_active_insights(conn):
     insights = recompute_insights(conn)
     assert all(i.status != "active" for i in insights) or insights == []
+
+
+# ---------------------------------------------------------------------------
+# followup_timing -- must include not_interested ("Failed") items in its
+# denominator, not just sent/waiting/replied/booked. A rejected prospect who
+# received a follow-up before declining is exactly the kind of data point
+# this insight is meant to catch; dropping it entirely (rather than counting
+# it as a reply, per outreach_outcome_summary's convention) would understate
+# how many follow-up recipients replied at all.
+# ---------------------------------------------------------------------------
+
+def test_followup_timing_includes_not_interested_items(conn):
+    from outreach.learning.engine import _detect_followup_timing
+
+    conn.tables.setdefault("campaigns", []).append({"campaign_id": "camp1", "name": "C"})
+    for i in range(30):
+        conn.tables.setdefault("outreach_items", []).append({
+            "item_id": f"item-{i}", "campaign_id": "camp1", "research_domain": f"c{i}.com",
+            "stage": "not_interested" if i < 20 else "sent",
+            "channel": "email", "subject": "s", "body": "b",
+            "personalized_from": "pain_summary", "sent_at": "2026-01-01T00:00:00",
+            "created_at": "2026-01-01T00:00:00", "stage_updated_at": "2026-01-01T00:00:00",
+            # First 20 (all not_interested) got a follow-up before rejecting;
+            # last 10 (still open) never got one.
+            "followup_count": 1 if i < 20 else 0,
+        })
+        conn.tables.setdefault("conversation_messages", []).append({
+            "message_id": f"m-item-{i}", "item_id": f"item-{i}", "direction": "inbound",
+            "intent": "not_interested", "created_at": "2026-01-02T00:00:00",
+        })
+
+    insight = _detect_followup_timing(conn)
+
+    assert insight is not None
+    assert insight.evidence_count == 30
+    # Without the fix, the 20 not_interested items would be excluded from
+    # the query entirely, leaving only the 10 never-followed-up items --
+    # evidence_count would be 10, not 30, and the "1+ follow-ups" group
+    # would not exist at all.
+    group_a = insight.metric_comparison["group_a"]
+    assert group_a["label"] == "1+ follow-ups"
+    assert group_a["n"] == 20
+    assert group_a["reply_rate"] == 100.0  # every not_interested item replied (rejected)

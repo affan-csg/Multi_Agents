@@ -61,6 +61,10 @@ const PATHS = {
     <circle cx="9" cy="18" r="1.2" fill="currentColor" stroke="none" />
     <circle cx="15" cy="18" r="1.2" fill="currentColor" stroke="none" />
   </>,
+  eye: <><path d="M2 12s3.8-7 10-7 10 7 10 7-3.8 7-10 7-10-7-10-7z" /><circle cx="12" cy="12" r="3" /></>,
+  shieldCheck: <><path d="M12 3.5 5 6v6c0 4.6 3 7.6 7 8.5 4-.9 7-3.9 7-8.5V6z" /><path d="m9 12 2 2 4-4.5" /></>,
+  ban: <><circle cx="12" cy="12" r="8.5" /><path d="m6 6 12 12" /></>,
+  activity: <><path d="M3 12h4l2.5-7L14 19l2.5-7H21" /></>,
 } as const;
 
 const AVATAR_COLORS = [
