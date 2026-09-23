@@ -1,25 +1,38 @@
 # CSG Agents
 
 Three independent projects that together run CSG's prospecting → outreach
-pipeline, plus one shared dashboard to operate them:
+pipeline, plus one shared dashboard to operate them. Research and Outreach
+are served through **one backend port** (see [Server](#server-single-port-composition)
+below); the Dashboard is still its own dev server.
 
-| Project | What it does | Port |
+| Project | What it does | Reached at |
 |---|---|---|
-| [Research_Agent](Research_Agent/README.md) | Discovers US companies, scores/tiers them as staffing prospects, finds contacts, and (optionally) runs an LLM qualification pass (`csg qualify`). | `:8000` |
-| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent** (replies/follow-ups after send) and the **Feedback Learning / Optimization Agent** (learns from performance, edits, outcomes; feeds insights back into drafts). | `:8001` |
+| [Research_Agent](Research_Agent/README.md) | Discovers US companies, scores/tiers them as staffing prospects, finds contacts, and (optionally) runs an LLM qualification pass (`csg qualify`). | `:8000/research` |
+| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent** (replies/follow-ups after send) and the **Feedback Learning / Optimization Agent** (learns from performance, edits, outcomes; feeds insights back into drafts). | `:8000/outreach` |
 | [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser. No database or backend of its own. Includes a dedicated Learning & Optimization tab under Outreach Agent. | `:5173` |
 
 ```
-                    ┌─────────────────┐        HTTP only        ┌──────────────────────────┐
-   companies  ──►   │  Research Agent  │ ───────────────────►   │  Outreach Agent   :8001  │ ──► email
-   (discover,       │  (own Supabase   │  qualified prospects   │  ┌────────────────────┐  │     (SMTP)
-   score, qualify)  │   project)       │  + auto hand-off       │  │ Conversation Agent │  │ ◄── replies
-                    │      :8000       │                        │  └────────────────────┘  │     (IMAP)
-                    └─────────▲────────┘                        └─────────▲────────────────┘
-                              │                                           │
-                              └───────────────  Dashboard  ───────────────┘
-                                  (browser-only, no DB, no backend)
+                    ┌────────────────────────────────────────────────────────────┐
+                    │                  Server  :8000  (one process)              │
+                    │                                                            │
+   companies  ──►   │  ┌─────────────────┐   HTTP,   ┌──────────────────────┐   │  ──► email
+   (discover,       │  │ /research        │  same     │ /outreach            │   │      (SMTP)
+   score, qualify)  │  │ (own Supabase    │  process  │ ┌──────────────────┐ │   │
+                    │  │  project)        │ ────────► │ │Conversation Agent│ │   │  ◄── replies
+                    │  └────────▲─────────┘           │ └──────────────────┘ │   │      (IMAP)
+                    │           │                      └──────────▲───────────┘   │
+                    └───────────┼─────────────────────────────────┼───────────────┘
+                                │                                  │
+                                └────────────────  Dashboard  ─────┘
+                                     (browser-only, no DB, no backend)
 ```
+
+`/research` and `/outreach` are two separate FastAPI apps (separate code,
+separate Supabase projects, separate business logic) mounted onto one parent
+app by [Server/app.py](Server/app.py) — a composition layer with no business
+logic of its own. Each agent can still be run standalone on its own port
+(`:8000` / `:8001`) exactly as before; see
+[Server/README.md](Server/README.md#running-an-agent-standalone).
 
 Inside the Outreach Agent process, two more sibling layers sit alongside the
 Conversation Agent — both read-only against outcomes, never in the request
@@ -70,31 +83,34 @@ Outreach Agent.
 
 ## Quickstart
 
-Each backend is its own process, each in its own terminal, from its own
-directory (see `run.txt` for the copy-pasteable version):
+Two terminals: one venv holding both agents' backends behind one port, plus
+the Dashboard (see `run.txt` for the copy-pasteable version):
 
 ```
-# Terminal 1 -- Research Agent's backend, :8000
-cd Research_Agent
-python -m uvicorn csg.api:app --app-dir src --reload --port 8000
+# Terminal 1 -- one venv, both agents' backends, :8000
+python -m venv .venv
+.venv/Scripts/activate            # macOS/Linux: source .venv/bin/activate
+pip install -e Research_Agent -e Outreach_Agent -e Server
+python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
 
-# Terminal 2 -- Outreach Agent's backend, :8001
-cd Outreach_Agent
-python -m uvicorn outreach.api:app --app-dir src --reload --port 8001
-
-# Terminal 3 -- the shared Dashboard, :5173
+# Terminal 2 -- the shared Dashboard, :5173
 cd Dashboard
 npm run dev
 ```
 
-`--port 8001` is not optional the way `:8000` is — the Dashboard's
-`VITE_OUTREACH_API_BASE` expects Outreach there specifically. Use
-`python -m uvicorn ...`, not the bare `uvicorn` command — on Windows, a
-venv's `uvicorn.exe` launcher hardcodes an absolute path to `python.exe` at
-creation time, so a venv folder moved/renamed after `pip install` breaks it
-(`Fatal error in launcher: Unable to create process...`) even though the
-venv itself is fine. Also, on Windows PowerShell (not pwsh/PowerShell 7),
-`&&` is not a valid command separator — one command per line, or use `;`.
+`--port 8000` is not optional — the Dashboard's `VITE_RESEARCH_API_BASE` /
+`VITE_OUTREACH_API_BASE` default to `:8000/research` and `:8000/outreach`
+specifically. Use `python -m uvicorn ...`, not the bare `uvicorn` command —
+on Windows, a venv's `uvicorn.exe` launcher hardcodes an absolute path to
+`python.exe` at creation time, so a venv folder moved/renamed after
+`pip install` breaks it (`Fatal error in launcher: Unable to create
+process...`) even though the venv itself is fine. Also, on Windows
+PowerShell (not pwsh/PowerShell 7), `&&` is not a valid command separator —
+one command per line, or use `;`.
+
+See [Server/README.md](Server/README.md) for why this is one process, what
+it does and does not change, and how to fall back to running an agent
+standalone on its own port.
 
 First-time setup (env vars, Supabase schema, dependencies) is documented per
 project — see each one's own README:
@@ -107,6 +123,9 @@ project — see each one's own README:
   data → live web search → static template), sending, the pipeline board.
 - [Dashboard/README.md](Dashboard/README.md) — adding a new agent's pages,
   the shared design system, the stale-while-revalidate data layer.
+- [Server/README.md](Server/README.md) — the single-port composition layer:
+  how it mounts both agents, keeps their databases separate, and how to run
+  an agent standalone instead.
 
 ## How a company moves through the pipeline
 
@@ -185,8 +204,9 @@ fixture stands in for Supabase — see each project's `tests/conftest.py`),
 so no live database or API keys are needed to run them:
 
 ```
-cd Research_Agent && pytest    # 295 passed
-cd Outreach_Agent  && pytest   # 584 passed (outreach + conversation + learning + optimization + Calendly)
+cd Research_Agent && pytest    # 299 passed
+cd Outreach_Agent  && pytest   # 592 passed (outreach + conversation + learning + optimization + Calendly)
+cd Server          && pytest   # single-port mounting, lifespans, WebSockets, CORS, DB isolation
 ```
 
 The Dashboard has no test suite; its guard rail is the TypeScript compiler:

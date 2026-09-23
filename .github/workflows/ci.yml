@@ -1,9 +1,12 @@
 name: CI
 
-# Each project is independent (separate Supabase projects, separate
-# dependency trees), so each gets its own job and none block the others.
-# Both Python suites run fully offline against an in-memory PostgREST fake
-# (see each project's tests/conftest.py) -- no secrets are needed here.
+# Research_Agent and Outreach_Agent are independent (separate Supabase
+# projects, separate dependency trees), so each gets its own job and none
+# block the others. Both Python suites run fully offline against an
+# in-memory PostgREST fake (see each project's tests/conftest.py) -- no
+# secrets are needed here. Server/ is the thin single-port composition layer
+# that mounts both agents' apps under one process/port (see Server/app.py);
+# its job installs all three editable, same as running it for real.
 on:
   push:
     branches: [main]
@@ -41,6 +44,20 @@ jobs:
       - name: Install dependencies
         run: pip install -e .
       - name: Run tests (412 total)
+        run: pytest -q
+
+  server:
+    name: Server tests (single-port composition)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e Research_Agent -e Outreach_Agent -e Server
+      - name: Run tests
+        working-directory: Server
         run: pytest -q
 
   dashboard:

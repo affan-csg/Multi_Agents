@@ -23,7 +23,7 @@ drafted, reviewable state (`pending`/`needs_review`); a person (or `campaign
 send`/the Send button) still has to trigger step 4.
 
 ```
- RESEARCH AGENT (separate service, :8000)
+ RESEARCH AGENT (separate app, own code + DB, reached at :8000/research)
         |
         v  (by hand: outreach import-prospects / Prospects page
         |   automatic: Research's _handoff_to_outreach, after qualify+contacts)
@@ -408,8 +408,9 @@ job snapshot updates.
   consumed by `Dashboard/src/pages/outreach/` (Campaigns list, Campaign
   Detail kanban, Analytics). Outreach has no frontend of its own — it's a
   set of pages inside the shared Dashboard app, talking to this agent's API
-  on port 8001 while the Research Agent's own API runs on 8000; both must be
-  running for the Dashboard's Outreach pages to work.
+  (normally `:8000/outreach`, via the [single-port server](../Server))
+  while the Research Agent's own API is reached at `:8000/research`; both
+  must be running for the Dashboard's Outreach pages to work.
 
 Both paths call the same `ingest`/`personalize`/`pipeline` functions, so the
 CLI and the API can never drift apart.

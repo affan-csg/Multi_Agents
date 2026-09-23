@@ -90,10 +90,13 @@ theoretical one.
      these from **this** Outreach project's Supabase Settings → API page —
      not the Research Agent's project.
    - `RESEARCH_API_BASE` — where the Research Agent's backend is running
-     (defaults to `http://127.0.0.1:8000`, i.e. `config/outreach.yaml`'s
-     `research.api_base` unless overridden here). Outreach pulls prospects
-     from `GET /runs/{run_id}/companies` and `/companies/{domain}` — the
-     Research Agent's backend must be running for imports to work.
+     (defaults to `http://127.0.0.1:8000/research`, i.e. `config/outreach.yaml`'s
+     `research.api_base` unless overridden here — that default matches the
+     [single-port server](../Server); running Research standalone instead
+     means `http://127.0.0.1:8000` with no `/research` suffix). Outreach
+     pulls prospects from `GET /runs/{run_id}/companies` and
+     `/companies/{domain}` — the Research Agent's backend must be running
+     for imports to work.
    - `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` — required
      to actually send email. For Gmail: use an **App Password**
      (myaccount.google.com/apppasswords, needs 2FA enabled), not your normal
@@ -178,9 +181,11 @@ campaign in the Campaigns list or Analytics scope selector.
 ### Running both backends (required for the web app)
 
 Outreach imports prospects from the Research Agent over HTTP, so **both
-backends need to be running at the same time**, each in its own terminal —
-Outreach on its own does not work standalone once you're past the CLI's
-`import-prospects` step:
+backends need to be running at the same time**. Normally that means both
+through the [single-port server](../Server) (`http://127.0.0.1:8000/outreach`
+and `/research`, one process) — see [Server/README.md](../Server/README.md)
+for setup and the run command. This section covers running this backend
+**standalone** instead, on its own port, e.g. for isolated debugging:
 
 ```
 # Terminal 1 -- Research Agent's backend, :8000
@@ -202,11 +207,11 @@ the launcher entirely. Also, on Windows PowerShell (not pwsh/PowerShell 7),
 `&&` is not a valid command separator — put each command on its own line, as
 above, or use `;` if you want to chain them.
 
-`--port 8001` here is not optional the way `--port 8000` is for Research's
-backend — the Dashboard's `VITE_OUTREACH_API_BASE` (see
-[Dashboard/.env.example](../Dashboard/.env.example)) expects Outreach on
-`:8001` specifically. If the Dashboard's sidebar shows "agent unreachable"
-for Outreach, this backend usually isn't running.
+Running standalone this way means pointing the Dashboard's
+`VITE_OUTREACH_API_BASE` (see [Dashboard/.env.example](../Dashboard/.env.example))
+at `http://127.0.0.1:8001` instead of the single-port server's default. If
+the Dashboard's sidebar shows "agent unreachable" for Outreach, this backend
+usually isn't running, or that var doesn't match where it's listening.
 
 ### Adding the web UI (Dashboard, a third process)
 
@@ -814,9 +819,13 @@ the Bookings tab behaves exactly as it always did.
    it) — purely additive, one new table (`calendly_events`), safe to re-run.
 3. Optional, for live updates instead of only manual/scheduled syncs: run
    `outreach calendly register-webhook https://your-public-host/calendly/webhook`
-   (needs the token's `webhooks:write` scope). **Save the printed
-   `signing_key` immediately** as `CALENDLY_WEBHOOK_SIGNING_KEY` in `.env` —
-   Calendly returns it exactly once and never shows it again.
+   (needs the token's `webhooks:write` scope). `/calendly/webhook` works at
+   that root path whether this agent is running standalone or through the
+   [single-port server](../Server) — the server keeps a root alias for it
+   alongside its own `/outreach/calendly/webhook`, so no change is needed
+   here either way. **Save the printed `signing_key` immediately** as
+   `CALENDLY_WEBHOOK_SIGNING_KEY` in `.env` — Calendly returns it exactly
+   once and never shows it again.
 4. Without step 3, `POST /calendly/sync` (or the Bookings tab's "Sync
    Calendly" button, or `outreach calendly sync`) is still a complete,
    correct way to keep the page current — just not real-time.

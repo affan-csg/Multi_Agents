@@ -7,11 +7,14 @@ directly from the browser, the same way each agent's own frontend does.
 
 ```
 Browser (this app, Vite dev server -- picks the next free port from :5173)
-  ├─→ GET http://127.0.0.1:8000/...   (Research_Agent/src/csg/api.py)
-  └─→ GET http://127.0.0.1:8001/...   (Outreach_Agent/src/outreach/api.py)
+  ├─→ GET http://127.0.0.1:8000/research/...   (Research_Agent/src/csg/api.py)
+  └─→ GET http://127.0.0.1:8000/outreach/...   (Outreach_Agent/src/outreach/api.py)
 ```
 
-Each agent keeps its own database, its own backend process, and its own
+Both agents are normally served through one backend process/port — see
+[Server](../Server) — but remain separate FastAPI apps with separate code
+and separate databases; only the path prefix (`/research` vs `/outreach`)
+tells them apart. Each agent keeps its own database, and its own
 independence — deleting or redeploying this dashboard never touches either
 agent, and deleting this dashboard doesn't either. Nothing here merges their
 databases; cross-agent linkage happens the way it already does at the API
@@ -37,18 +40,20 @@ cp .env.example .env   # point at each agent's API if not on the defaults
 npm run dev
 ```
 
-Requires the agents you want to see to be running (each from its own
-directory, each in its own terminal):
+Requires the backend(s) for the agents you want to see to be running.
+Normally that's both agents together through the single-port
+[Server](../Server):
 
 ```
-# Research Agent -- :8000
-cd ../Research_Agent
-python -m uvicorn csg.api:app --app-dir src --reload --port 8000
-
-# Outreach Agent -- :8001 (not optional -- see its README)
-cd ../Outreach_Agent
-python -m uvicorn outreach.api:app --app-dir src --reload --port 8001
+python -m uvicorn app:app --app-dir ../Server --reload --reload-dir ../Research_Agent/src --reload-dir ../Outreach_Agent/src --reload-dir ../Server --port 8000
 ```
+
+which serves Research at `:8000/research` and Outreach at `:8000/outreach`
+— matching this app's `.env.example` defaults. Running an agent standalone
+on its own port instead (e.g. `:8000` for Research, `:8001` for Outreach —
+see [Server/README.md](../Server/README.md#running-an-agent-standalone))
+means updating `VITE_RESEARCH_API_BASE`/`VITE_OUTREACH_API_BASE` in this
+app's `.env` to match.
 
 Use `python -m uvicorn ...`, not the bare `uvicorn` command — on Windows, a
 venv's `uvicorn.exe` launcher hardcodes an absolute path to `python.exe` at

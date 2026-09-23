@@ -105,8 +105,14 @@ class SupabaseConn:
 
 
 def connect(url: Optional[str] = None, service_key: Optional[str] = None) -> SupabaseConn:
-    url = url or os.environ.get("SUPABASE_URL")
-    service_key = service_key or os.environ.get("SUPABASE_SERVICE_KEY")
+    # RESEARCH_-scoped vars win: the single-port server (Server/app.py) runs
+    # this agent and the Outreach Agent in one process, where the unscoped
+    # SUPABASE_* names would collide with Outreach's separate project.
+    # Standalone use never sets them, so it falls through unchanged.
+    url = url or os.environ.get("RESEARCH_SUPABASE_URL") or os.environ.get("SUPABASE_URL")
+    service_key = (
+        service_key or os.environ.get("RESEARCH_SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
+    )
     if not url or not service_key:
         raise SupabaseError(
             "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in .env (see .env.example)."

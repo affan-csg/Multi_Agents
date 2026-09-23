@@ -16,8 +16,13 @@ version: 1
 # --- Research Agent connection ---------------------------------------------
 # Where to pull qualified prospects from. Outreach never touches the Research
 # database directly -- only this HTTP API (see src/outreach/research_client.py).
+# RESEARCH_API_BASE env var wins over this if set (see .env.example) -- this
+# is only the fallback for running with no .env override at all. Matches the
+# single-port server's default (Server/app.py, http://127.0.0.1:8000); if
+# running Research standalone on its own port instead, use
+# http://127.0.0.1:8000 with no /research suffix (or just set the env var).
 research:
-  api_base: "http://127.0.0.1:8000"
+  api_base: "http://127.0.0.1:8000/research"
   # Default tiers considered "qualified" for outreach selection.
   qualified_tiers: [A, B]
 

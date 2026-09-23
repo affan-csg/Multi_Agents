@@ -1,6 +1,20 @@
 cd Dashboard
 npm run dev
-cd Outreach_Agent  
+
+# One-time setup: one venv holding all three packages editable.
+python -m venv .venv
+.venv/Scripts/activate   (or: source .venv/bin/activate on macOS/Linux)
+pip install -e Research_Agent -e Outreach_Agent -e Server
+python -m uvicorn app:app --app-dir Server --reload --port 8000
+
+# Both agents, served through one port (recommended -- see Server/app.py):
+python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
+# Research Agent routes:  http://127.0.0.1:8000/research/...
+# Outreach Agent routes:  http://127.0.0.1:8000/outreach/...
+
+# Running an agent standalone on its own port (e.g. isolated debugging)
+# still works exactly as before:
+cd Outreach_Agent
 python -m uvicorn outreach.api:app --app-dir src --reload --port 8001
 cd Research_Agent
 python -m uvicorn csg.api:app --app-dir src --reload --port 8000

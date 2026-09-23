@@ -1,0 +1,26 @@
+[project]
+name = "csg-server"
+version = "0.1.0"
+description = "Single-port composition layer: mounts the Research Agent and Outreach Agent FastAPI apps under one uvicorn process. No business logic lives here -- see Research_Agent/ and Outreach_Agent/ for that."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    # The composed apps themselves -- installed editable from their own
+    # directories so this is the single venv that can run both.
+    "csg-agents",
+    "csg-outreach-agent",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+include = ["app.py"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

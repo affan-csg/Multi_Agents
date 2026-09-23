@@ -128,10 +128,15 @@ Outreach Agent — imported as prospects and drafted into a campaign. See
 **Outreach hand-off** below; this never sends anything, and never happens on
 the CLI path.
 
-**Web app** (two processes, each in its own terminal): this agent has no
-frontend of its own — its pages (Runs, Companies, Company Detail, Saved,
-Contacts, Analytics, Settings) live in the shared [Dashboard](../Dashboard)
-app alongside every other agent.
+**Web app**: this agent has no frontend of its own — its pages (Runs,
+Companies, Company Detail, Saved, Contacts, Analytics, Settings) live in the
+shared [Dashboard](../Dashboard) app alongside every other agent. This
+backend is normally run together with the Outreach Agent through the
+[Server](../Server) single-port composition layer, reachable at
+`http://127.0.0.1:8000/research` — see [Server/README.md](../Server/README.md)
+for setup and the run command. This section covers running it **standalone**
+instead, on its own port, e.g. for isolated debugging:
+
 ```
 # Terminal 1 -- this backend, http://127.0.0.1:8000 (run from this directory)
 python -m uvicorn csg.api:app --app-dir src --reload --port 8000
@@ -156,10 +161,10 @@ valid command separator — run each command on its own line, or use `;`, not
 `&&`, if you want to chain them.
 
 Leave the backend running in its own terminal; the Dashboard proxies
-nothing — it calls `http://127.0.0.1:8000` directly, so both must be up at
-once (see Dashboard's `VITE_RESEARCH_API_BASE` in its `.env.example` if you
-need to point it elsewhere). Port 8000 is not just a suggestion here — the
-Dashboard's default expects Research on that exact port.
+nothing — it calls the base URL in `VITE_RESEARCH_API_BASE` directly (see
+Dashboard's `.env.example`), so both must be up at once. Running standalone
+this way means pointing that var at `http://127.0.0.1:8000` (no `/research`
+suffix) instead of the single-port server's default.
 
 The Research runs page is a region picker and a Start button — the embedded ICP
 does the rest. You can optionally name a run (e.g. "Georgia Q4") so it's easy to find later —
@@ -193,8 +198,10 @@ rather than requiring a whole new run. See
 
 ## Outreach hand-off
 
-Set `OUTREACH_API_BASE` (`.env`, e.g. `http://127.0.0.1:8001`) to
-automatically connect a run's results to the [Outreach Agent](../Outreach_Agent).
+Set `OUTREACH_API_BASE` (`.env`, e.g. `http://127.0.0.1:8000/outreach` when
+running through the [single-port server](../Server), or
+`http://127.0.0.1:8001` when running Outreach standalone) to automatically
+connect a run's results to the [Outreach Agent](../Outreach_Agent).
 When it's set, every run started via `POST /discover` (the Dashboard) does
 this automatically once qualify + contacts finish for the run's Tier A/B
 companies:
