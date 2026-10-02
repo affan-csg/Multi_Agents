@@ -105,6 +105,9 @@ class Config:
         icp.yaml, same convention as Outreach's own RESEARCH_API_BASE. None
         (unset) means no Outreach Agent is configured; the hand-off is then
         skipped entirely rather than failing the research run."""
+        service_url = os.environ.get("OUTREACH_SERVICE_URL")
+        if service_url:
+            return f"{service_url.rstrip('/')}/outreach"
         return os.environ.get("OUTREACH_API_BASE") or self.outreach.get("api_base")
 
     @property

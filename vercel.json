@@ -1,0 +1,57 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "dashboard": {
+      "root": "Dashboard",
+      "framework": "vite"
+    },
+    "outreach_agent": {
+      "root": "Outreach_Agent",
+      "framework": "fastapi",
+      "entrypoint": "vercel_app:app",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "research_agent",
+          "format": "url",
+          "env": "RESEARCH_SERVICE_URL"
+        }
+      ]
+    },
+    "research_agent": {
+      "root": "Research_Agent",
+      "framework": "fastapi",
+      "entrypoint": "vercel_app:app",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "outreach_agent",
+          "format": "url",
+          "env": "OUTREACH_SERVICE_URL"
+        }
+      ]
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/research/(.*)",
+      "destination": { "service": "research_agent" }
+    },
+    {
+      "source": "/research",
+      "destination": { "service": "research_agent" }
+    },
+    {
+      "source": "/outreach/(.*)",
+      "destination": { "service": "outreach_agent" }
+    },
+    {
+      "source": "/outreach",
+      "destination": { "service": "outreach_agent" }
+    },
+    {
+      "source": "/(.*)",
+      "destination": { "service": "dashboard" }
+    }
+  ]
+}

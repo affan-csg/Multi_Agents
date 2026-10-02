@@ -33,6 +33,9 @@ class Config:
 
     @property
     def research_api_base(self) -> str:
+        service_url = os.environ.get("RESEARCH_SERVICE_URL")
+        if service_url:
+            return f"{service_url.rstrip('/')}/research"
         # Env var wins over the committed config, so a dev/prod split never
         # needs an outreach.yaml edit.
         return os.environ.get("RESEARCH_API_BASE") or self.research["api_base"]

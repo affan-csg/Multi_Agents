@@ -17,12 +17,12 @@ export const AGENTS: AgentInfo[] = [
   {
     id: "research",
     label: "Research Agent",
-    baseUrl: import.meta.env.VITE_RESEARCH_API_BASE || "http://127.0.0.1:8000/research",
+    baseUrl: import.meta.env.VITE_RESEARCH_API_BASE || `${import.meta.env.DEV ? "http://127.0.0.1:8000" : ""}/research`,
   },
   {
     id: "outreach",
     label: "Outreach Agent",
-    baseUrl: import.meta.env.VITE_OUTREACH_API_BASE || "http://127.0.0.1:8000/outreach",
+    baseUrl: import.meta.env.VITE_OUTREACH_API_BASE || `${import.meta.env.DEV ? "http://127.0.0.1:8000" : ""}/outreach`,
   },
 ];
 
