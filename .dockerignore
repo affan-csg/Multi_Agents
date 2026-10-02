@@ -1,0 +1,39 @@
+.git
+.gitignore
+.github
+
+# Frontend / Node
+node_modules
+**/node_modules
+Dashboard
+
+# Python
+venv
+.venv
+**/venv
+**/.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+build
+dist
+
+# Secrets and local config
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Misc
+.vscode
+.idea
+.DS_Store
+*.log
+run.txt
+vercel.json
+.vercel
