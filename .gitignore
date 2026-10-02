@@ -36,3 +36,7 @@ npm-debug.log*
 # Scratch space used by Claude Code sessions working in this repo
 scratchpad/
 .claude/
+
+brag-output-ProductDemo
+brag-output-ProductOverview
+brag-output-SalesDemo

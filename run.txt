@@ -7,6 +7,11 @@ python -m venv .venv
 pip install -e Research_Agent -e Outreach_Agent -e Server
 python -m uvicorn app:app --app-dir Server --reload --port 8000
 
+
+python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
+
+
+
 # Both agents, served through one port (recommended -- see Server/app.py):
 python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
 # Research Agent routes:  http://127.0.0.1:8000/research/...
