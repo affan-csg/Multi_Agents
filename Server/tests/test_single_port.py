@@ -152,6 +152,20 @@ def test_cors_preflight_allows_local_dev_origin(client, prefix):
     assert resp.headers.get("access-control-allow-origin") == "http://localhost:5173"
 
 
+@pytest.mark.parametrize("prefix", ["/research/regions", "/outreach/calendly/status"])
+def test_cors_preflight_allows_vercel_origin(client, prefix):
+    origin = "https://multi-agents-beta.vercel.app"
+    resp = client.options(
+        prefix,
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert resp.status_code in (200, 204)
+    assert resp.headers.get("access-control-allow-origin") == origin
+
+
 # ---------------------------------------------------------------------------
 # Calendly webhook: root alias + prefixed path both reach the same handler
 # ---------------------------------------------------------------------------

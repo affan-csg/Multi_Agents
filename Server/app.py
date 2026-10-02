@@ -43,6 +43,7 @@ from typing import AsyncIterator
 
 from dotenv import dotenv_values
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("csg_server")
 
@@ -155,6 +156,14 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="CSG Agents API", lifespan=_lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://multi-agents-beta.vercel.app"],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):5\d{3}",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.mount("/research", research_app)
 app.mount("/outreach", outreach_app)
