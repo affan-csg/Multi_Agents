@@ -781,8 +781,8 @@ def get_settings() -> dict[str, Any]:
             key_status("GROQ_API_KEY"),
             key_status("TAVILY_API_KEY"),
             key_status("HUNTER_API_KEY"),
-            key_status("SUPABASE_URL"),
-            key_status("SUPABASE_SERVICE_KEY"),
+            key_status("RESEARCH_SUPABASE_URL"),
+            key_status("RESEARCH_SUPABASE_SERVICE_KEY"),
         ],
     }
 

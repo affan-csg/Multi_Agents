@@ -86,7 +86,7 @@ theoretical one.
    pip install -e .
    ```
 2. **Environment**: copy `.env.example` to `.env` and fill in:
-   - `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` — required for everything. Get
+  - `OUTREACH_SUPABASE_URL` / `OUTREACH_SUPABASE_SERVICE_KEY` — required for everything. Get
      these from **this** Outreach project's Supabase Settings → API page —
      not the Research Agent's project.
    - `RESEARCH_API_BASE` — where the Research Agent's backend is running

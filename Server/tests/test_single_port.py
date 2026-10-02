@@ -178,7 +178,7 @@ def test_calendly_webhook_root_alias_reachable(client, monkeypatch):
 # derivation logic and the fallback each db.connect() got)
 # ---------------------------------------------------------------------------
 
-# These three call the real connect() (not the autouse _stub_both_dbs fake)
+# These call the real connect() (not the autouse _stub_both_dbs fake)
 # to verify env-var resolution order itself, so they import it fresh under
 # a different name before the module-level `research_db.connect` /
 # `outreach_db.connect` attributes get monkeypatched by the autouse fixture.
@@ -204,9 +204,8 @@ def test_outreach_db_connect_prefers_scoped_var(monkeypatch):
     assert conn.base.startswith("https://outreach-only.supabase.co")
 
 
-def test_db_connect_still_falls_back_to_unscoped_var_when_unset(monkeypatch):
-    """Standalone use (no Server/app.py involved) must keep working exactly
-    as before: only the old SUPABASE_URL/SUPABASE_SERVICE_KEY are set."""
+def test_db_connect_rejects_unscoped_vars_when_scoped_vars_are_unset(monkeypatch):
+    """Legacy shared names must never select a database for either agent."""
     for scoped in (
         "RESEARCH_SUPABASE_URL", "RESEARCH_SUPABASE_SERVICE_KEY",
         "OUTREACH_SUPABASE_URL", "OUTREACH_SUPABASE_SERVICE_KEY",
@@ -215,8 +214,10 @@ def test_db_connect_still_falls_back_to_unscoped_var_when_unset(monkeypatch):
     monkeypatch.setenv("SUPABASE_URL", "https://only-unscoped.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_KEY", "unscoped-key")
 
-    assert _real_research_connect().base.startswith("https://only-unscoped.supabase.co")
-    assert _real_outreach_connect().base.startswith("https://only-unscoped.supabase.co")
+    with pytest.raises(research_db.SupabaseError):
+        _real_research_connect()
+    with pytest.raises(outreach_db.SupabaseError):
+        _real_outreach_connect()
 
 
 def test_configure_env_sets_prefixed_cross_agent_bases(tmp_path, monkeypatch):
@@ -234,14 +235,14 @@ def test_configure_env_sets_prefixed_cross_agent_bases(tmp_path, monkeypatch):
     research_env = tmp_path / "research.env"
     outreach_env = tmp_path / "outreach.env"
     research_env.write_text(
-        "SUPABASE_URL=https://r.supabase.co\n"
-        "SUPABASE_SERVICE_KEY=r-key\n"
+        "RESEARCH_SUPABASE_URL=https://r.supabase.co\n"
+        "RESEARCH_SUPABASE_SERVICE_KEY=r-key\n"
         "OUTREACH_API_BASE=http://127.0.0.1:8001\n",  # hand-off WAS configured
         encoding="utf-8",
     )
     outreach_env.write_text(
-        "SUPABASE_URL=https://o.supabase.co\n"
-        "SUPABASE_SERVICE_KEY=o-key\n",
+        "OUTREACH_SUPABASE_URL=https://o.supabase.co\n"
+        "OUTREACH_SUPABASE_SERVICE_KEY=o-key\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(server_app, "RESEARCH_ENV", research_env)
@@ -255,9 +256,8 @@ def test_configure_env_sets_prefixed_cross_agent_bases(tmp_path, monkeypatch):
     # Hand-off stays enabled (was configured in Research's .env), but now
     # points at this server's own prefix instead of the old standalone :8001.
     assert os.environ["OUTREACH_API_BASE"] == "http://127.0.0.1:8000/outreach"
-    # Unscoped SUPABASE_URL must NOT be republished from either .env -- that
-    # is exactly the collision this whole mechanism exists to prevent.
-    assert os.environ.get("SUPABASE_URL") not in ("https://r.supabase.co", "https://o.supabase.co")
+    assert os.environ["RESEARCH_SUPABASE_SERVICE_KEY"] == "r-key"
+    assert os.environ["OUTREACH_SUPABASE_SERVICE_KEY"] == "o-key"
 
 
 def test_configure_env_leaves_handoff_disabled_when_unconfigured(tmp_path, monkeypatch):
@@ -272,14 +272,39 @@ def test_configure_env_leaves_handoff_disabled_when_unconfigured(tmp_path, monke
 
     research_env = tmp_path / "research.env"
     outreach_env = tmp_path / "outreach.env"
-    research_env.write_text("SUPABASE_URL=https://r.supabase.co\nSUPABASE_SERVICE_KEY=r-key\n", encoding="utf-8")
-    outreach_env.write_text("SUPABASE_URL=https://o.supabase.co\nSUPABASE_SERVICE_KEY=o-key\n", encoding="utf-8")
+    research_env.write_text("RESEARCH_SUPABASE_URL=https://r.supabase.co\nRESEARCH_SUPABASE_SERVICE_KEY=r-key\n", encoding="utf-8")
+    outreach_env.write_text("OUTREACH_SUPABASE_URL=https://o.supabase.co\nOUTREACH_SUPABASE_SERVICE_KEY=o-key\n", encoding="utf-8")
     monkeypatch.setattr(server_app, "RESEARCH_ENV", research_env)
     monkeypatch.setattr(server_app, "OUTREACH_ENV", outreach_env)
 
     server_app._configure_env()
 
     assert "OUTREACH_API_BASE" not in os.environ
+
+
+def test_configure_env_preserves_render_supabase_values(tmp_path, monkeypatch):
+    for var in (
+        "RESEARCH_SUPABASE_URL", "RESEARCH_SUPABASE_SERVICE_KEY",
+        "OUTREACH_SUPABASE_URL", "OUTREACH_SUPABASE_SERVICE_KEY",
+        "RESEARCH_API_BASE", "OUTREACH_API_BASE", "CSG_API_BASE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("RESEARCH_SUPABASE_URL", "https://render-research.supabase.co")
+    monkeypatch.setenv("RESEARCH_SUPABASE_SERVICE_KEY", "render-research-key")
+    monkeypatch.setenv("OUTREACH_SUPABASE_URL", "https://render-outreach.supabase.co")
+    monkeypatch.setenv("OUTREACH_SUPABASE_SERVICE_KEY", "render-outreach-key")
+
+    research_env = tmp_path / "research.env"
+    outreach_env = tmp_path / "outreach.env"
+    research_env.write_text("RESEARCH_SUPABASE_URL=https://file-research.supabase.co\n", encoding="utf-8")
+    outreach_env.write_text("OUTREACH_SUPABASE_URL=https://file-outreach.supabase.co\n", encoding="utf-8")
+    monkeypatch.setattr(server_app, "RESEARCH_ENV", research_env)
+    monkeypatch.setattr(server_app, "OUTREACH_ENV", outreach_env)
+
+    server_app._configure_env()
+
+    assert os.environ["RESEARCH_SUPABASE_URL"] == "https://render-research.supabase.co"
+    assert os.environ["OUTREACH_SUPABASE_URL"] == "https://render-outreach.supabase.co"
 
 
 def test_configure_env_warns_on_shared_key_mismatch(tmp_path, monkeypatch, caplog):
@@ -294,11 +319,11 @@ def test_configure_env_warns_on_shared_key_mismatch(tmp_path, monkeypatch, caplo
     research_env = tmp_path / "research.env"
     outreach_env = tmp_path / "outreach.env"
     research_env.write_text(
-        "SUPABASE_URL=https://r.supabase.co\nSUPABASE_SERVICE_KEY=r-key\nGEMINI_API_KEY=key-a\n",
+        "RESEARCH_SUPABASE_URL=https://r.supabase.co\nRESEARCH_SUPABASE_SERVICE_KEY=r-key\nGEMINI_API_KEY=key-a\n",
         encoding="utf-8",
     )
     outreach_env.write_text(
-        "SUPABASE_URL=https://o.supabase.co\nSUPABASE_SERVICE_KEY=o-key\nGEMINI_API_KEY=key-b\n",
+        "OUTREACH_SUPABASE_URL=https://o.supabase.co\nOUTREACH_SUPABASE_SERVICE_KEY=o-key\nGEMINI_API_KEY=key-b\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(server_app, "RESEARCH_ENV", research_env)

@@ -38,7 +38,7 @@ See [WORKFLOW.md](WORKFLOW.md) for how the pipeline works end to end.
    pip install -e .
    ```
 2. **Environment**: copy `.env.example` to `.env` and fill in:
-   - `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` — required for everything.
+  - `RESEARCH_SUPABASE_URL` / `RESEARCH_SUPABASE_SERVICE_KEY` — required for everything.
    - `GEMINI_API_KEY` — **required for `csg discover`** (company discovery and
      firmographic research). Also used by `csg qualify`.
      **Multi-key failover**: add `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`, etc.
@@ -351,7 +351,7 @@ below for the current live-run status.
 `CREATE TABLE IF NOT EXISTS` only affects a brand-new Supabase project — it
 does not retroactively alter tables that already exist. Schema changes on an
 already-provisioned project need `ALTER TABLE` statements, pasted into the
-Supabase SQL editor by hand (the `SUPABASE_SERVICE_KEY` used everywhere else
+Supabase SQL editor by hand (the `RESEARCH_SUPABASE_SERVICE_KEY` used everywhere else
 is a PostgREST REST key, not a Postgres connection string, so nothing here can
 run DDL for you).
 

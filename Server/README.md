@@ -19,16 +19,12 @@ and `/outreach`, instead of two separate ports (`:8000` and `:8001`).
 
 ## What stays separate
 
-- **Databases.** Research and Outreach keep their own Supabase projects.
-  Both agents' `db.connect()` read `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` by
-  name — if this server just merged both `.env` files into one process's
-  environment, whichever was set last would silently win for *both* agents.
-  Instead, `app.py` reads each agent's own `.env` itself and republishes
-  those two values as `RESEARCH_SUPABASE_URL`/`RESEARCH_SUPABASE_SERVICE_KEY`
-  and `OUTREACH_SUPABASE_URL`/`OUTREACH_SUPABASE_SERVICE_KEY`. Each agent's
-  `db.connect()` tries its scoped name first, falling back to the old
-  unscoped name — the fallback is what keeps each agent's own standalone
-  run, CLI, and test suite working with zero changes.
+- **Databases.** Research and Outreach keep their own Supabase projects and
+  use only `RESEARCH_SUPABASE_URL`/`RESEARCH_SUPABASE_SERVICE_KEY` and
+  `OUTREACH_SUPABASE_URL`/`OUTREACH_SUPABASE_SERVICE_KEY`, respectively.
+  `app.py` reads these names from each agent's own `.env` without merging
+  credentials. Render may provide the same four variables directly; process
+  environment values take precedence over `.env` values.
 - **Code.** Nothing under `Research_Agent/src/csg/` or
   `Outreach_Agent/src/outreach/` was restructured. The only edits outside
   this directory are the one-line scoped-var fallback in each agent's own
@@ -54,6 +50,21 @@ and point at `Research_Agent`/`Outreach_Agent`/`Server`.)
 Each agent's own `.env` still lives in its own project directory
 (`Research_Agent/.env`, `Outreach_Agent/.env`) — nothing moves. Fill them in
 per each project's own `.env.example`; this server reads both at startup.
+
+For a combined Render service running `Server/app.py`, configure these four
+environment variables in the Render service settings, using each project's
+own Supabase URL and service-role key:
+
+```
+RESEARCH_SUPABASE_URL
+RESEARCH_SUPABASE_SERVICE_KEY
+OUTREACH_SUPABASE_URL
+OUTREACH_SUPABASE_SERVICE_KEY
+```
+
+For separate Render services, set only the matching pair on each agent
+service. Do not configure the legacy shared `SUPABASE_URL` or
+`SUPABASE_SERVICE_KEY` names.
 
 ## Run
 
@@ -95,9 +106,9 @@ cd Outreach_Agent
 python -m uvicorn outreach.api:app --app-dir src --reload --port 8001
 ```
 
-In that mode each agent reads the plain `SUPABASE_URL`/`SUPABASE_SERVICE_KEY`
-from its own `.env` (the scoped `RESEARCH_SUPABASE_*`/`OUTREACH_SUPABASE_*`
-names are unset, so the fallback applies), and `OUTREACH_API_BASE` /
+In that mode each agent reads its own scoped Supabase variables from its
+`.env`; use the same scoped variable names in that agent's Render environment.
+`OUTREACH_API_BASE` /
 `RESEARCH_API_BASE` should point at whatever port the other agent is
 actually running on (see each project's `.env.example`).
 

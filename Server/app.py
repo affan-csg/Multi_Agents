@@ -5,26 +5,20 @@ Agent's app (outreach.api:app) at /outreach onto one FastAPI instance, so
 both run under one uvicorn process/port instead of two. This file is pure
 composition/port-routing -- no business logic, no route handlers, no model
 changes. Both agents' code, databases, and API behavior are otherwise
-untouched; see db.py in each agent for the one shared change this required
-(a scoped-env-var fallback, described below).
+untouched; each database uses its own scoped environment variables.
 
 Why this file has to run before either agent is imported
 ----------------------------------------------------------
 Both `csg.config` and `outreach.config` call `load_dotenv(PROJECT_ROOT/.env)`
-at import time, into the same process-wide `os.environ`. Loaded that way,
-both agents' `db.connect()` would read the same unscoped `SUPABASE_URL` /
-`SUPABASE_SERVICE_KEY` names -- but the two projects' `.env` files hold
-different Supabase projects, and merging their databases is explicitly out
-of scope. So this module:
+at import time, into the same process-wide `os.environ`. The two projects'
+`.env` files hold different Supabase projects, and merging their databases
+is explicitly out of scope. So this module:
 
 1. Reads each agent's own `.env` file itself (via `dotenv_values`, which
-   does NOT touch `os.environ`) and republishes those two values under
-   `RESEARCH_SUPABASE_*` / `OUTREACH_SUPABASE_*` -- names only this file
-   introduces. `Research_Agent/src/csg/db.py` and
-   `Outreach_Agent/src/outreach/db.py` each try their scoped name first and
-   fall back to the old unscoped `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` --
-   the fallback is what keeps each agent's own standalone uvicorn run, CLI,
-   and existing test suite working unchanged.
+    does NOT touch `os.environ`) and publishes the already-scoped
+    `RESEARCH_SUPABASE_*` / `OUTREACH_SUPABASE_*` values. Render can provide
+    all four variables directly in the process environment, which take
+    precedence over these files.
 2. Points each agent's cross-agent HTTP base (`OUTREACH_API_BASE` read by
    Research, `RESEARCH_API_BASE` read by Outreach) at this same server's own
    prefixed paths, so the existing hand-off code (discover.py's
@@ -76,10 +70,10 @@ def _configure_env() -> None:
     research_env = dotenv_values(RESEARCH_ENV) if RESEARCH_ENV.exists() else {}
     outreach_env = dotenv_values(OUTREACH_ENV) if OUTREACH_ENV.exists() else {}
 
-    _set_default("RESEARCH_SUPABASE_URL", research_env.get("SUPABASE_URL"))
-    _set_default("RESEARCH_SUPABASE_SERVICE_KEY", research_env.get("SUPABASE_SERVICE_KEY"))
-    _set_default("OUTREACH_SUPABASE_URL", outreach_env.get("SUPABASE_URL"))
-    _set_default("OUTREACH_SUPABASE_SERVICE_KEY", outreach_env.get("SUPABASE_SERVICE_KEY"))
+    _set_default("RESEARCH_SUPABASE_URL", research_env.get("RESEARCH_SUPABASE_URL"))
+    _set_default("RESEARCH_SUPABASE_SERVICE_KEY", research_env.get("RESEARCH_SUPABASE_SERVICE_KEY"))
+    _set_default("OUTREACH_SUPABASE_URL", outreach_env.get("OUTREACH_SUPABASE_URL"))
+    _set_default("OUTREACH_SUPABASE_SERVICE_KEY", outreach_env.get("OUTREACH_SUPABASE_SERVICE_KEY"))
 
     # Also republish each agent's own other .env values (Gemini/Anthropic/
     # SMTP/etc keys) into os.environ so this single process has everything
@@ -89,8 +83,6 @@ def _configure_env() -> None:
     # .env load would supply them).
     for env in (research_env, outreach_env):
         for key, value in env.items():
-            if key in ("SUPABASE_URL", "SUPABASE_SERVICE_KEY"):
-                continue  # deliberately NOT republished unscoped -- see module docstring
             _set_default(key, value)
 
     for key in _SHARED_KEY_NAMES:
