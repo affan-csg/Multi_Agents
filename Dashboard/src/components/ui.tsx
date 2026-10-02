@@ -128,7 +128,7 @@ export function StatCard({
   icon: IconName;
   tone: "accent" | "mint" | "violet" | "amber";
   value: ReactNode;
-  label: string;
+  label: ReactNode;
   compact?: boolean;
 }) {
   return (
