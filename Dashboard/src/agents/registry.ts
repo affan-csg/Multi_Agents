@@ -11,18 +11,25 @@ export interface AgentInfo {
   baseUrl: string;
 }
 
-// Vite env vars (VITE_*) let each deployment point at different hosts/ports
-// without a code change -- see .env.example.
+// VITE_API_URL is the backend origin. Local development defaults to the
+// combined local API server; production must provide an explicit backend.
+const API_URL = import.meta.env.VITE_API_URL?.replace(/\/+$/, "") ||
+  (import.meta.env.DEV ? "http://127.0.0.1:8000" : "");
+
+if (!API_URL) {
+  throw new Error("VITE_API_URL must be configured for production builds.");
+}
+
 export const AGENTS: AgentInfo[] = [
   {
     id: "research",
     label: "Research Agent",
-    baseUrl: import.meta.env.VITE_RESEARCH_API_BASE || `${import.meta.env.DEV ? "http://127.0.0.1:8000" : ""}/research`,
+    baseUrl: `${API_URL}/research`,
   },
   {
     id: "outreach",
     label: "Outreach Agent",
-    baseUrl: import.meta.env.VITE_OUTREACH_API_BASE || `${import.meta.env.DEV ? "http://127.0.0.1:8000" : ""}/outreach`,
+    baseUrl: `${API_URL}/outreach`,
   },
 ];
 

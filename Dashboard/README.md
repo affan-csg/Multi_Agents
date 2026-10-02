@@ -49,11 +49,10 @@ python -m uvicorn app:app --app-dir ../Server --reload --reload-dir ../Research_
 ```
 
 which serves Research at `:8000/research` and Outreach at `:8000/outreach`
-— matching this app's `.env.example` defaults. Running an agent standalone
-on its own port instead (e.g. `:8000` for Research, `:8001` for Outreach —
-see [Server/README.md](../Server/README.md#running-an-agent-standalone))
-means updating `VITE_RESEARCH_API_BASE`/`VITE_OUTREACH_API_BASE` in this
-app's `.env` to match.
+— matching this app's `.env.example` default. For deployment, set
+`VITE_API_URL` in the hosting environment to the backend origin; Vercel
+builds then send API requests to that origin under `/research` and
+`/outreach`.
 
 Use `python -m uvicorn ...`, not the bare `uvicorn` command — on Windows, a
 venv's `uvicorn.exe` launcher hardcodes an absolute path to `python.exe` at
