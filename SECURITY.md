@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in this project, please email `justkhanj@gmail.com` with:
+If you discover a security vulnerability in this project, please email `justkhan010@gmail.com` with:
 
 1. A description of the vulnerability
 2. Steps to reproduce (if applicable)

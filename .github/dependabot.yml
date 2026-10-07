@@ -9,8 +9,6 @@ updates:
       time: "03:00"
     allow:
       - dependency-type: "all"
-    reviewers:
-      - "justkhanj"
     labels:
       - "dependencies"
       - "python"
@@ -24,8 +22,6 @@ updates:
       time: "03:00"
     allow:
       - dependency-type: "all"
-    reviewers:
-      - "justkhanj"
     labels:
       - "dependencies"
       - "python"
@@ -39,8 +35,6 @@ updates:
       time: "03:00"
     allow:
       - dependency-type: "all"
-    reviewers:
-      - "justkhanj"
     labels:
       - "dependencies"
       - "python"
@@ -54,8 +48,6 @@ updates:
       time: "04:00"
     allow:
       - dependency-type: "all"
-    reviewers:
-      - "justkhanj"
     labels:
       - "dependencies"
       - "javascript"
