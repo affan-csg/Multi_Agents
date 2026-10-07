@@ -48,28 +48,27 @@ See each project's README for environment variable setup:
 All tests run offline against an in-memory PostgREST fixture — no live database or API keys needed.
 
 ```bash
-# Research Agent (299+ tests)
+# Research Agent (323 tests)
 cd Research_Agent && pytest
 
-# Outreach Agent (592+ tests: Outreach + Conversation + Learning + Optimization)
+# Outreach Agent (724 tests: Outreach + Conversation + Learning + Optimization + Calendly + Automation + Analytics)
 cd Outreach_Agent && pytest
 
-# Server (composition layer tests)
+# Server (composition layer tests; needs all three packages installed in the active venv)
 cd Server && pytest
 
 # Dashboard (TypeScript type checking)
 cd Dashboard && npx tsc -b --noEmit
 ```
 
-Or run all via CI:
-```bash
-.github/workflows/ci.yml  # Runs on push to main and PRs
-```
+Or `make test` runs all of the above. CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same four jobs on push to `main` and on PRs (Python 3.11, Node 20; the Dashboard typecheck step is currently `continue-on-error`).
+
+The in-memory fake PostgREST used by the suites lives in `Outreach_Agent/tests/conftest.py` and, for Research, `Research_Agent/tests/test_db_roundtrip.py` (Research has no `conftest.py`).
 
 ## Code style & conventions
 
 - **Python**: Follow PEP 8. Type hints are expected. Use `pytest` for tests.
-- **TypeScript/React**: Run `tsc` to catch type errors. Follow existing patterns in `src/agents/` and `src/pages/`.
+- **TypeScript/React**: Run `npx tsc -b --noEmit` to catch type errors (`npm run lint` runs oxlint). Follow existing patterns in `src/agents/` and `src/pages/`. The Makefile has no formatter configured.
 - **SQL**: Migrations go in `*/migrations/` numbered sequentially; `schema.sql` is the complete current schema.
 
 ## Project boundaries
@@ -77,7 +76,7 @@ Or run all via CI:
 Each agent is **completely independent**:
 - **Research Agent** (`Research_Agent/`): Discovery, scoring, qualification, contacts. Uses its own Supabase project.
 - **Outreach Agent** (`Outreach_Agent/`): Campaign building, email drafting, sending, conversation (replies/follow-ups), learning & optimization. Uses its own Supabase project. Calls Research's API to fetch prospect data.
-- **Server** (`Server/`): Mounts both agents' FastAPI apps under one process on one port. No business logic.
+- **Server** (`Server/`): Mounts both agents' FastAPI apps under one process on one port. No business logic — only composition, dashboard password auth (`DASHBOARD_PASSWORD`), CORS, and the opt-in background scheduler lifespan.
 - **Dashboard** (`Dashboard/`): React/Vite UI. Calls both agents' APIs directly from the browser. No backend or database.
 
 **Do not**:
@@ -91,7 +90,7 @@ Each agent is **completely independent**:
 
 1. **Clarify scope**: Is it Research, Outreach, Dashboard, or multi-agent?
 2. **Add tests first** (or alongside). Both agents' test suites are comprehensive and run offline.
-3. **Update schemas** if you add/modify database tables (edit `schema.sql` and create a migration in `migrations/NNN_*.sql`).
+3. **Update schemas** if you add/modify database tables (edit `schema.sql` and create a migration in `migrations/NNN_*.sql`). Research migrations are 001-005; Outreach uses 001-010, 014, 014b (011-013 were folded into `schema.sql`) — pick the next free number.
 4. **Update READMEs** for user-facing changes (setup, CLI commands, config options, deployment).
 
 ### Database changes
@@ -111,7 +110,9 @@ The workflow in `.github/workflows/ci.yml` runs tests for each agent independent
 - Each agent and the Dashboard can be deployed independently.
 - Research and Outreach use their own Supabase projects — configure environment variables per project.
 - The Server needs all four Supabase env vars (both projects' URLs and service keys) to run.
-- Dashboard's `VITE_API_URL` points to the backend origin (defaults to `:8000` for local dev).
+- The Server also needs `DASHBOARD_PASSWORD` (login; unset = 503 on protected routes) and optionally `AUTO_SYNC_ENABLED=true` for background polling.
+- Dashboard's `VITE_API_URL` points to the backend origin (defaults to `:8000` for local dev; required for production builds). A non-default Dashboard origin must be added to `allow_origins` in `Server/app.py`.
+- See [DEPLOYMENT.md](DEPLOYMENT.md) for the Docker, Vercel and standalone options.
 
 See [Server/README.md#setup](Server/README.md#setup) for production environment variable names.
 

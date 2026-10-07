@@ -2,14 +2,14 @@
 
 Three independent projects that together run CSG's prospecting → outreach
 pipeline, plus one shared dashboard to operate them. Research and Outreach
-are served through **one backend port** (see [Server](#server-single-port-composition)
+are served through **one backend port** (see [Server](Server/README.md)
 below); the Dashboard is still its own dev server.
 
 | Project | What it does | Reached at |
 |---|---|---|
-| [Research_Agent](Research_Agent/README.md) | Discovers US companies, scores/tiers them as staffing prospects, finds contacts, and (optionally) runs an LLM qualification pass (`csg qualify`). | `:8000/research` |
-| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent** (replies/follow-ups after send), the **Feedback Learning / Optimization Agent** (learns from performance, edits, outcomes; feeds insights back into drafts), and the **Analytics Dashboard** (multi-account, multi-campaign, per-sender analytics with drill-down). | `:8000/outreach` |
-| [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser. No database or backend of its own. Includes a dedicated Learning & Optimization tab under Outreach Agent. | `:5173` |
+| [Research_Agent](Research_Agent/README.md) | Discovers US companies, scores/tiers them as staffing prospects, never re-processes a company it has already seen (global de-duplication), finds contacts, and (optionally) runs an LLM qualification pass (`csg qualify`). | `:8000/research` |
+| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent** (replies/follow-ups after send), the **Feedback Learning / Optimization Agent** (learns from performance, edits, outcomes; feeds insights back into drafts), the **Calendly** integration, **automatic polling** (inbox + Calendly sync + follow-ups on a schedule), and the **Analytics Dashboard** (multi-account, multi-campaign, per-sender analytics with drill-down). | `:8000/outreach` |
+| [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser behind a password screen. No database or backend of its own. Includes a dedicated Learning & Optimization tab under Outreach Agent. | `:5173` |
 
 ```
                     ┌────────────────────────────────────────────────────────────┐
@@ -30,17 +30,18 @@ below); the Dashboard is still its own dev server.
 `/research` and `/outreach` are two separate FastAPI apps (separate code,
 separate Supabase projects, separate business logic) mounted onto one parent
 app by [Server/app.py](Server/app.py) — a composition layer with no business
-logic of its own. Each agent can still be run standalone on its own port
+logic of its own (it only adds dashboard password auth, CORS, the optional
+background scheduler, and a root alias for the Calendly webhook). Each agent can still be run standalone on its own port
 (`:8000` / `:8001`) exactly as before; see
 [Server/README.md](Server/README.md#running-an-agent-standalone).
 
-Inside the Outreach Agent process, two more sibling layers sit alongside the
+Inside the Outreach Agent process (`:8000/outreach`, or `:8001` standalone), two more sibling layers sit alongside the
 Conversation Agent — both read-only against outcomes, never in the request
 path of import/draft/send itself:
 
 ```
 +-------------------------------------------------------------+
-|   Outreach Agent :8001                                      |
+|   Outreach Agent                                            |
 |                                                             |
 |   outreach_items / conversation_messages  (read by both)    |
 |               |                          |                  |
@@ -98,9 +99,11 @@ cd Dashboard
 npm run dev
 ```
 
-`--port 8000` is not optional — the Dashboard's `VITE_RESEARCH_API_BASE` /
-`VITE_OUTREACH_API_BASE` default to `:8000/research` and `:8000/outreach`
-specifically. Use `python -m uvicorn ...`, not the bare `uvicorn` command —
+`--port 8000` is not optional — the Dashboard's `VITE_API_URL` defaults to
+`http://127.0.0.1:8000` in dev and appends `/research` and `/outreach`.
+Set `DASHBOARD_PASSWORD` (in `Server/.env` or the shell) before starting: it
+is the Dashboard login password, and with it unset every protected route
+returns 503 (fail closed). Use `python -m uvicorn ...`, not the bare `uvicorn` command —
 on Windows, a venv's `uvicorn.exe` launcher hardcodes an absolute path to
 `python.exe` at creation time, so a venv folder moved/renamed after
 `pip install` breaks it (`Fatal error in launcher: Unable to create
@@ -129,8 +132,12 @@ project — see each one's own README:
 
 ## How a company moves through the pipeline
 
-1. **Discover** (Research Agent) — pulls companies from configured sources
-   into a research run.
+1. **Discover** (Research Agent) — Gemini grounded search (falling back to
+   Tavily + Groq when every Gemini key is out of quota) finds companies in the
+   chosen region and researches their firmographics. Each candidate is checked
+   against every company already stored (normalized domain, then normalized
+   name); a match is listed in the run as "Already exists" but is not
+   re-inserted, re-scored or re-handed to Outreach.
 2. **Score / tier** (Research Agent) — rules-based scoring assigns a tier
    (A/B/C/D). `csg qualify` is a separate, optional LLM pass that adds a
    `pain_summary`/`recommended_angle` on top of a tier — it can lag behind or
@@ -172,6 +179,8 @@ project — see each one's own README:
    sent once a card lands there. It is **off by default per campaign**, and
    even when on it only *drafts* outgoing email unless `auto_reply` is also
    enabled. With it off, those stages are moved by hand exactly as before.
+   Replies are checked by the Dashboard button / CLI tick, or automatically
+   when `AUTO_SYNC_ENABLED=true` (see step 10).
    See
    [Outreach_Agent/README.md](Outreach_Agent/README.md#conversation-agent-agent-3).
 7. **Learn** (Feedback Learning Agent + Campaign-Level Optimization) —
@@ -205,16 +214,28 @@ project — see each one's own README:
    the [Calendly Integration](Outreach_Agent/README.md#calendly-integration)
    section.
 
+10. **Automate** (opt-in) — with `AUTO_SYNC_ENABLED=true` the Server runs a
+    background loop (`outreach.automation`) that, every
+    `AUTO_SYNC_INTERVAL_MINUTES` (default 30; afterwards the Dashboard /
+    `PATCH /outreach/automation/settings` wins), syncs Calendly, reads the
+    inbox once, ticks every campaign whose Conversation Agent is on, and
+    sends/drafts follow-ups. Timers and a lease live in the `automation_state`
+    table, so restarts and multiple replicas neither duplicate nor skip work.
+    A follow-up is only attempted when both the Calendly sync and the inbox
+    read succeeded. Off by default.
+
 ## Tests
 
 Both Python agents' suites run fully offline (a fake in-memory PostgREST
-fixture stands in for Supabase — see each project's `tests/conftest.py`),
-so no live database or API keys are needed to run them:
+fixture stands in for Supabase),
+so no live database or API keys are needed to run them (Research's fake lives
+in `tests/test_db_roundtrip.py`; Outreach's in `tests/conftest.py`):
 
 ```
-cd Research_Agent && pytest    # 299 passed
-cd Outreach_Agent  && pytest   # 592 passed (outreach + conversation + learning + optimization + Calendly)
-cd Server          && pytest   # single-port mounting, lifespans, WebSockets, CORS, DB isolation
+cd Research_Agent && pytest    # 323 tests (incl. global de-duplication)
+cd Outreach_Agent  && pytest   # 724 tests (outreach + conversation + learning + optimization + Calendly + automation + analytics)
+cd Server          && pytest   # single-port mounting, lifespans, WebSockets, CORS, auth, DB isolation
+                               # (needs all three packages installed: pip install -e Research_Agent -e Outreach_Agent -e Server)
 ```
 
 The Dashboard has no test suite; its guard rail is the TypeScript compiler:
@@ -228,9 +249,13 @@ in CI.
 
 ## Known limitations
 
-- Reply checking is manual (a button or a CLI tick) — the Conversation Agent
-  has no background poller yet, by design, until the flow has been exercised
-  against real mail.
+- Automatic polling (`AUTO_SYNC_ENABLED`) is off by default and runs inside
+  the Server process; a standalone Outreach process has no scheduler, so reply
+  checking there stays manual (Dashboard button / `outreach conversation tick`
+  / `outreach automation run-once`).
+- Dashboard authentication is a single shared password (`DASHBOARD_PASSWORD`)
+  enforced by the Server; there are no per-user accounts, and standalone
+  agent processes have no auth at all.
 - `POST /campaigns` has no server-side "one campaign per research run"
   guard; today's only two callers (the Dashboard form, and Research's
   automatic hand-off) each only call it once per run in practice, but
@@ -251,7 +276,10 @@ in CI.
   randomly assigned, so other differences between an adopting campaign and
   the comparison set (timing, ICP mix, sender) are not accounted for. Every
   such API response includes an explicit `causality_note` saying so.
-- The Dashboard has one pre-existing, unrelated TypeScript error in
-  `src/pages/research/UsageTab.tsx` (a JSX element assigned where a `string`
-  prop is expected) — tracked, not yet fixed; everything else type-checks
-  clean.
+- CI's Dashboard typecheck step is still marked `continue-on-error` for a
+  historical `UsageTab.tsx` error; `npx tsc -b --noEmit` currently passes
+  cleanly, so that flag can be dropped.
+- Research's de-duplication needs migration 005 on any existing Research
+  project, and name matching only applies to normalized names of 5+
+  characters. See
+  [Research_Agent/README.md](Research_Agent/README.md#global-company-de-duplication).

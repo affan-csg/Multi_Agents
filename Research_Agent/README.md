@@ -38,7 +38,7 @@ See [WORKFLOW.md](WORKFLOW.md) for how the pipeline works end to end.
    pip install -e .
    ```
 2. **Environment**: copy `.env.example` to `.env` and fill in:
-  - `RESEARCH_SUPABASE_URL` / `RESEARCH_SUPABASE_SERVICE_KEY` — required for everything.
+   - `RESEARCH_SUPABASE_URL` / `RESEARCH_SUPABASE_SERVICE_KEY` — required for everything.
    - `GEMINI_API_KEY` — **required for `csg discover`** (company discovery and
      firmographic research). Also used by `csg qualify`.
      **Multi-key failover**: add `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`, etc.
@@ -87,6 +87,8 @@ csg show <domain>                           # full scoring breakdown for one com
 csg qualify --run <run_id>                  # LLM pain summary + angle (costs tokens)
 csg contacts --run <run_id>                 # HR contact discovery via Hunter.io (costs quota)
 csg export --run <run_id>                   # re-export CSV/JSONL
+csg suppress <domain>                       # never process this domain (existing client / DNC)
+csg dedupe-report                           # read-only: list stored companies that look like duplicates
 ```
 
 **A qualification attempt is never silently dropped on failure.** Every
@@ -129,7 +131,8 @@ Outreach Agent — imported as prospects and drafted into a campaign. See
 the CLI path.
 
 **Web app**: this agent has no frontend of its own — its pages (Runs,
-Companies, Company Detail, Saved, Contacts, Analytics, Settings) live in the
+Companies, Company Detail, Saved, Contacts, Analytics, Settings — plus Excel and
+PDF-report downloads per run) live in the
 shared [Dashboard](../Dashboard) app alongside every other agent. This
 backend is normally run together with the Outreach Agent through the
 [Server](../Server) single-port composition layer, reachable at
@@ -161,10 +164,11 @@ valid command separator — run each command on its own line, or use `;`, not
 `&&`, if you want to chain them.
 
 Leave the backend running in its own terminal; the Dashboard proxies
-nothing — it calls the base URL in `VITE_RESEARCH_API_BASE` directly (see
-Dashboard's `.env.example`), so both must be up at once. Running standalone
-this way means pointing that var at `http://127.0.0.1:8000` (no `/research`
-suffix) instead of the single-port server's default.
+nothing — it calls `VITE_API_URL` + `/research` directly (see Dashboard's
+`.env.example`), so the backend must be up. A standalone Research process
+serves its routes at the root (no `/research` prefix), has no dashboard
+password auth, and so can't be used by the Dashboard without a proxy that
+adds the prefix — use the single-port server for normal Dashboard work.
 
 The Research runs page is a region picker and a Start button — the embedded ICP
 does the rest. You can optionally name a run (e.g. "Georgia Q4") so it's easy to find later —
@@ -270,9 +274,10 @@ drifts out of sync with what the agent actually searches for.
 pytest
 ```
 
-295 tests, no network and no LLM calls (HTTP boundaries are mocked with
-`httpx.MockTransport` or a fake fetcher/DB, not real calls) — the
-deterministic core and every provider integration is fully covered:
+323 tests (including 22 global de-duplication tests), no network and no LLM
+calls (HTTP boundaries are mocked with `httpx.MockTransport` or a fake
+fetcher/DB, not real calls) — the deterministic core and every provider
+integration is fully covered:
 
 - [test_scoring.py](tests/test_scoring.py) — scoring, tiering, financial
   strength, and the missing-data policy, including that a company whose job
@@ -340,11 +345,51 @@ deterministic core and every provider integration is fully covered:
   company's "Qualify with AI" button previously widening to the whole
   pending set), `GET /qualify/failed`, `POST /qualify/retry-failed`, and
   `company_detail`'s `qualification_attempt` field.
+- [test_dedupe.py](tests/test_dedupe.py) — global company de-duplication
+  (22 tests): domain/name normalization variants, existing-company lookup,
+  atomic claim-company (race-safe insert), end-to-end discovery with
+  existing/new/deleted company scenarios, concurrent runs, and the
+  complete flow: existing companies are matched but not inserted/scored/
+  handed to Outreach as duplicates, deletion is preserved, and re-running
+  the same run ID is idempotent.
 
 There is still no automated end-to-end test: a real run makes live HTTP calls
 to career sites and the Gemini API. See [WORKFLOW.md](WORKFLOW.md) for what a
 full run touches before wiring one up, and the **Known limitations** section
 below for the current live-run status.
+
+## Global company de-duplication
+
+A company that already exists is never duplicated across research runs. The
+same company under different domain strings (e.g., `company.com`,
+`https://www.Company.com/careers`, `company.com:443`) or similar names (e.g.,
+"Acme Inc." vs. "ACME Staffing LLC") is recognized as a match and reused
+without inserting, re-scoring, or handing off to Outreach a second time.
+
+**How it works:**
+- Each research run loads every existing company once (at start) and checks
+  each discovered candidate against it.
+- **Domain matching** — the primary key. Normalizes scheme, `www.`, port,
+  path/query/fragment, trailing dot, and case (see
+  [src/csg/dedupe.py](src/csg/dedupe.py) for the full algorithm).
+- **Name matching** — fallback when domain doesn't match but a company's
+  normalized name (case, accents, suffixes like "Inc" dropped) does, and the
+  name key is at least 5 characters long (too-short keys like "Ace Co" are
+  ignored to avoid false matches).
+- **Existing companies are shown but not re-processed.** A match is recorded
+  in the `run_company_matches` table, shown in the run's Companies list with
+  an "Already exists" badge, but is never enriched, scored, or handed to
+  Outreach as a new campaign.
+- **Race-safe and idempotent.** Concurrent runs can discover the same company
+  without creating duplicates (atomic insert-if-absent via PostgREST's
+  `ignore-duplicates` preference). Re-running the same research run with the
+  same ID doesn't turn its own companies into matches.
+- **Deletion still works.** Deleting a run keeps the company alive only if
+  another run still scores it. A company with no remaining scores is deleted
+  and can be rediscovered fresh in a later run.
+
+**Database requirement:** migration 005 must be applied (see **Applying schema
+migrations** below). Without it, attempting to save a match will fail.
 
 ## Applying schema migrations
 
@@ -377,6 +422,13 @@ live in [migrations/](migrations/):
   Company Detail page's failure state, and the retry-failed banner/route —
   without it those simply have nothing to read and behave as if nothing has
   ever failed.
+- [005_company_dedup.sql](migrations/005_company_dedup.sql) — adds the
+  `run_company_matches` table and a `NOT VALID` CHECK constraint on
+  `companies.domain` to ensure new writes use the canonical bare-host form
+  (no scheme/www/port/path, lowercase — see [src/csg/dedupe.py](src/csg/dedupe.py)).
+  This migration is required for global company de-duplication across runs
+  to work — without it, matching existing companies and saving the match
+  records will fail. See **Global company de-duplication** below.
 
 Earlier migrations, kept in `scratchpad/` as a record:
 - [migration_add_fk_cascades.sql](scratchpad/migration_add_fk_cascades.sql) —

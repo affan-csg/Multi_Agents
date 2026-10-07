@@ -4,8 +4,11 @@ out. No database access here, so every rule is unit-testable.
 Definitions (one place, so the numbers on every tab agree):
 
 * Sender -- `outreach_items.sender_email`, the mailbox that actually sent the
-  first email (stamped at send time). Items sent before sender tracking and
-  never backfilled have no sender and are reported as "Unknown / legacy".
+  first email (stamped at send time). An item with no recorded sender (sent
+  before sender tracking, or not sent yet) is attributed to the sole
+  configured account when exactly one is configured -- every email can then
+  only have come from it. With several configured accounts it stays
+  "Unknown / legacy" rather than being guessed.
 * Cohort -- the items whose first email was sent inside the date range (and
   that match the sender/campaign filters). Counts and rates in the summary
   tables describe that cohort, so a rate can never exceed 100%.
@@ -89,9 +92,9 @@ class ItemFacts:
         "bounced", "bounced_at", "booked", "booked_at", "followups", "failed", "failed_at",
     )
 
-    def __init__(self, item: dict[str, Any]):
+    def __init__(self, item: dict[str, Any], default_sender: Optional[str] = None):
         self.item = item
-        self.sender = sender_key(item.get("sender_email"))
+        self.sender = sender_key(item.get("sender_email") or default_sender)
         self.sent_at = parse_dt(item.get("sent_at"))
         self.stage = item.get("stage")
         self.first_reply_at: Optional[datetime] = None
@@ -118,8 +121,9 @@ def build_facts(
     messages: Iterable[dict[str, Any]],
     attempts: Iterable[dict[str, Any]],
     calendly: Iterable[dict[str, Any]],
+    default_sender: Optional[str] = None,
 ) -> dict[str, ItemFacts]:
-    facts = {i["item_id"]: ItemFacts(i) for i in items}
+    facts = {i["item_id"]: ItemFacts(i, default_sender) for i in items}
 
     for m in messages:
         f = facts.get(m.get("item_id"))
@@ -234,7 +238,7 @@ def accounts_block(
     keys: dict[str, str] = {sender_key(c): c for c in configured if c}
     for f in facts.values():
         if f.sender != UNKNOWN_SENDER:
-            keys.setdefault(f.sender, (f.item.get("sender_email") or "").strip())
+            keys.setdefault(f.sender, (f.item.get("sender_email") or "").strip() or f.sender)
     has_unknown = any(f.sender == UNKNOWN_SENDER for f in facts.values())
     configured_keys = {sender_key(c) for c in configured if c}
 
@@ -256,19 +260,30 @@ def accounts_block(
     return rows
 
 
+STAGES = ("needs_review", "pending", "sent", "waiting", "replied", "booked", "not_interested", "failed")
+
+
 def campaigns_block(
     selected: list[ItemFacts], campaigns: dict[str, dict[str, Any]],
     lo: Optional[datetime], hi: Optional[datetime],
 ) -> list[dict[str, Any]]:
+    """One row for EVERY campaign (idle ones show zeros). `stages` is the
+    current pipeline state of the campaign's prospects and ignores the date
+    range; the sent/reply/booking counts and rates describe the cohort sent
+    inside the range."""
     by_campaign: dict[str, list[ItemFacts]] = defaultdict(list)
+    for cid in campaigns:
+        by_campaign[cid]
     for f in selected:
         by_campaign[f.item.get("campaign_id")].append(f)
     rows = []
     for cid, group in by_campaign.items():
         sent, failed = cohort(group, lo, hi)
-        if not sent and not failed and (lo or hi):
-            continue
         camp = campaigns.get(cid) or {}
+        stages = {st: 0 for st in STAGES}
+        for f in group:
+            if f.stage in stages:
+                stages[f.stage] += 1
         senders = sorted({f.sender for f in group if f.sent_at is not None or f.failed})
         rows.append({
             "campaign_id": cid,
@@ -276,9 +291,10 @@ def campaigns_block(
             "created_at": camp.get("created_at"),
             "senders": senders,
             "prospects": len(group),
+            "stages": stages,
             **totals(sent, failed),
         })
-    rows.sort(key=lambda r: (-r["sent"], r["name"] or ""))
+    rows.sort(key=lambda r: (-r["prospects"], -r["sent"], r["name"] or ""))
     return rows
 
 
@@ -382,10 +398,9 @@ def prospect_rows(
 ) -> list[dict[str, Any]]:
     out = []
     for f in selected:
-        if f.sent_at is not None:
-            if not _in_range(f.sent_at, lo, hi):
-                continue
-        elif not (f.failed and _in_range(f.failed_at, lo, hi)):
+        # Sent items follow the date range; items not sent yet (manual review,
+        # pending, send-failed) are current pipeline state and always listed.
+        if f.sent_at is not None and not _in_range(f.sent_at, lo, hi):
             continue
         item = f.item
         pros = prospects.get(item.get("research_domain")) or {}
@@ -404,6 +419,7 @@ def prospect_rows(
             "positive": f.positive,
             "booked": f.booked,
             "failed": f.failed,
+            "rejected": f.stage == "not_interested",
             "bounced": f.bounced,
             "error": item.get("error") if f.failed else None,
         })

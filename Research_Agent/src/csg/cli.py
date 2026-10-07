@@ -399,6 +399,24 @@ def suppress(domain: str, reason: str = typer.Option("client", "--reason")) -> N
     conn.close()
 
 
+@app.command("dedupe-report")
+def dedupe_report() -> None:
+    """Read-only: list stored companies that look like the same company
+    (same normalized domain or name). Changes nothing."""
+    from .dedupe import find_duplicate_groups
+    conn = db.connect()
+    try:
+        groups = find_duplicate_groups(conn.select("companies", select="domain,name"))
+    finally:
+        conn.close()
+    if not groups:
+        console.print("[green]no duplicate companies found[/green]")
+        return
+    for g in groups:
+        console.print(f"[yellow]{g['kind']}[/yellow] {g['key']}: {', '.join(g['domains'])}")
+    console.print(f"{len(groups)} possible duplicate group(s). Nothing was modified.")
+
+
 @app.command("export")
 def export_cmd(
     run_id: Optional[str] = typer.Option(None, "--run", "-r"),

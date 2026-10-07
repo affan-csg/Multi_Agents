@@ -151,15 +151,9 @@ def _candidate_subpages(base_url: str, body: str) -> list[str]:
 
 
 def normalize_domain(raw: str) -> str:
-    s = (raw or "").strip().lower()
-    if not s:
-        return ""
-    if "://" in s:
-        s = urlparse(s).netloc
-    s = s.split("/")[0]
-    if s.startswith("www."):
-        s = s[4:]
-    return s
+    """Single implementation lives in csg.dedupe (global company identity)."""
+    from ..dedupe import normalize_domain as _normalize
+    return _normalize(raw)
 
 
 def candidate_tokens(domain: str, name: Optional[str]) -> list[str]:

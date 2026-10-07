@@ -39,11 +39,19 @@ If you discover a security vulnerability in this project, please email `justkhan
 - Monitor API usage for unusual activity.
 - Respect rate limits to avoid account lockouts.
 
+### Dashboard authentication (Server)
+
+- `Server/app.py` guards every HTTP and WebSocket route with `DASHBOARD_PASSWORD`. The Dashboard exchanges the password at `POST /auth/login` for a stateless HMAC-SHA256 token and sends it as `Authorization: Bearer <token>` (or `?token=` on WebSocket handshakes and download links, so the token can appear in access logs — keep logs private).
+- It fails closed: with `DASHBOARD_PASSWORD` unset, protected routes return 503. There is a single shared password (no per-user accounts, no rotation other than changing the variable, which invalidates all tokens).
+- Exemptions: `/auth/login`, the Calendly webhooks, CORS preflights, and loopback calls from `127.0.0.1`/`::1` that carry no `Origin` header (the agents calling each other). If you deploy behind a reverse proxy on the same host, make sure proxied external traffic does not arrive looking like loopback without an `Origin` header.
+- Agents run standalone (without the Server) and the Vercel multi-service deployment have **no** dashboard auth — protect them at the network layer.
+- The Calendly webhook verifies `Calendly-Webhook-Signature` with `CALENDLY_WEBHOOK_SIGNING_KEY` (HMAC-SHA256, replay tolerance window) and rejects unsigned calls.
+
 ### Frontend (Dashboard)
 
-- The Dashboard is a browser-based SPA. Sensitive operations must happen on the backend.
-- Avoid storing authentication tokens or API keys in `localStorage` (vulnerable to XSS).
-- Use CORS carefully — the backend is configured to accept requests from known origins.
+- The Dashboard is a browser-based SPA. Sensitive operations must happen on the backend; the password is never bundled.
+- The login token is kept in `sessionStorage` (cleared when the browser session ends). Never put API keys in the bundle; only `VITE_*` values (the backend origin) are public.
+- CORS is restricted: the Server allows `https://multi-agents-beta.vercel.app` and local `localhost`/`127.0.0.1` `:5xxx` dev origins. Add your own deployed Dashboard origin in `Server/app.py` deliberately; don't widen it to `*`.
 - Validate all user input on the backend before using it in database queries or external API calls.
 
 ### Deployment

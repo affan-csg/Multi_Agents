@@ -92,7 +92,7 @@ interface Props {
 export function AnalyticsDashboard({ campaignId, campaigns, onCampaignChange, pipeline }: Props) {
   const [tab, setTab] = useState<Tab>("overview");
   const [sender, setSender] = useState<string>("all");
-  const [range, setRange] = useState<Range>("30");
+  const [range, setRange] = useState<Range>("all");
   const [custom, setCustom] = useState({ from: "", to: "" });
   const [openItem, setOpenItem] = useState<{ itemId: string; title: string; sender: string | null } | null>(null);
 
@@ -551,23 +551,39 @@ function CampaignsTab({
   onOpenItem: (p: ProspectRow) => void;
 }) {
   const rows = data.campaigns;
-  const chart = rows.slice(0, 10).map((c) => ({
-    name: c.name, sent: c.sent, replies: c.replies, positive_replies: c.positive_replies, bookings: c.bookings,
+  const chart = rows.map((c) => ({
+    name: c.name,
+    "Manual review": c.stages.needs_review,
+    Pending: c.stages.pending,
+    Waiting: c.stages.sent + c.stages.waiting,
+    Replied: c.stages.replied,
+    Booked: c.stages.booked,
+    "Not interested": c.stages.not_interested,
+    "Send failed": c.stages.failed,
   }));
+  const STAGE_BARS: Array<[string, string]> = [
+    ["Manual review", "#c9cdd8"], ["Pending", "#4f7df3"], ["Waiting", "#e8a33d"], ["Replied", "#23c08b"],
+    ["Booked", "#6f63f2"], ["Not interested", "#e8734a"], ["Send failed", "#c0392b"],
+  ];
 
   return (
     <>
       <div className="card" style={{ marginBottom: 16 }}>
         <h3 className="card-title"><Icon name="send" size={16} /> Campaign performance</h3>
-        <p className="card-sub">Click a campaign to list its prospects, then a prospect to read the conversation.</p>
+        <p className="card-sub">
+          Every campaign is listed, including ones with no activity. Status columns are each campaign's
+          current pipeline; Sent, replies, bookings and rates cover emails sent in the selected dates.
+          Click a campaign to list its prospects, then a prospect to read the conversation.
+        </p>
         {rows.length === 0 ? (
-          <EmptyState icon="send" message="No campaigns sent emails for these filters and dates." />
+          <EmptyState icon="send" message="No campaigns exist yet." />
         ) : (
           <div className="table-scroll">
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>Campaign</th><th>Sending email</th><th>Prospects</th><th>Sent</th><th>Replies</th>
+                  <th>Campaign</th><th>Sending email</th><th>Prospects</th><th>Manual review</th><th>Pending</th>
+                  <th>Sent</th><th>Send failed</th><th>No reply</th><th>Replied</th><th>Not interested</th>
                   <th>Positive</th><th>Follow-ups</th><th>Bookings</th>
                   <th>Reply rate</th><th>Positive rate</th><th>Booking rate</th>
                 </tr>
@@ -581,7 +597,10 @@ function CampaignsTab({
                   >
                     <td>{c.name}</td>
                     <td>{c.senders.length ? c.senders.map((s) => senderLabel(s)).join(", ") : "—"}</td>
-                    <td>{num(c.prospects)}</td><td>{num(c.sent)}</td><td>{num(c.replies)}</td>
+                    <td>{num(c.prospects)}</td>
+                    <td>{num(c.stages.needs_review)}</td><td>{num(c.stages.pending)}</td>
+                    <td>{num(c.sent)}</td><td>{num(c.stages.failed)}</td><td>{num(c.no_replies)}</td>
+                    <td>{num(c.replies)}</td><td>{num(c.stages.not_interested)}</td>
                     <td>{num(c.positive_replies)}</td><td>{num(c.follow_ups_sent)}</td><td>{num(c.bookings)}</td>
                     <td><RateCell rate={c.reply_rate} /></td>
                     <td><RateCell rate={c.positive_reply_rate} /></td>
@@ -596,19 +615,18 @@ function CampaignsTab({
 
       {rows.length > 0 && (
         <div className="card" style={{ marginBottom: 16 }}>
-          <h3 className="card-title"><Icon name="chart" size={16} /> Campaign comparison</h3>
-          <p className="card-sub">Top {chart.length} campaigns by emails sent.</p>
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={chart} margin={{ top: 4, right: 8, bottom: 4, left: -18 }}>
-              <CartesianGrid stroke={GRID} vertical={false} />
-              <XAxis dataKey="name" tickLine={false} axisLine={false} tick={{ ...AXIS, fontSize: 11 }} />
-              <YAxis tickLine={false} axisLine={false} tick={AXIS} allowDecimals={false} />
+          <h3 className="card-title"><Icon name="chart" size={16} /> Pipeline by campaign</h3>
+          <p className="card-sub">Where each campaign's prospects are right now.</p>
+          <ResponsiveContainer width="100%" height={Math.max(220, 48 * chart.length + 60)}>
+            <BarChart data={chart} layout="vertical" margin={{ top: 4, right: 8, bottom: 4, left: 8 }}>
+              <CartesianGrid stroke={GRID} horizontal={false} />
+              <XAxis type="number" tickLine={false} axisLine={false} tick={AXIS} allowDecimals={false} />
+              <YAxis type="category" dataKey="name" width={150} tickLine={false} axisLine={false} tick={{ ...AXIS, fontSize: 11 }} />
               <Tooltip contentStyle={tooltipStyle} cursor={{ fill: "rgba(81,69,232,.06)" }} />
               <Legend wrapperStyle={{ fontSize: 11.5 }} />
-              <Bar dataKey="sent" name="Sent" fill={METRIC_COLORS.sent} radius={[4, 4, 0, 0]} />
-              <Bar dataKey="replies" name="Replies" fill={METRIC_COLORS.replies} radius={[4, 4, 0, 0]} />
-              <Bar dataKey="positive_replies" name="Positive" fill={METRIC_COLORS.positive_replies} radius={[4, 4, 0, 0]} />
-              <Bar dataKey="bookings" name="Bookings" fill={METRIC_COLORS.bookings} radius={[4, 4, 0, 0]} />
+              {STAGE_BARS.map(([key, color]) => (
+                <Bar key={key} dataKey={key} stackId="s" fill={color} />
+              ))}
             </BarChart>
           </ResponsiveContainer>
         </div>
@@ -660,8 +678,9 @@ function ProspectsPanel({
                     <td>{p.stage.replace("_", " ")}</td>
                     <td>
                       {p.booked ? "Booked" : p.positive ? "Positive reply" : p.replied ? "Replied"
-                        : p.failed ? `Failed${p.error ? ` — ${p.error}` : ""}`
-                        : p.bounced ? "Bounce detected" : "No reply"}
+                        : p.rejected ? "Not interested"
+                        : p.failed ? `Send failed${p.error ? ` — ${p.error}` : ""}`
+                        : p.bounced ? "Bounce detected" : p.sent_at ? "No reply" : "Not sent yet"}
                     </td>
                   </tr>
                 ))}

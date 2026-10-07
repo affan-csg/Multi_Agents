@@ -482,11 +482,16 @@ def run_companies(
     conn = db.connect()
     try:
         rows = db.latest_scores_per_domain(conn) if run_id == "all" else db.get_scores(conn, run_id)
+        if run_id != "all":
+            # Companies this run found that already existed: listed (flagged
+            # existing_match) but never re-created, re-scored or handed off.
+            scored = {r["domain"] for r in rows}
+            rows = rows + [m for m in db.get_run_matches(conn, run_id) if m["domain"] not in scored]
         if tier:
             want = set(tier.upper())
             rows = [r for r in rows if r["tier"] in want]
         if min_score is not None:
-            rows = [r for r in rows if r["score"] >= min_score]
+            rows = [r for r in rows if r["score"] is not None and r["score"] >= min_score]
         if industry:
             needle = industry.lower()
             rows = [r for r in rows if r.get("industry") and needle in r["industry"].lower()]

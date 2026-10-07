@@ -63,6 +63,12 @@ def _configured_senders() -> list[str]:
         return []
 
 
+def _default_sender(configured: list[str]) -> Optional[str]:
+    """The sole configured account, used for items with no recorded sender."""
+    unique = {metrics.sender_key(c) for c in configured}
+    return configured[0] if len(unique) == 1 else None
+
+
 def _chunks(values: list[str], size: int = 100):
     for i in range(0, len(values), size):
         yield values[i:i + size]
@@ -114,15 +120,20 @@ def summary(
     errors: dict[str, str] = {}
     conn = db.connect()
     try:
-        data = _load(conn, campaign_id, errors)
-        facts = metrics.build_facts(data["items"], data["messages"], data["attempts"], data["calendly"])
+        # Load every campaign's items: the campaign table compares campaigns,
+        # so it must not shrink to the one currently selected.
+        configured = _configured_senders()
+        data = _load(conn, None, errors)
+        facts = metrics.build_facts(
+            data["items"], data["messages"], data["attempts"], data["calendly"], _default_sender(configured),
+        )
         campaigns = data["campaigns"]
         selected = metrics.select_facts(facts, sender=sender, campaign_id=campaign_id)
         sent, failed = metrics.cohort(selected, lo, hi)
+        across_campaigns = metrics.select_facts(facts, sender=sender, campaign_id=None)
 
         domains = [f.item.get("research_domain") for f in facts.values() if f.booked]
         prospects = _safe(errors, "prospects", lambda: _prospects(conn, domains), {})
-        configured = _configured_senders()
 
         return {
             "filters": {"sender": sender, "campaign_id": campaign_id, "date_from": date_from, "date_to": date_to},
@@ -143,7 +154,7 @@ def summary(
                 errors, "accounts",
                 lambda: metrics.accounts_block(facts, configured, campaign_id=campaign_id, lo=lo, hi=hi), [],
             ),
-            "campaigns": _safe(errors, "campaigns_table", lambda: metrics.campaigns_block(selected, campaigns, lo, hi), []),
+            "campaigns": _safe(errors, "campaigns_table", lambda: metrics.campaigns_block(across_campaigns, campaigns, lo, hi), []),
             "followups": _safe(errors, "followups_block", lambda: metrics.followups_block(sent), {"rows": [], "note": ""}),
             "bookings": _safe(
                 errors, "bookings_block",
@@ -177,7 +188,10 @@ def prospects_list(
     conn = db.connect()
     try:
         data = _load(conn, campaign_id, errors)
-        facts = metrics.build_facts(data["items"], data["messages"], data["attempts"], data["calendly"])
+        facts = metrics.build_facts(
+            data["items"], data["messages"], data["attempts"], data["calendly"],
+            _default_sender(_configured_senders()),
+        )
         selected = metrics.select_facts(facts, sender=sender, campaign_id=campaign_id)
         # Only the page being returned needs its prospect names looked up.
         probe = metrics.prospect_rows(selected, data["campaigns"], {}, lo, hi)

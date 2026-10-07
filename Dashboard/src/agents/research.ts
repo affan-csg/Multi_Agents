@@ -115,6 +115,10 @@ export interface ScoredCompany {
   explanation: string[];
   metrics: Record<string, unknown>;
   scored_at: string;
+  /** True when this run found a company that already existed -- it is listed
+   *  here but was not re-created, re-scored, or handed to Outreach. */
+  existing_match?: boolean;
+  matched_from_run?: string | null;
   name: string | null;
   employee_count: ProvenanceValue<number> | null;
   revenue: ProvenanceValue<string> | null;

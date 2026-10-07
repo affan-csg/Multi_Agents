@@ -435,6 +435,13 @@ CREATE TABLE IF NOT EXISTS calendly_events (
 CREATE INDEX IF NOT EXISTS idx_calendly_events_item   ON calendly_events(item_id);
 CREATE INDEX IF NOT EXISTS idx_calendly_events_email  ON calendly_events(invitee_email);
 CREATE INDEX IF NOT EXISTS idx_calendly_events_status ON calendly_events(status);
+
+-- Tombstones for bookings deleted from the Dashboard (migration 015): sync and
+-- webhooks skip any event_uri listed here so a deleted booking never reappears.
+CREATE TABLE IF NOT EXISTS calendly_deleted_events (
+    event_uri  TEXT PRIMARY KEY,
+    deleted_at TIMESTAMPTZ NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_opt_adoptions_campaign ON optimization_recommendation_adoptions(campaign_id);
 
 -- Idempotency ledger: one row per (item, follow-up number), ever. The UNIQUE

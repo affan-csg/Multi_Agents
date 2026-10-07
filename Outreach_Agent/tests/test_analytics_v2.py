@@ -124,8 +124,10 @@ def test_new_sender_in_data_appears_automatically(client, conn):
 def test_filters_combine(client):
     data = client.get("/analytics/v2/summary", params={**MARCH, "sender": A, "campaign_id": "c1"}).json()
     assert data["overall"]["sent"] == 3
-    assert [c["campaign_id"] for c in data["campaigns"]] == ["c1"]
-    assert data["campaigns"][0]["senders"] == [A]
+    # The campaign table compares campaigns, so it ignores the campaign filter.
+    rows = {c["campaign_id"]: c for c in data["campaigns"]}
+    assert set(rows) == {"c1", "c2"} and rows["c1"]["senders"] == [A]
+    assert rows["c2"]["sent"] == 0  # none of c2 was sent by A: shown as zero, not hidden
     assert data["bookings"]["total"] == 1 and data["bookings"]["unmatched"] == 0
 
     legacy = client.get("/analytics/v2/summary", params={**MARCH, "sender": "unknown"}).json()
@@ -303,3 +305,36 @@ def test_create_item_omits_empty_sender_column(conn):
     from outreach.models import OutreachItem
     db.create_item(conn, OutreachItem(item_id="z", campaign_id="c", research_domain="z.com"))
     assert "sender_email" not in conn.tables["outreach_items"][0]
+
+
+def test_idle_campaigns_are_listed_with_zeros_and_stage_counts(client, conn):
+    conn.tables["campaigns"].append({"campaign_id": "c3", "name": "Empty", "created_at": None})
+    conn.tables["outreach_items"] += [
+        _item("p1", "c1", None, stage="needs_review", sent=None),
+        _item("p2", "c1", None, stage="pending", sent=None),
+    ]
+    data = client.get("/analytics/v2/summary", params={"date_from": "2026-01-01", "date_to": "2026-01-02"}).json()
+    rows = {c["campaign_id"]: c for c in data["campaigns"]}
+    assert set(rows) == {"c1", "c2", "c3"}
+    assert rows["c3"]["prospects"] == 0 and rows["c3"]["sent"] == 0 and rows["c3"]["reply_rate"]["pct"] is None
+    # Stage counts are current pipeline state, independent of the date range.
+    st = rows["c1"]["stages"]
+    assert (st["needs_review"], st["pending"], st["replied"], st["booked"]) == (1, 1, 1, 1)
+    assert sum(st.values()) == rows["c1"]["prospects"]
+
+
+def test_legacy_sends_attributed_to_the_only_configured_account(client, monkeypatch):
+    monkeypatch.setattr(analytics_routes, "_configured_senders", lambda: [A])
+    data = client.get("/analytics/v2/summary", params=MARCH).json()
+    assert "unknown" not in [a["sender"] for a in data["accounts"]]
+    assert _acct(data, A)["sent"] == 4  # its 3 own sends + the legacy i6
+    assert all(s["sender"] != "unknown" for s in data["senders"])
+    # Rows recorded under another address keep it; only blanks are inferred.
+    assert client.get("/analytics/v2/summary", params={**MARCH, "sender": "unknown"}).json()["overall"]["sent"] == 0
+
+
+def test_prospect_drilldown_lists_unsent_items(client, conn):
+    conn.tables["outreach_items"].append(_item("p1", "c1", None, stage="needs_review", sent=None))
+    data = client.get("/analytics/v2/prospects", params={**MARCH, "campaign_id": "c1"}).json()
+    row = next(r for r in data["rows"] if r["item_id"] == "p1")
+    assert row["stage"] == "needs_review" and row["sent_at"] is None

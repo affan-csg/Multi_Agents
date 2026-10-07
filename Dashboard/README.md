@@ -79,8 +79,10 @@ of the two backends above isn't running yet — start it and refresh.
 - `src/agents/registry.ts` — the list of connected agents (id, label, base URL).
 - `src/agents/research.ts`, `src/agents/outreach.ts` — typed HTTP clients,
   one per agent, each talking to that agent's unmodified FastAPI.
-- `src/pages/research/` — Runs, Companies, Company Detail, Saved, Contacts,
-  Analytics, Settings. Originally ported from Research Agent's own
+- `src/pages/Home.tsx` — overview dashboard (cross-agent charts and counts).
+- `src/pages/research/` — Runs (`RunConfig`), Companies (rows already known
+  from an earlier run carry an "Already exists" badge — global de-duplication),
+  Company Detail, Saved, Contacts, Analytics, Settings (incl. `UsageTab`). Originally ported from Research Agent's own
   standalone frontend (since retired — this Dashboard is now Research's only
   UI, same as it always was for Outreach).
 - `src/pages/outreach/` — native to this dashboard (Outreach has no
@@ -125,7 +127,9 @@ of the two backends above isn't running yet — start it and refresh.
   `src/pages/outreach/Learning.tsx`).
 - `src/pages/outreach/Analytics.tsx` + `AnalyticsDashboard.tsx` — tabbed
   Overview / Email Accounts / Campaigns / Bookings analytics with account,
-  campaign and date filters and prospect drill-down; the original pipeline
+  campaign and date filters (default range: All time) and an Account →
+  Campaign → Prospect → Conversation drill-down; the Campaigns tab lists every
+  campaign, idle ones as 0, with per-stage counts and a pipeline chart; the original pipeline
   charts live under Overview. Data comes from `src/agents/analytics.ts`
   (`/analytics/v2/*`); shared chart styling is in `src/components/charts.ts`.
 - `src/components/` — shared UI (`ui.tsx` design system, Nav, drawers,
@@ -188,8 +192,10 @@ Campaign option exempted since it's never tied to a run.
 
 ## What this is not
 
-- Not a new source of truth — every value shown is fetched live from an
-  agent's own API on each page load; nothing is cached or duplicated here.
+- Not a new source of truth — every value shown is fetched from an agent's
+  own API; the only client-side copy is the short-lived stale-while-revalidate
+  cache in `useCachedFetch` (in memory, refetched in the background) and the
+  login token in `sessionStorage`.
 - Not a proxy/aggregator backend — there is no server process for this app
   beyond the Vite dev/preview server; all requests go straight from the
   browser to each agent.

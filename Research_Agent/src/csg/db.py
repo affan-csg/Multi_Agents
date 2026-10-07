@@ -97,6 +97,20 @@ class SupabaseConn:
         ))
         return r.json()
 
+    def insert_if_absent(self, table: str, rows: list[dict[str, Any]], on_conflict: str) -> list[dict[str, Any]]:
+        """Atomic insert-or-skip (ON CONFLICT DO NOTHING). Returns ONLY the
+        rows this call actually inserted -- an empty list means another writer
+        already owned the key. This is the race-safe "claim"."""
+        if not rows:
+            return []
+        r = self._check(self._client.post(
+            f"/{table}",
+            params={"on_conflict": on_conflict},
+            headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
+            json=rows,
+        ))
+        return r.json()
+
     def update(self, table: str, data: dict[str, Any], **filters: Any) -> None:
         self._check(self._client.patch(f"/{table}", params=filters, json=data))
 
@@ -162,6 +176,7 @@ def delete_run(conn: SupabaseConn, run_id: str) -> int:
 
     conn.delete("scores", run_id=f"eq.{run_id}")
     conn.delete("qualifications", run_id=f"eq.{run_id}")
+    conn.delete("run_company_matches", run_id=f"eq.{run_id}")  # matches never keep a company alive
     conn.delete("runs", run_id=f"eq.{run_id}")
 
     removed = 0
@@ -222,6 +237,23 @@ def upsert_company(conn: SupabaseConn, c: Company) -> None:
     conn.upsert("companies", [row], on_conflict="domain")
 
 
+def claim_company(conn: SupabaseConn, c: Company) -> bool:
+    """Atomically insert `c` only if no company with this domain exists.
+    Returns True if this call created the row, False if it already existed
+    (including one created a moment ago by a concurrent run). Never touches
+    an existing row -- that is what makes concurrent/repeated discovery unable
+    to duplicate or overwrite a company."""
+    now = _iso(utcnow())
+    row: dict[str, Any] = {
+        "domain": c.domain, "last_checked": now, "first_seen": now,
+        "status": c.status, "dq_reason": c.dq_reason,
+    }
+    incoming = c.model_dump(mode="json")
+    for field in _COALESCE_FIELDS:
+        row[field] = incoming.get(field)
+    return bool(conn.insert_if_absent("companies", [row], on_conflict="domain"))
+
+
 def get_company(conn: SupabaseConn, domain: str) -> Optional[Company]:
     rows = conn.select("companies", domain=f"eq.{domain}", limit=1)
     return _row_to_company(rows[0]) if rows else None
@@ -256,6 +288,42 @@ def save_discovery_sources(conn: SupabaseConn, rows: list[dict[str, Any]]) -> in
         return 0
     conn.upsert("discovery_sources", rows, on_conflict="domain,provider_name")
     return len(rows)
+
+
+# --- run <-> existing-company matches ------------------------------------------
+
+def save_run_matches(conn: SupabaseConn, run_id: str, matches: list[dict[str, str]]) -> None:
+    """Record that `run_id` found companies that already exist (each
+    {"domain", "matched_by"}). Idempotent; creates no company, score, or
+    prospect."""
+    now = _iso(utcnow())
+    conn.upsert("run_company_matches", [
+        {"run_id": run_id, "domain": m["domain"], "matched_by": m["matched_by"], "matched_at": now}
+        for m in matches
+    ], on_conflict="run_id,domain")
+
+
+def get_run_matches(conn: SupabaseConn, run_id: str) -> list[dict[str, Any]]:
+    """Companies this run matched (not created), shaped like get_scores() rows
+    -- each company's most recent score row, flagged `existing_match` -- so the
+    run's Companies list can show them. A matched company with no score yet
+    comes back with score 0 and tier "-"."""
+    matches = conn.select("run_company_matches", run_id=f"eq.{run_id}")
+    if not matches:
+        return []
+    domains = sorted({m["domain"] for m in matches})
+    latest: dict[str, dict[str, Any]] = {}
+    for sc in conn.select("scores", domain=f"in.({','.join(domains)})"):
+        cur = latest.get(sc["domain"])
+        if cur is None or sc["scored_at"] > cur["scored_at"]:
+            latest[sc["domain"]] = sc
+    base = [latest.get(d) or {"domain": d, "run_id": None, "score": 0.0, "tier": "-",
+                              "dimensions": {}, "explanation": [], "metrics": {}, "scored_at": None}
+            for d in domains]
+    joined = {r["domain"]: r for r in _join_companies(conn, base)}
+    return [{**joined[m["domain"]], "existing_match": True,
+             "matched_from_run": joined[m["domain"]].get("run_id"),
+             "matched_by": m["matched_by"]} for m in matches if m["domain"] in joined]
 
 
 # --- job postings ------------------------------------------------------------

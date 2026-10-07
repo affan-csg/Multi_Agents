@@ -21,6 +21,7 @@ _KEYS = {
     "campaign_optimization_insights": ("pattern_key",),
     "optimization_recommendation_adoptions": ("adoption_id",),
     "calendly_events": ("event_uri",),
+    "calendly_deleted_events": ("event_uri",),
     "followup_attempts": ("item_id", "followup_number"),
     "automation_state": ("job",),
 }

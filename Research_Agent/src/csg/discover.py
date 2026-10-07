@@ -31,6 +31,7 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 from . import contacts as contacts_mod, db, export, pipeline, qualify as qualify_mod
+from .dedupe import ExistingCompanies, Match
 from .config import Config
 from .db import SupabaseConn
 from .discovery import (DiscoveryError, WebSearchProvider, GroqTavilyProvider,
@@ -61,6 +62,13 @@ class DiscoveryStats:
     contacts: Optional[dict[str, Any]] = None
     auto_qualify_top_n: int = 0
     auto_qualify_skipped_tier: int = 0
+    duplicates_existing: int = 0
+    existing_matches: list[dict[str, str]] = field(default_factory=list)
+    """Companies this run found that ALREADY exist in the database (by
+    normalized domain, else normalized name): [{"domain", "matched_by"}]. They
+    are reused as-is -- not re-inserted, re-scored, re-enriched, or handed to
+    Outreach -- and are listed on the run's Companies tab as existing matches
+    (see db.save_run_matches)."""
     enrich_failures: dict[str, int] = field(default_factory=dict)
     """Count of enrichment failures by reason (see enrich_company_firmographics
     and usage_tracker.classify_error): "no_api_key", "quota_exhausted",
@@ -84,6 +92,8 @@ class DiscoveryStats:
             "enriched": self.enriched,
             "enrich_skipped": self.enrich_skipped,
             "enrich_failures": self.enrich_failures,
+            "duplicates_existing": self.duplicates_existing,
+            "existing_matches": self.existing_matches,
             "companies": p.companies if p else 0,
             "suppressed": p.suppressed if p else 0,
             "no_ats": p.no_ats if p else 0,
@@ -247,6 +257,31 @@ async def run_discovery(
         if not candidates:
             return stats
 
+        # --- 1b. global dedup: reuse companies that already exist ---
+        # A company found by an earlier run (and still present) is matched,
+        # never re-created. Domains this run already scored are its own
+        # (a resumed/re-run run_id), not duplicates.
+        existing = ExistingCompanies.load(conn)
+        own = {r["domain"] for r in conn.select("scores", run_id=f"eq.{rid}", select="domain")}
+        matches: dict[str, Match] = {}
+        fresh = []
+        for c in candidates:
+            m = existing.lookup(c.domain, c.name)
+            if m is not None and m.domain not in own:
+                matches.setdefault(m.domain, m)  # first (strongest) match wins
+                provider_rows = [{
+                    "domain": m.domain, "provider_name": provider_name, "url": c.source_url,
+                    "discovered_at": c.discovered_at.isoformat() if c.discovered_at else None,
+                }]
+                try:
+                    db.save_discovery_sources(conn, provider_rows)
+                except db.SupabaseError as exc:
+                    print(f"  [WARN] discovery_sources save failed: {exc}")
+            else:
+                fresh.append(c)
+        candidates = fresh
+        stats.discovered = len(candidates) + len(matches)
+
         # --- 2. enrich (skips companies already researched) ---
         pairs, skipped, enrich_failures = await _enrich_all(conn, candidates, region, on_progress)
         stats.enriched = len(pairs) - skipped - sum(enrich_failures.values())
@@ -254,9 +289,16 @@ async def run_discovery(
         stats.enrich_failures = enrich_failures
 
         # --- 3. persist ---
+        # claim_company is an atomic insert-if-absent: if a concurrent run
+        # created this company between our check and now, we lose the claim
+        # and treat it as an existing match instead of overwriting it.
         rows = []
+        claimed_pairs = []
         for candidate, company in pairs:
-            db.upsert_company(conn, company)
+            if not db.claim_company(conn, company) and company.domain not in own:
+                matches[company.domain] = Match(company.domain, "domain")
+                continue
+            claimed_pairs.append((candidate, company))
             rows.append({
                 "domain": candidate.domain,
                 "provider_name": provider_name,
@@ -264,11 +306,27 @@ async def run_discovery(
                 "discovered_at": (candidate.discovered_at.isoformat()
                                   if candidate.discovered_at else None),
             })
+        pairs = claimed_pairs
         try:
             db.save_discovery_sources(conn, rows)
         except db.SupabaseError as exc:
             print(f"  [WARN] discovery_sources save failed: {exc}")
         conn.commit()
+
+        stats.existing_matches = [{"domain": m.domain, "matched_by": m.matched_by}
+                                  for m in matches.values()]
+        stats.duplicates_existing = len(stats.existing_matches)
+        stats.discovered = len(pairs) + stats.duplicates_existing
+        if matches:
+            db.save_run_matches(conn, rid, stats.existing_matches)
+
+        if not pairs:
+            # Everything found already exists: still register the run (so its
+            # matches have a run to live under) but score/hand off nothing.
+            db.start_run(conn, rid, cfg.raw.get("profile", "default"), 0,
+                         label=label or f"discover {region}")
+            db.finish_run(conn, rid, notes="all discovered companies already exist")
+            return stats
 
         # --- 4. ATS + jobs + scoring ---
         def pipeline_progress(done: int, total: int, domain: str) -> None:

@@ -21,6 +21,7 @@ NOW = datetime(2026, 4, 1, 12, 0, 0)
 # a *successful* cancel must use a start time that stays ahead of real
 # db.utcnow(), not the fixture's own NOW.
 FUTURE = db.utcnow() + timedelta(days=30)
+PAST_DT = db.utcnow() - timedelta(days=30)
 
 
 def _seed_item(conn, *, item_id: str, domain: str, to_email: str, stage: str = "sent",
@@ -727,3 +728,81 @@ def test_ingest_webhook_event_duplicate_delivery_is_idempotent(conn):
     calendly_sync.ingest_webhook_event(conn, payload)  # Calendly re-delivers on a retry
 
     assert len(conn.tables.get("calendly_events", [])) == 1
+
+
+# --- persistent deletion (tombstones) -------------------------------------------
+
+EV1 = "https://api.calendly.com/scheduled_events/EV1"
+
+
+def _sync_client(status_for_ev1):
+    class FakeClient:
+        def __init__(self, cfg):
+            self.configured = True
+
+        def list_scheduled_events(self, *, status=None, **kwargs):
+            if status == status_for_ev1:
+                return {
+                    "collection": [{"uri": EV1, "name": "Call", "start_time": "2026-04-01T15:00:00Z", "end_time": "2026-04-01T15:30:00Z", "location": {}}],
+                    "pagination": {"next_page_token": None},
+                }
+            return {"collection": [], "pagination": {"next_page_token": None}}
+
+        def list_event_invitees(self, event_uri, **kwargs):
+            return {"collection": [{"uri": "inv1", "email": "a@acme.com", "name": "A", "status": status_for_ev1}]}
+
+        def close(self):
+            pass
+    return FakeClient
+
+
+def _bare_cfg():
+    from outreach.config import Config
+    return Config(raw={"research": {"api_base": "http://x"}, "selection": {}, "sending": {}, "personalization": {}, "stages": {}}, path=None)
+
+
+@pytest.mark.parametrize("status", ["active", "canceled"])
+def test_deleted_booking_is_not_recreated_by_sync(conn, monkeypatch, status):
+    monkeypatch.setattr(calendly_sync, "CalendlyClient", _FakeCancelClient)
+    calendly_sync.apply_event(conn, _event(status="canceled", starts_at=PAST_DT), calendly_sync.SyncResult())
+    calendly_sync.delete_booking(conn, _cfg(), EV1)
+    assert calendly_db.get_event(conn, EV1) is None
+
+    monkeypatch.setattr(calendly_sync, "CalendlyClient", _sync_client(status))
+    result = calendly_sync.run_sync(conn, _bare_cfg())
+    assert result.ignored == 1 and result.created == 0
+    assert calendly_db.get_event(conn, EV1) is None
+    # and again -- still gone
+    calendly_sync.run_sync(conn, _bare_cfg(), skip_unchanged=True)
+    assert calendly_db.get_event(conn, EV1) is None
+
+
+def test_deleted_booking_is_not_recreated_by_webhook(conn, monkeypatch):
+    monkeypatch.setattr(calendly_sync, "CalendlyClient", _FakeCancelClient)
+    calendly_sync.apply_event(conn, _event(status="canceled", starts_at=PAST_DT), calendly_sync.SyncResult())
+    calendly_sync.delete_booking(conn, _cfg(), EV1)
+    payload = {
+        "event": "invitee.canceled",
+        "payload": {"uri": "inv1", "email": "a@acme.com", "name": "A",
+                    "scheduled_event": {"uri": EV1, "start_time": "2026-04-01T15:00:00Z", "end_time": "2026-04-01T15:30:00Z"}},
+    }
+    assert calendly_sync.ingest_webhook_event(conn, payload) is None
+    assert calendly_db.get_event(conn, EV1) is None
+
+
+def test_deleting_one_booking_does_not_block_others(conn, monkeypatch):
+    monkeypatch.setattr(calendly_sync, "CalendlyClient", _FakeCancelClient)
+    calendly_sync.apply_event(conn, _event(status="canceled", starts_at=PAST_DT), calendly_sync.SyncResult())
+    calendly_sync.delete_booking(conn, _cfg(), EV1)
+    other = "https://api.calendly.com/scheduled_events/EV2"
+    calendly_sync.apply_event(conn, _event(event_uri=other), calendly_sync.SyncResult())
+    assert calendly_db.get_event(conn, other) is not None
+
+
+def test_delete_booking_moves_booked_item_off_booked(conn, monkeypatch):
+    monkeypatch.setattr(calendly_sync, "CalendlyClient", _FakeCancelClient)
+    _seed_item(conn, item_id="item-1", domain="acme.com", to_email="prospect@acme.com", stage="waiting")
+    calendly_sync.apply_event(conn, _event(starts_at=PAST_DT), calendly_sync.SyncResult())
+    assert db.get_item(conn, "item-1").stage == "booked"
+    calendly_sync.delete_booking(conn, _cfg(), EV1)
+    assert db.get_item(conn, "item-1").stage == "waiting"

@@ -52,3 +52,17 @@ def delete_event(conn: SupabaseConn, event_uri: str) -> None:
     choice as the table's item_id ON DELETE SET NULL: deleting a booking
     record is not the same as deleting the pipeline item it was matched to."""
     conn.delete("calendly_events", event_uri=f"eq.{event_uri}")
+
+
+def is_deleted(conn: SupabaseConn, event_uri: str) -> bool:
+    """True if the user explicitly deleted this booking (a tombstone exists)."""
+    return bool(conn.select("calendly_deleted_events", event_uri=f"eq.{event_uri}", limit=1))
+
+
+def mark_deleted(conn: SupabaseConn, event_uri: str) -> None:
+    """Record a tombstone so sync/webhooks never recreate this event."""
+    conn.upsert(
+        "calendly_deleted_events",
+        [{"event_uri": event_uri, "deleted_at": _iso(utcnow())}],
+        on_conflict="event_uri",
+    )

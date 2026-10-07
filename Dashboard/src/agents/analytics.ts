@@ -54,6 +54,8 @@ export interface CampaignRow extends Totals {
   created_at: string | null;
   senders: string[];
   prospects: number;
+  /** Current pipeline stage of every prospect (not date-filtered). */
+  stages: Record<"needs_review" | "pending" | "sent" | "waiting" | "replied" | "booked" | "not_interested" | "failed", number>;
 }
 
 export interface FollowupRow {
@@ -118,6 +120,7 @@ export interface ProspectRow {
   positive: boolean;
   booked: boolean;
   failed: boolean;
+  rejected: boolean;
   bounced: boolean;
   error: string | null;
 }

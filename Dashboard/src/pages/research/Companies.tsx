@@ -31,7 +31,7 @@ const columns = [
         <div className="cell-company">
           <Avatar name={row.name || row.domain} size="sm" />
           <div>
-            <div className="cell-company-name">{row.name || row.domain}</div>
+            <div className="cell-company-name">{row.name || row.domain}{row.existing_match && <span className="run-badge" style={{ marginLeft: 8 }} title={`Already exists${row.matched_from_run ? ` (from ${row.matched_from_run})` : ""} — not added again`}>Already exists</span>}</div>
             <div className="cell-company-domain">{row.domain}</div>
           </div>
         </div>

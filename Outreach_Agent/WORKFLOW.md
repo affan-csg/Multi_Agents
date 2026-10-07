@@ -13,7 +13,7 @@ either by hand or automatically**:
 - **Automatically**: the Research Agent calls this agent's own
   `POST /import` then `POST /campaigns` right after it qualifies + finds
   contacts for a run's Tier A/B companies — see
-  [Research_Agent/WORKFLOW.md's "4. Outreach hand-off"](../Research_Agent/WORKFLOW.md#4-outreach-hand-off).
+  [Research_Agent/WORKFLOW.md's "5. Outreach hand-off"](../Research_Agent/WORKFLOW.md#5-outreach-hand-off--srccsgoutreach_clientpy).
   It is calling the *exact same routes and code* a person would; there is no
   separate "automatic" import/campaign-creation logic in this codebase to
   keep in sync.
@@ -385,6 +385,24 @@ sends-over-time. Deliberately mirrors the Research Agent's own
 `_aggregate_analytics` shape so the two agents' analytics pages read as the
 same product in the Dashboard.
 
+### Analytics v2 — [analytics/](src/outreach/analytics/)
+
+`GET /analytics/v2/summary` and `/analytics/v2/prospects` (read-only, filters
+`sender`, `campaign_id`, `date_from`, `date_to`) feed the Dashboard's tabbed
+Analytics page. Data flow: `routes.py` loads items/messages/events with a
+paginated fetch (1000-row pages) → `metrics.build_facts` builds one
+`ItemFacts` per item → `select_facts` applies filters → pure-Python blocks
+(`accounts_block`, `campaigns_block`, `prospect_rows`, timeseries) aggregate.
+
+- **Sender**: `outreach_items.sender_email`; when empty and exactly one
+  account is configured, `routes._default_sender` attributes it to that account
+  at read time (no write). With several accounts it stays "unknown".
+- **Campaigns block**: lists every campaign (idle ones as 0) with per-stage
+  counts (current state, ignores dates) and cohort metrics (items sent in the
+  date range). It ignores the `campaign_id` filter but respects `sender`.
+- **Prospects list**: unsent items always; sent items follow the date range.
+- Nothing is estimated: counts and rates are derived only from stored rows.
+
 ## Jobs — import and send progress
 
 `import` and `send` both run in a thread-pool executor (`_MAIN_LOOP.run_in_executor`),
@@ -401,8 +419,10 @@ job snapshot updates.
 - **CLI** ([cli.py](src/outreach/cli.py)) — `outreach import-prospects <run_id>`,
   `campaign create`, `campaign send <id>`, `campaign list`, `campaign delete <id>`,
   `campaign pipeline <id>` (Rich table of the board), `item set-stage <id> <stage>`
-  (`waiting`/`replied`/`booked` only — no `approve`/`redraft`/`schedule` from
-  the CLI; those are API/Dashboard-only actions).
+  (`waiting`/`replied`/`booked`/`not_interested` only — no `approve`/`redraft`/
+  `schedule` from the CLI; those are API/Dashboard-only actions),
+  `conversation status|enable|disable|tick`, `calendly register-webhook|sync`,
+  and `automation run-once|status`.
 - **Web app** — [api.py](src/outreach/api.py) (FastAPI) serves the same
   `ingest`/`personalize`/`pipeline` modules over HTTP + the jobs WebSocket,
   consumed by `Dashboard/src/pages/outreach/` (Campaigns list, Campaign
@@ -421,7 +441,12 @@ A **different** Supabase project from the Research Agent's — never joined at
 the DB level (Postgres can't FK across projects anyway). `research_domain`
 and `research_run_id` are plain copied reference strings, not foreign keys.
 
-Four tables ([schema.sql](schema.sql)): `prospects` (PK `research_domain`,
+Core tables ([schema.sql](schema.sql)) — the first four are this section's subject; the rest are covered in
+their own sections (`conversation_settings`/`conversation_messages` §6,
+`followup_attempts`/`automation_state` §10, `draft_versions`/`learning_insights`/
+`learning_events` §7, `campaign_optimization_insights`/
+`optimization_recommendation_adoptions` §8, `calendly_events` §9):
+`prospects` (PK `research_domain`,
 no campaign ownership — a cache, reusable across campaigns), `campaigns` (PK
 `campaign_id`), `outreach_items` (PK `item_id`, FKs into both `campaigns` and
 `prospects` with `ON DELETE CASCADE`, `UNIQUE(campaign_id, research_domain)`
@@ -468,10 +493,16 @@ service-role key from a trusted backend, same posture as the Research Agent.
   authoritative `Stage`/`STAGE_ORDER` in [models.py](src/outreach/models.py),
   which is the one that actually governs behavior — treat the YAML list as
   documentation, not a second source of truth to keep byte-for-byte in sync.
+- `sending.accounts` — optional extra sending accounts (`from_email`,
+  `from_name`, `env_prefix`; secrets come from `<PREFIX>_SMTP_*`/`_IMAP_*` env
+  vars). The default account is `OUTREACH_FROM_EMAIL` / `SMTP_*` / `IMAP_*`;
+  each send records its account in `outreach_items.sender_email`.
 - `conversation` — the Conversation Agent's defaults for a campaign that has
-  never been configured (`enabled`/`auto_reply` both off, `followup_after_days`).
-  The live per-campaign switch lives in the database, not here — see
-  [section 6](#6-conversation-agent--conversation).
+  never been configured (`enabled`/`auto_reply` both off, `followup_after_days`,
+  `followup_days: [7, 14]`, `max_followups: 2`, `no_response_after_days: 21`,
+  `imap_lookback_days`). The live per-campaign switch lives in the database,
+  not here — see [section 6](#6-conversation-agent--conversation) and
+  [section 10](#10-automation--automation).
 
 ## 6. Conversation Agent — [conversation/](src/outreach/conversation/)
 
@@ -512,9 +543,10 @@ detected deterministically and never move a card or count as engagement;
 every reply/follow-up carries real `In-Reply-To`/`References` headers so it
 threads in the prospect's mail client.
 
-Reply checking is manual today (button or CLI tick) — there is no background
-poller yet, by design, until the flow has been exercised against real mail.
-See [README.md's Conversation Agent section](README.md#conversation-agent-agent-3)
+Reply checking is manual by default (button or CLI tick); with
+`AUTO_SYNC_ENABLED=true` the Server polls automatically — see
+[10. Automation](#10-automation--automation). See
+[README.md's Conversation Agent section](README.md#conversation-agent-agent-3)
 for full setup (IMAP credentials, schema) and CLI reference.
 
 ## 7. Learning — [learning/](src/outreach/learning/)
@@ -728,9 +760,13 @@ past or already-canceled event has nothing left to cancel, so that step is
 skipped. Either way, the local `calendly_events` row is deleted last, so a
 failed Calendly cancel never leaves this integration lying about a booking
 that's still actually live there. Unlike cancel, this never leaves a row
-behind, and it never touches the matched pipeline item (unlinked, not
-deleted — same `item_id ON DELETE SET NULL` philosophy the table already
-uses for a deleted campaign item).
+behind. Before the row is removed a tombstone is written to
+`calendly_deleted_events` (migration 015), so `apply_event` (sync) and
+`ingest_webhook_event` (webhook) skip that event URI forever (counted as
+`ignored` in the sync result). The matched pipeline item is never deleted; but
+if it is in `booked` and no other active booking backs it, it moves back to
+`waiting` (event logged with reason "Calendly booking deleted") so the
+Bookings list doesn't keep a ghost row.
 
 **API:** `POST /calendly/webhook` (Calendly calls this), `POST
 /calendly/sync`, `POST /calendly/events/cancel` (`{event_uri, reason?}`),
@@ -780,15 +816,58 @@ endpoint (`/webhook_subscriptions`, not plan-gated). A "Copy reschedule link"
 action was also removed — Calendly's API has no reschedule endpoint, only a
 hosted page link, so it never did more than link out.
 
+## 10. Automation — [automation/](src/outreach/automation/)
+
+Optional background loop that runs one **cycle** on a schedule so replies,
+bookings and follow-ups do not wait for someone to press a button. It is a
+thin orchestrator over code that already exists (Calendly sync, inbox read,
+Conversation Agent tick) and is off unless `AUTO_SYNC_ENABLED=true` is set on
+the process running `Server/app.py`, whose lifespan starts
+`automation.loop.run_forever`.
+
+- **Loop** ([loop.py](src/outreach/automation/loop.py)): wakes every 60 s and
+  asks the database whether a cycle is due. It keeps no schedule of its own —
+  `automation_state.next_run_at` is the schedule, so a restart resumes where
+  it left off instead of firing on boot.
+- **Cycle** ([runner.py](src/outreach/automation/runner.py)): (1) take a DB
+  lease (`LEASE_MINUTES = 20`, so replicas never overlap and a crashed cycle
+  frees itself); (2) sync Calendly over the last 30 days (bookings are always
+  recorded, cards move only for campaigns whose Conversation Agent is ON);
+  (3) read the inbox once, incrementally from one day before the last good
+  read (dedupe by provider message id), shared by every campaign; (4) tick
+  each enabled campaign — its follow-up phase runs only if BOTH reads
+  succeeded, so a failed sync never leads to a blind send; (5) persist the
+  result and the next run time. Status is `ok | partial | failed |
+  skipped_locked`; after a failure the retry backs off (5 min, doubling per
+  consecutive failure) instead of waiting a full interval.
+- **Follow-ups** ([conversation/followup.py](src/outreach/conversation/followup.py)):
+  exact elapsed time since the original `sent_at` — day 2 Waiting, day 7
+  follow-up #1, day 14 follow-up #2, day 21 terminal `not_interested` only if
+  #2 was actually sent with no reply/booking/bounce/opt-out. Each follow-up is
+  first claimed in `followup_attempts` (`UNIQUE(item_id, followup_number)`),
+  state is re-read before and after composing, sends retry up to 3 times, and
+  a claim left by a crash is never resent. Follow-ups are always drafted;
+  they are sent only when the campaign has `enabled` AND `auto_reply`.
+- **Settings & endpoints** ([routes.py](src/outreach/automation/routes.py)):
+  `GET /automation/status`, `PATCH /automation/settings`
+  (`interval_minutes` 5–1440, `enabled`), `POST /automation/run` (one cycle
+  now, through the same lease). `AUTO_SYNC_INTERVAL_MINUTES` (default 30) only
+  seeds the first row; the stored value wins afterwards. CLI:
+  `outreach automation run-once|status` (usable from an external cron when the
+  Server loop is not running).
+- **Storage**: `automation_state` (single row, job `sync`: interval, enabled,
+  lease, last/next run, last error) and `followup_attempts`.
+
 ## Known limitations
 
 - **Scheduling doesn't send.** `scheduled_at` is stored, never acted on.
 - **One channel.** Only email is implemented; `channels.send()` is written to
   dispatch by name so a second channel is a new module + dispatch entry, not
   a rearchitecture.
-- **Reply checking is manual.** The Conversation Agent runs on a button click
-  or a CLI tick — there is no background poller yet, by design, until the
-  flow has been exercised against real mail.
+- **Automatic polling is opt-in and Server-only.** The scheduler only runs
+  under `Server/app.py` with `AUTO_SYNC_ENABLED=true`; a standalone Outreach
+  process has none, so there reply checking stays manual (button,
+  `outreach conversation tick`, or `outreach automation run-once` from a cron).
 - **Learning and Optimization recomputation are synchronous per-request.**
   Acceptable at current volumes but could move to frontend caching or
   event-driven if `draft_versions`/`outreach_items` grow very large.

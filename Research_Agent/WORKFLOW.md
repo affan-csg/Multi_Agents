@@ -109,11 +109,22 @@ region it uses `geo.search_regions.active` from the ICP.
    queries run (one hub-anchored, one hiring-anchored) against Gemini with
    grounded search.
 2. **Resolve.** Results are cleaned, blocklisted domains (job boards, social
-   networks, staffing competitors) dropped, and deduplicated by domain.
-3. **Research.** Each *new* company gets one Gemini call for headcount,
-   revenue, funding, industry, and description. Companies already researched
-   in a previous run are skipped — firmographics don't change run to run —
-   and the rest run concurrently (`ENRICH_CONCURRENCY`), not serially.
+   networks, staffing competitors) dropped, and deduplicated by normalized
+   domain (scheme, `www.`, port, path, case all stripped — see
+   [src/csg/dedupe.py](src/csg/dedupe.py)).
+3. **Global de-duplication.** All existing companies (from any prior run) are
+   loaded once. Each discovered candidate is checked against them by normalized
+   domain (primary key) or normalized name (fallback, for exact name matches ≥5
+   characters). A match is recorded as an existing company (shown in the run
+   with an "Already exists" badge, never re-enriched/scored/handed to Outreach)
+   and excluded from the rest of the pipeline. A concurrent run that claims the
+   company first wins atomically, and the race loser treats it as an existing
+   match instead of duplicating it.
+4. **Research.** Each *new* (genuinely discovered, not matched) company gets
+   one Gemini call for headcount, revenue, funding, industry, and description.
+   Companies already researched in a previous run are skipped — firmographics
+   don't change run to run — and the rest run concurrently (`ENRICH_CONCURRENCY`),
+   not serially.
 
 Every researched figure is stored as a **provenance envelope**
 (`models.ProvenanceValue`): value plus source, URL, date, confidence, and
@@ -585,8 +596,13 @@ its key, with `ON DELETE CASCADE` declared in [schema.sql](schema.sql) and
 applied to the live database (see
 [migration_add_fk_cascades.sql](scratchpad/migration_add_fk_cascades.sql)),
 so deleting a `companies` row deletes everything that referenced it (job
-postings, scores, qualifications, saved entries, contacts, suppression) in
-one shot.
+postings, scores, qualifications, saved entries, contacts, suppression, and
+`run_company_matches` rows) in one shot. Tables: `runs`, `companies`,
+`discovery_sources`, `job_postings`, `scores`, `suppression`,
+`qualifications`, `qualification_attempts`, `saved_companies`, `contacts`,
+`api_usage`, `run_company_matches`. `companies.domain` is always the
+canonical bare host (a `NOT VALID` CHECK from migration 005 enforces this for
+new writes).
 
 `runs` additionally carries an optional `label` column (see
 [migration_add_run_label.sql](scratchpad/migration_add_run_label.sql)) — a
@@ -631,14 +647,19 @@ usual tier/state/industry filters apply.
 
 - **CLI** ([src/csg/cli.py](src/csg/cli.py)) — `csg discover [region]`,
   `csg report`, `csg show <domain>`,
-  `csg qualify`, `csg contacts`, `csg export`, `csg suppress <domain>`.
+  `csg qualify`, `csg contacts`, `csg export`, `csg suppress <domain>`,
+  `csg dedupe-report` (read-only: lists stored companies that look like the
+  same company by normalized domain or name; changes nothing).
   Scriptable, no server needed.
 - **Web app** — [src/csg/api.py](src/csg/api.py) (FastAPI) serves the same
   pipeline over HTTP + a WebSocket for live run progress
   (`/jobs/{job_id}/ws`), consumed by the React frontend that lives in the
   shared [Dashboard](../Dashboard) app, not in this repo (Runs, Companies
   table with tier/score/state/industry filters, Company Detail, Analytics,
-  Saved Lists, Contacts, Settings pages). A Research selector at the top of
+  Saved Lists, Contacts, Settings pages, plus Excel
+  (`GET /runs/{run_id}/export/excel`, companies + contacts) and PDF-reports-
+  in-a-ZIP (`GET /runs/{run_id}/export/pdf`) downloads — read-only, built from
+  stored data, never triggering a new run). A Research selector at the top of
   every run-scoped page lets you switch between named runs or "All
   research." See the [README](README.md#running-it) for how to run both
   processes together.
@@ -793,7 +814,9 @@ running the pipeline over nothing.
 ## Deleting a run
 
 `DELETE /runs/{run_id}` (Settings page) tears down everything exclusively
-scoped to that run — companies, job postings, discovery sources, contacts,
+scoped to that run (its `run_company_matches` rows are removed first and never
+keep a company alive — a company with no remaining scores is deleted and can
+be rediscovered as new) — companies, job postings, discovery sources, contacts,
 saved entries, and suppression rows, via `ON DELETE CASCADE` in
 [schema.sql](schema.sql) once `db.delete_run()` removes the `scores`/
 `qualifications` rows. A domain also scored by another surviving run is left

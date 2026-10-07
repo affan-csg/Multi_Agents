@@ -39,6 +39,7 @@ class SyncResult:
         self.created = 0
         self.updated = 0
         self.unchanged = 0
+        self.ignored = 0
         self.matched = 0
         self.unmatched = 0
         self.advanced_to_booked = 0
@@ -51,6 +52,7 @@ class SyncResult:
             "created": self.created,
             "updated": self.updated,
             "unchanged": self.unchanged,
+            "ignored": self.ignored,
             "matched": self.matched,
             "unmatched": self.unmatched,
             "advanced_to_booked": self.advanced_to_booked,
@@ -160,9 +162,15 @@ def apply_event(
     item's pipeline stage in sync -- the single path both run_sync and
     ingest_webhook_event funnel through, so a booking behaves identically
     regardless of source."""
+    from . import db as calendly_db
+    # A booking the user explicitly deleted is never stored again, whatever
+    # Calendly still reports for it (sync lists canceled events too).
+    if calendly_db.is_deleted(conn, raw_event.event_uri):
+        result.ignored += 1
+        return raw_event
+
     existing = None
     try:
-        from . import db as calendly_db
         existing = calendly_db.get_event(conn, raw_event.event_uri)
     except Exception:
         pass
@@ -333,7 +341,23 @@ def delete_booking(conn: SupabaseConn, cfg: Config, event_uri: str) -> None:
         finally:
             client.close()
 
+    # Tombstone first: even if the row delete fails, no sync can recreate it,
+    # and a sync racing this call cannot slip the event back in afterwards.
+    calendly_db.mark_deleted(conn, event_uri)
     calendly_db.delete_event(conn, event_uri)
+
+    # The Bookings list is built from items in `booked`, so a booked item whose
+    # only meeting was just deleted would still show up as a booking. Back it
+    # off `booked` (same move a cancellation makes) unless another live
+    # booking still backs it. The item itself is never deleted.
+    if event.item_id:
+        item = core_db.get_item(conn, event.item_id)
+        others = [e for e in calendly_db.list_events_by_item(conn, event.item_id) if e.status == "active"]
+        if item is not None and item.stage == "booked" and not others:
+            core_db.set_stage(
+                conn, item.item_id, "waiting", actor=ACTOR,
+                detail={"reason": "Calendly booking deleted", "event_uri": event_uri},
+            )
 
 
 class NoShowError(RuntimeError):
@@ -469,6 +493,10 @@ def ingest_webhook_event(conn: SupabaseConn, payload: dict[str, Any]) -> Optiona
     if fields.get("webhook_event_type") not in ("invitee.created", "invitee.canceled"):
         return None
     if not fields.get("event_uri"):
+        return None
+
+    from . import db as calendly_db
+    if calendly_db.is_deleted(conn, fields["event_uri"]):
         return None
 
     result = SyncResult()

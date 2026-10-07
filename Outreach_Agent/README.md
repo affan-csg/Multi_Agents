@@ -207,11 +207,15 @@ the launcher entirely. Also, on Windows PowerShell (not pwsh/PowerShell 7),
 `&&` is not a valid command separator — put each command on its own line, as
 above, or use `;` if you want to chain them.
 
-Running standalone this way means pointing the Dashboard's
-`VITE_OUTREACH_API_BASE` (see [Dashboard/.env.example](../Dashboard/.env.example))
-at `http://127.0.0.1:8001` instead of the single-port server's default. If
-the Dashboard's sidebar shows "agent unreachable" for Outreach, this backend
-usually isn't running, or that var doesn't match where it's listening.
+Running standalone this way means the Dashboard cannot reach it directly:
+the Dashboard only has one backend origin (`VITE_API_URL`, see
+[Dashboard/.env.example](../Dashboard/.env.example)) and appends `/research`
+and `/outreach` to it, so standalone agents on separate ports need a reverse
+proxy that maps those two prefixes (or just use the single-port server).
+A standalone process also has **no dashboard password auth and no background
+scheduler** — both live in `Server/app.py`. If the Dashboard's sidebar shows
+"agent unreachable" for Outreach, this backend usually isn't running, or
+`VITE_API_URL` doesn't match where it's listening.
 
 ### Adding the web UI (Dashboard, a third process)
 
@@ -227,7 +231,8 @@ npm run dev
 
 Open the Dashboard, go to **Outreach Agent → Campaigns**, and click into a
 campaign to see the pipeline board (Needs Review → Pending → Sent → Waiting →
-Replied → Booked). Cards from Sent onward are drag-and-drop between columns
+Replied → Booked → Failed; the Failed column holds clear rejections, and send
+errors show as "Send Failed"). Cards from Sent onward are drag-and-drop between columns
 (in addition to the item drawer's stage buttons — both call the same
 `POST /items/{id}/stage`); that page is
 [Dashboard/src/pages/outreach/CampaignDetail.tsx](../Dashboard/src/pages/outreach/CampaignDetail.tsx).
@@ -285,9 +290,9 @@ outreach conversation tick <campaign_id>       # run one cycle now
 outreach conversation tick                     # ...for every enabled campaign
 ```
 
-Reply checking is **manual today** — the button or the CLI. There is no
-background poller yet; that comes once the flow has been exercised on real
-mail.
+Reply checking can be **manual** (the button or the CLI) or **automatic**: with
+`AUTO_SYNC_ENABLED=true` the Server polls the inbox on a schedule — see
+[Automatic polling and follow-ups](#automatic-polling-and-follow-ups).
 
 ### What a tick actually does
 
@@ -457,12 +462,13 @@ Automation tables and endpoints live in [src/outreach/automation/](src/outreach/
 pytest
 ```
 
-592 tests, no network (a fake in-memory PostgREST fixture in
+724 tests, no network (a fake in-memory PostgREST fixture in
 [tests/conftest.py](tests/conftest.py) stands in for Supabase; the Calendly
 suite additionally never calls `api.calendly.com` — `httpx.Client.get/post`
 is monkeypatched per test, same convention as the Gemini/Anthropic/Tavily
-tests) — 114 Outreach + 155 Conversation + 105 Learning + 38 Campaign-Level
-Optimization + 60 Calendly Integration + 20 Analytics tests, roughly:
+tests) — roughly 128 core Outreach + 197 Conversation + 94 Automation/
+follow-up + 110 Learning + 41 Campaign-Level Optimization + 120 Calendly
+Integration + 29 Analytics tests, by file:
 
 - [test_ingest.py](tests/test_ingest.py) — importing prospects from
   Research's API response shape; that a tier-matching company with no
@@ -573,7 +579,7 @@ so the full reply path runs with no mailbox, no LLM, and no waiting:
   (including a same-microsecond tie on Windows), and the Calendly link
   included on each row.
 
-### Feedback Learning Agent (105 of the 412)
+### Feedback Learning Agent (110 of the 724)
 
 Data-driven pattern detection without ML or causal claims, fed back into future drafts.
 
@@ -603,7 +609,7 @@ Data-driven pattern detection without ML or causal claims, fed back into future 
   must not create active insight; 30-edit fixture with exact 73% shorten-CTA
   pattern).
 
-### Campaign-Level Optimization (38 of the 412)
+### Campaign-Level Optimization (41 of the 724)
 
 Independent sibling layer to the Feedback Learning Agent above — compares whole
 campaigns/strategies against each other rather than diffing single edits.
@@ -674,14 +680,27 @@ campaigns/strategies against each other rather than diffing single edits.
   all (the pre-existing classifier-only path) is completely unchanged —
   falls back to the shared account-wide `calendly_url` exactly as before.
 
-### Analytics Dashboard (20 of the 592)
+### Automation and follow-ups (94 of the 724)
+
+- [test_automation_runner.py](tests/test_automation_runner.py),
+  [test_automation_api.py](tests/test_automation_api.py),
+  [test_automation_followups.py](tests/test_automation_followups.py),
+  [test_followup_schedule.py](tests/test_followup_schedule.py),
+  [test_inbox_since.py](tests/test_inbox_since.py) — the DB-leased polling
+  cycle (no overlap, failure backoff, skip-on-failed-read), the
+  `/automation/*` routes and settings clamping, the day-2/7/14/21 follow-up
+  schedule and ledger claims, and incremental inbox reads.
+
+### Analytics Dashboard (29 of the 724)
 
 - [test_analytics_v2.py](tests/test_analytics_v2.py) — per-sender and
   per-campaign metrics with multiple sending accounts; legacy (null sender)
   handling; rate math with zero-division safety; positive-reply and booking
   attribution; unmatched Calendly bookings excluded from campaign/sender but
   counted in overall; follow-ups counted correctly; combined filters
-  (sender+campaign+date range); insufficient-data flagging below minimum
+  (sender+campaign+date range); idle campaigns listed with zeros and stage
+  counts; legacy sends attributed to the sole configured account; the prospect
+  drill-down listing unsent items; insufficient-data flagging below minimum
   sample; paginated fetch for >1000-row result sets; and that analytics
   failures never block any other Outreach behavior.
 
@@ -800,13 +819,19 @@ page.
 - **Overview**: key metrics (prospects in scope, messages sent, reply rate,
   booking rate, failure rate), pipeline funnel by stage, personalization source
   distribution, prospect tier mix, and sends over time — filters by account and
-  campaign.
+  campaign. The date range defaults to **All time**.
 - **Email Accounts**: per-sender metrics and trends — reply rate, booking rate,
   failure rate across each sending account, with comparison to the overall
   average.
-- **Campaigns**: campaign-level comparison table showing send volume, reply
-  counts, positive replies, bookings, and derived rates — sortable,
-  filterable by account and sender.
+- **Campaigns**: **every** campaign is listed, including ones with no activity
+  (shown as 0), with prospects, manual review, pending, sent, send failed, no
+  reply, replied, not interested, positive replies, follow-ups, bookings, and
+  reply / positive-reply / booking rates, plus a stacked "Pipeline by campaign"
+  chart. Stage columns are the *current* pipeline state and ignore the date
+  range; sent, reply, booking and rate columns cover items *sent* in the range.
+  The table ignores the campaign filter (so campaigns stay comparable) but
+  respects the account filter; clicking a campaign drills into its prospects,
+  including not-yet-sent ones.
 - **Bookings**: booked prospects across all campaigns with sender, campaign,
   contact, and booking time, with All/Upcoming/Past filter tabs.
 
@@ -822,7 +847,13 @@ this recorded sender. Follow-ups and replies inherit the item's sender. A
 backfill migration (`014b_backfill_sender_email.sql`) is available if the
 system started with a single sending account. Run it once, and only after
 confirming every historical send came from `OUTREACH_FROM_EMAIL`; otherwise
-leave it, and older sends show as "Unknown / legacy".
+leave it.
+
+Read-time fallback (no DB write): while exactly one sending account is
+configured, items with no recorded sender are attributed to that account, so
+"Unknown / legacy" does not appear as a sender. Once a second account is
+configured, such items show as "Unknown / legacy" again, since the real sender
+can't be known. Items that already have a `sender_email` always keep it.
 
 Calendly bookings are matched to items by invitee email (case-insensitive,
 most-recent-send tiebreak across campaigns). Unmatched Calendly bookings appear
@@ -970,11 +1001,23 @@ the Bookings tab behaves exactly as it always did.
   `calendly_events` row's real join link/meeting time, and to list unmatched
   Calendly bookings alongside pipeline-matched ones.
 
+**Deleted bookings stay deleted.** The Bookings page's Delete action (any
+status) records a tombstone in `calendly_deleted_events` before removing the
+row; manual/scheduled sync and webhooks skip tombstoned event URIs (counted as
+`ignored` in the sync result). Requires migration
+[015_calendly_deleted_events.sql](migrations/015_calendly_deleted_events.sql)
+(also in `schema.sql`) — without the table, delete fails rather than silently
+allowing the event to come back. If the deleted booking was the only active
+one behind a `booked` item, that item moves back to `waiting` so no ghost row
+stays in Bookings.
+
 ## Known limitations
 
-- **Reply checking is manual.** The Conversation Agent runs on a button click
-  or a CLI tick — there is no background poller yet, by design, until the
-  flow has been exercised against real mail.
+- **Automatic polling is opt-in and Server-only.** It runs only when
+  `AUTO_SYNC_ENABLED=true` under `Server/app.py`; a standalone Outreach
+  process (or the Vercel multi-service deployment) has no scheduler, so reply
+  checking there stays manual (button, `outreach conversation tick`,
+  `outreach automation run-once` from a cron, or `POST /automation/run`).
 - **Email only.** The Conversation Agent reads and replies over IMAP/SMTP.
   LinkedIn and other channels are not handled.
 - **Meeting detection has two independent paths, not fully unified.** A

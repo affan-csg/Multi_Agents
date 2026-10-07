@@ -7,7 +7,8 @@ Get the full CSG Agents system (Research + Outreach + Dashboard) running in ~5 m
 - Python 3.11+
 - Node.js 20+
 - Two terminal windows/tabs
-- API keys: Gemini (required), SMTP credentials (required), Hunter.io, Anthropic, Groq+Tavily (optional)
+- Two Supabase projects (one per agent) with each `schema.sql` applied
+- API keys: Gemini (required for discovery), SMTP credentials (required to send), IMAP credentials (to detect replies), Hunter.io (contacts), Anthropic, Groq+Tavily (optional)
 
 ## 1. Clone & navigate
 
@@ -29,10 +30,17 @@ cp Research_Agent/.env.example Research_Agent/.env
 cp Outreach_Agent/.env.example Outreach_Agent/.env
 # Edit and fill: OUTREACH_SUPABASE_URL, OUTREACH_SUPABASE_SERVICE_KEY, SMTP_*, RESEARCH_API_BASE
 
+# Server (Dashboard login password)
+cp Server/.env.example Server/.env
+# Edit and fill: DASHBOARD_PASSWORD  (unset = every protected route returns 503)
+
 # Dashboard
 cp Dashboard/.env.example Dashboard/.env
-# Defaults are usually fine for local dev
+# VITE_API_URL defaults to http://127.0.0.1:8000 -- usually fine for local dev
 ```
+
+Apply each agent's `schema.sql` in its own Supabase project's SQL editor
+(`Research_Agent/schema.sql`, `Outreach_Agent/schema.sql`) before the first run.
 
 See the full setup docs in each project's README for details.
 
@@ -93,11 +101,14 @@ Or use the Makefile:
 make dashboard
 ```
 
-The Dashboard opens at http://localhost:5173
+The Dashboard opens at http://localhost:5173 and asks for the
+`DASHBOARD_PASSWORD` you set in `Server/.env`. If the port is taken, Vite picks
+the next free one (the backend accepts any local `:5xxx` origin).
 
 ## 6. Test the system
 
-Both agents are fully tested offline (no secrets or live APIs needed for tests):
+Both agents are fully tested offline (no secrets or live APIs needed for tests).
+Run these inside the activated venv (the Server suite imports both agents):
 
 ```bash
 # Terminal 3 (or after stopping the backend)
@@ -114,7 +125,7 @@ make test-dashboard
 - **Explore the UI**: Open http://localhost:5173 and poke around
 - **Run a research discovery**: In the Dashboard, Research tab → Runs → New Run
 - **Create a campaign**: Import prospects into Outreach, draft emails, review and send
-- **Check conversations**: Switch on the Conversation Agent per campaign to auto-reply to prospects
+- **Check conversations**: Switch on the Conversation Agent per campaign (it drafts replies; `auto_reply` sends them). Set `AUTO_SYNC_ENABLED=true` to poll the inbox and Calendly automatically
 - **View learning insights**: Outreach → Learning & Optimization tab to see patterns and recommendations
 
 ## Common commands
@@ -130,6 +141,7 @@ make test-dashboard
 
 **"One or more agents unreachable" in Dashboard?**
 - Verify backend is running on :8000 (`http://localhost:8000/docs`)
+- A 401/503 on every request means the login password is wrong or `DASHBOARD_PASSWORD` is unset on the server
 - Check `.env` files have correct Supabase URLs
 
 **Import fails in Outreach?**
