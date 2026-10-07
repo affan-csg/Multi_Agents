@@ -323,6 +323,32 @@ def test_configure_env_preserves_render_supabase_values(tmp_path, monkeypatch):
     assert os.environ["OUTREACH_SUPABASE_URL"] == "https://render-outreach.supabase.co"
 
 
+@pytest.mark.parametrize(
+    ("process_password", "expected_password"),
+    [(None, "file-password"), ("process-password", "process-password")],
+)
+def test_configure_env_loads_server_password_and_preserves_process_value(
+    tmp_path, monkeypatch, process_password, expected_password
+):
+    server_env = tmp_path / "server.env"
+    server_env.write_text(
+        "DASHBOARD_PASSWORD=file-password\n"
+        "CSG_API_BASE=http://server-env:9000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server_app, "SERVER_ENV", server_env)
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    monkeypatch.delenv("CSG_API_BASE", raising=False)
+    monkeypatch.delenv("RESEARCH_API_BASE", raising=False)
+    if process_password is not None:
+        monkeypatch.setenv("DASHBOARD_PASSWORD", process_password)
+
+    server_app._configure_env()
+
+    assert os.environ["DASHBOARD_PASSWORD"] == expected_password
+    assert os.environ["RESEARCH_API_BASE"] == "http://server-env:9000/research"
+
+
 def test_configure_env_warns_on_shared_key_mismatch(tmp_path, monkeypatch, caplog):
     for var in (
         "RESEARCH_SUPABASE_URL", "RESEARCH_SUPABASE_SERVICE_KEY",

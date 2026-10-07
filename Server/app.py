@@ -55,6 +55,7 @@ logger = logging.getLogger("csg_server")
 
 SERVER_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = SERVER_ROOT.parent
+SERVER_ENV = SERVER_ROOT / ".env"
 RESEARCH_ENV = REPO_ROOT / "Research_Agent" / ".env"
 OUTREACH_ENV = REPO_ROOT / "Outreach_Agent" / ".env"
 
@@ -74,8 +75,12 @@ def _configure_env() -> None:
     never overrides a value the environment already had (matches
     python-dotenv's own default override=False behavior, so an operator who
     sets these directly, e.g. in a container, is always respected)."""
+    server_env = dotenv_values(SERVER_ENV) if SERVER_ENV.exists() else {}
     research_env = dotenv_values(RESEARCH_ENV) if RESEARCH_ENV.exists() else {}
     outreach_env = dotenv_values(OUTREACH_ENV) if OUTREACH_ENV.exists() else {}
+
+    for key, value in server_env.items():
+        _set_default(key, value)
 
     _set_default("RESEARCH_SUPABASE_URL", research_env.get("RESEARCH_SUPABASE_URL"))
     _set_default("RESEARCH_SUPABASE_SERVICE_KEY", research_env.get("RESEARCH_SUPABASE_SERVICE_KEY"))
