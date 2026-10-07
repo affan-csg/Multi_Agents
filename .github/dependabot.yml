@@ -1,0 +1,67 @@
+version: 2
+updates:
+  # Python dependencies in Research_Agent
+  - package-ecosystem: "pip"
+    directory: "/Research_Agent"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    allow:
+      - dependency-type: "all"
+    reviewers:
+      - "justkhanj"
+    labels:
+      - "dependencies"
+      - "python"
+
+  # Python dependencies in Outreach_Agent
+  - package-ecosystem: "pip"
+    directory: "/Outreach_Agent"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    allow:
+      - dependency-type: "all"
+    reviewers:
+      - "justkhanj"
+    labels:
+      - "dependencies"
+      - "python"
+
+  # Python dependencies in Server
+  - package-ecosystem: "pip"
+    directory: "/Server"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    allow:
+      - dependency-type: "all"
+    reviewers:
+      - "justkhanj"
+    labels:
+      - "dependencies"
+      - "python"
+
+  # Node dependencies in Dashboard
+  - package-ecosystem: "npm"
+    directory: "/Dashboard"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+    allow:
+      - dependency-type: "all"
+    reviewers:
+      - "justkhanj"
+    labels:
+      - "dependencies"
+      - "javascript"
+    # Batch minor and patch updates; keep major updates separate for safety
+    groups:
+      - dependency-type: "dev-dependencies"
+        update-types: ["minor", "patch"]
+      - dependency-type: "production"
+        update-types: ["minor", "patch"]
