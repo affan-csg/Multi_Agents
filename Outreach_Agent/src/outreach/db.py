@@ -22,9 +22,11 @@ from dotenv import load_dotenv
 
 from .config import PROJECT_ROOT
 from .models import (
+    AutomationState,
     Campaign,
     ConversationMessage,
     ConversationSettings,
+    FollowupAttempt,
     ImportedProspect,
     OutreachEvent,
     OutreachItem,
@@ -283,6 +285,10 @@ def delete_by_research_run(conn: SupabaseConn, run_id: str) -> dict[str, int]:
 
 def create_item(conn: SupabaseConn, item: OutreachItem) -> None:
     row = item.model_dump(mode="json")
+    if not row.get("sender_email"):
+        # Omitted rather than sent as null so campaign creation keeps working
+        # on a database where the sender_email migration is not applied yet.
+        row.pop("sender_email", None)
     now = _iso(utcnow())
     row["created_at"] = row["created_at"] or now
     row["stage_updated_at"] = row["stage_updated_at"] or now
@@ -343,16 +349,28 @@ def set_stage(conn: SupabaseConn, item_id: str, stage: str, *, actor: str = "sys
     ))
 
 
-def mark_sent(conn: SupabaseConn, item_id: str, provider_message_id: Optional[str] = None) -> None:
+def mark_sent(
+    conn: SupabaseConn, item_id: str, provider_message_id: Optional[str] = None,
+    sender_email: Optional[str] = None,
+) -> None:
     now = utcnow()
-    conn.update("outreach_items", {
+    fields: dict[str, Any] = {
         "sent_at": _iso(now), "provider_message_id": provider_message_id, "error": None,
-    }, item_id=f"eq.{item_id}")
+    }
+    if sender_email:
+        # The mailbox that actually sent this email; follow-ups and replies
+        # for the item continue from it.
+        fields["sender_email"] = sender_email
+    conn.update("outreach_items", fields, item_id=f"eq.{item_id}")
     set_stage(conn, item_id, "sent", actor="system", detail={"provider_message_id": provider_message_id})
 
 
-def mark_failed(conn: SupabaseConn, item_id: str, error: str) -> None:
-    conn.update("outreach_items", {"error": error}, item_id=f"eq.{item_id}")
+def mark_failed(conn: SupabaseConn, item_id: str, error: str, sender_email: Optional[str] = None) -> None:
+    fields: dict[str, Any] = {"error": error}
+    if sender_email:
+        # A failed send is still attributable to the mailbox that attempted it.
+        fields["sender_email"] = sender_email
+    conn.update("outreach_items", fields, item_id=f"eq.{item_id}")
     set_stage(conn, item_id, "failed", actor="system", detail={"error": error})
 
 
@@ -501,3 +519,116 @@ def list_conversation_items(conn: SupabaseConn, campaign_id: str, stages: list[s
         order="created_at.desc",
     )
     return [OutreachItem(**r) for r in rows]
+
+
+# --- follow-up idempotency ledger ---------------------------------------------
+
+def claim_followup_attempt(conn: SupabaseConn, item_id: str, number: int) -> Optional[FollowupAttempt]:
+    """Claim "send follow-up `number` for this item". Returns the new ledger
+    row if this caller won, None if the number was already claimed.
+
+    The UNIQUE (item_id, followup_number) constraint is the guarantee: it is
+    enforced by Postgres, so overlapping ticks, a restart mid-send, or a second
+    replica cannot both win. A read-first check keeps the common case cheap and
+    a constraint violation on the insert is treated the same as losing."""
+    existing = conn.select(
+        "followup_attempts", item_id=f"eq.{item_id}", followup_number=f"eq.{number}", limit=1,
+    )
+    if existing:
+        return None
+    now = utcnow()
+    row = FollowupAttempt(
+        attempt_id=f"fu-{item_id}-{number}", item_id=item_id, followup_number=number,
+        status="claimed", claimed_at=now, updated_at=now,
+    )
+    try:
+        conn.insert("followup_attempts", [row.model_dump(mode="json")])
+    except SupabaseError as e:
+        if "23505" in str(e) or "duplicate key" in str(e).lower() or " 409" in str(e):
+            return None
+        raise
+    return row
+
+
+def update_followup_attempt(conn: SupabaseConn, item_id: str, number: int, **fields: Any) -> None:
+    fields["updated_at"] = _iso(utcnow())
+    conn.update(
+        "followup_attempts", fields,
+        item_id=f"eq.{item_id}", followup_number=f"eq.{number}",
+    )
+
+
+def get_followup_attempt(conn: SupabaseConn, item_id: str, number: int) -> Optional[FollowupAttempt]:
+    rows = conn.select(
+        "followup_attempts", item_id=f"eq.{item_id}", followup_number=f"eq.{number}", limit=1,
+    )
+    return FollowupAttempt(**rows[0]) if rows else None
+
+
+def reclaim_failed_followup(conn: SupabaseConn, item_id: str, number: int) -> bool:
+    """Take a `failed` attempt back to `claimed` for a retry. A conditional
+    PATCH so two ticks cannot both retry the same failure."""
+    won = conn.update_returning(
+        "followup_attempts", {"status": "claimed", "updated_at": _iso(utcnow())},
+        item_id=f"eq.{item_id}", followup_number=f"eq.{number}", status="eq.failed",
+    )
+    return bool(won)
+
+
+def list_followup_attempts(conn: SupabaseConn, item_id: str) -> list[FollowupAttempt]:
+    rows = conn.select("followup_attempts", item_id=f"eq.{item_id}", order="followup_number.asc")
+    return [FollowupAttempt(**r) for r in rows]
+
+
+# --- automation (scheduler) state and lease -------------------------------------
+
+def get_automation_state(conn: SupabaseConn, job: str = "sync") -> AutomationState:
+    """The job's state row; a default (never run) when none exists yet."""
+    rows = conn.select("automation_state", job=f"eq.{job}", limit=1)
+    return AutomationState(**rows[0]) if rows else AutomationState(job=job)
+
+
+def update_automation_state(conn: SupabaseConn, job: str, **fields: Any) -> None:
+    """Merge `fields` into the job's row, creating it if needed."""
+    current = conn.select("automation_state", job=f"eq.{job}", limit=1)
+    fields = {k: (_iso(v) if isinstance(v, datetime) else v) for k, v in fields.items()}
+    fields["updated_at"] = _iso(utcnow())
+    if current:
+        conn.update("automation_state", fields, job=f"eq.{job}")
+    else:
+        row = AutomationState(job=job).model_dump(mode="json")
+        row.update(fields)
+        conn.upsert("automation_state", [row], on_conflict="job")
+
+
+def claim_automation_lease(
+    conn: SupabaseConn, job: str, owner: str, *, now: datetime, until: datetime,
+) -> bool:
+    """Take the scheduler lease. True if this caller won it.
+
+    Same shape as claim_conversation_lock: conditional PATCHes, so exactly one
+    concurrent caller (another replica, a CLI run, the API button) can win, and
+    a lease stranded by a crash expires on its own at `until`."""
+    if not conn.select("automation_state", job=f"eq.{job}", limit=1):
+        update_automation_state(conn, job)  # ensure the row exists
+    values = {"locked_by": owner, "locked_until": _iso(until), "last_started_at": _iso(now)}
+    for cond in ({"locked_until": "is.null"}, {"locked_until": f"lt.{_iso(now)}"}):
+        if conn.update_returning("automation_state", values, job=f"eq.{job}", **cond):
+            return True
+    return False
+
+
+def renew_automation_lease(
+    conn: SupabaseConn, job: str, owner: str, *, until: datetime,
+) -> bool:
+    return bool(conn.update_returning(
+        "automation_state", {"locked_until": _iso(until)},
+        job=f"eq.{job}", locked_by=f"eq.{owner}",
+    ))
+
+
+def release_automation_lease(conn: SupabaseConn, job: str, owner: str) -> None:
+    conn.update(
+        "automation_state", {"locked_by": None, "locked_until": None},
+        job=f"eq.{job}", locked_by=f"eq.{owner}",
+    )

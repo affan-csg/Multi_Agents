@@ -18,6 +18,7 @@ import {
 import { useCachedFetch } from "../../hooks/useCachedFetch";
 import { outreachApi, type Campaign, type OutreachAnalytics, type Stage } from "../../agents/outreach";
 import { ChartCardSkeleton, EmptyState, Icon, StatCard, StatCardSkeleton } from "../../components/ui";
+import { AnalyticsDashboard } from "./AnalyticsDashboard";
 
 const TIER_COLORS: Record<string, string> = {
   A: "#5145e8",
@@ -84,29 +85,43 @@ interface Props {
   campaigns: Campaign[];
 }
 
-export function Analytics({ campaignId, campaigns }: Props) {
+interface PageProps extends Props {
+  onCampaignChange: (id: string | "all") => void;
+}
+
+/** Outreach → Analytics: sending-account / campaign / booking dashboard (see
+ *  AnalyticsDashboard.tsx) with the original pipeline view kept beneath its
+ *  Overview tab. */
+export function Analytics({ campaignId, campaigns, onCampaignChange }: PageProps) {
+  const campaignLabel =
+    campaignId === "all" ? "All campaigns" : campaigns.find((c) => c.campaign_id === campaignId)?.name || campaignId;
+  return (
+    <>
+      <Head label={campaignLabel} />
+      <AnalyticsDashboard
+        campaignId={campaignId}
+        campaigns={campaigns}
+        onCampaignChange={onCampaignChange}
+        pipeline={<PipelineOverview campaignId={campaignId} campaigns={campaigns} />}
+      />
+    </>
+  );
+}
+
+function PipelineOverview({ campaignId }: Props) {
   const { data, error: fetchError } = useCachedFetch<OutreachAnalytics>(
     `outreach-analytics:${campaignId}`,
     () => outreachApi.analytics(campaignId),
   );
   const error = fetchError ? String(fetchError) : null;
 
-  const campaignLabel =
-    campaignId === "all" ? "All campaigns" : campaigns.find((c) => c.campaign_id === campaignId)?.name || campaignId;
-
   if (error) {
-    return (
-      <>
-        <Head />
-        <p className="error-text">{error}</p>
-      </>
-    );
+    return <p className="error-text">{error}</p>;
   }
 
   if (!data) {
     return (
       <>
-        <Head label={campaignLabel} />
         <div className="stat-grid">
           <StatCardSkeleton />
           <StatCardSkeleton />
@@ -128,7 +143,6 @@ export function Analytics({ campaignId, campaigns }: Props) {
   if (data.total_items === 0) {
     return (
       <>
-        <Head />
         <div className="card">
           <EmptyState
             icon="chart"
@@ -148,8 +162,6 @@ export function Analytics({ campaignId, campaigns }: Props) {
 
   return (
     <>
-      <Head label={campaignLabel} />
-
       <div className="stat-grid">
         <StatCard icon="send" tone="accent" value={data.total_items.toLocaleString()} label="Prospects in scope" />
         <StatCard icon="info" tone="amber" value={data.needs_review_count.toLocaleString()} label="Needs review" />
@@ -333,7 +345,7 @@ function Head({ label }: { label?: string | null }) {
       <div className="page-head-text">
         <p className="breadcrumb">Outreach Agent / <span>Analytics</span></p>
         <h1>Analytics</h1>
-        <p>Pipeline health across your outreach — funnel progression, personalization, and reply performance.</p>
+        <p>Email and campaign performance — by sending account, campaign and booking, with the full pipeline view.</p>
       </div>
       {label && (
         <div className="page-head-actions">

@@ -8,7 +8,7 @@ below); the Dashboard is still its own dev server.
 | Project | What it does | Reached at |
 |---|---|---|
 | [Research_Agent](Research_Agent/README.md) | Discovers US companies, scores/tiers them as staffing prospects, finds contacts, and (optionally) runs an LLM qualification pass (`csg qualify`). | `:8000/research` |
-| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent** (replies/follow-ups after send) and the **Feedback Learning / Optimization Agent** (learns from performance, edits, outcomes; feeds insights back into drafts). | `:8000/outreach` |
+| [Outreach_Agent](Outreach_Agent/README.md) | Pulls qualified (Tier A/B) companies from Research over HTTP, builds campaigns, drafts personalized emails, and sends them. Also hosts the **Conversation Agent** (replies/follow-ups after send), the **Feedback Learning / Optimization Agent** (learns from performance, edits, outcomes; feeds insights back into drafts), and the **Analytics Dashboard** (multi-account, multi-campaign, per-sender analytics with drill-down). | `:8000/outreach` |
 | [Dashboard](Dashboard/README.md) | The only UI for both agents — a React/Vite app that talks to both backends directly from the browser. No database or backend of its own. Includes a dedicated Learning & Optimization tab under Outreach Agent. | `:5173` |
 
 ```
@@ -188,7 +188,15 @@ project — see each one's own README:
    detected patterns, human-edit trends, campaign comparison, strategy
    insights, adoption tracking, and drill-down into the data behind each
    insight.
-8. **Calendly** (Dashboard) — one page, capsule tabs at the top (Bookings |
+8. **Analyze** (Analytics Dashboard) — real-time email and campaign performance
+   by sending account, campaign, and individual prospect. Overview tab shows
+   key metrics (prospects, sends, reply rate, booking rate), pipeline funnel,
+   personalization sources, tier mix, and sends over time. Email Accounts tab
+   breaks down per-sender metrics and trends. Campaigns tab compares campaigns
+   with response/booking rates. Bookings tab shows booked prospects across
+   campaigns. Filters allow drilling by account, campaign, and date range.
+   Prospect drill-down shows full conversation thread and follow-up history.
+9. **Calendly** (Dashboard) — one page, capsule tabs at the top (Bookings |
    Event Types), no separate nav items. Bookings: every prospect currently
    in `booked`, across every campaign, in one list, with All/Upcoming/Past
    filters, search, sort, and per-booking cancel/mark-no-show/delete actions

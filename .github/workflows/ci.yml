@@ -31,7 +31,7 @@ jobs:
         run: pytest -v
 
   outreach-agent:
-    name: Outreach Agent tests (Outreach + Conversation + Learning + Optimization)
+    name: Outreach Agent tests (Outreach + Conversation + Learning + Optimization + Analytics)
     runs-on: ubuntu-latest
     defaults:
       run:

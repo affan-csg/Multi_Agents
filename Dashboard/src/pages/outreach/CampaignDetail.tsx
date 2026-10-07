@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AGENT_OWNED_STAGES,
   MANUAL_STAGES,
   outreachApi,
   STAGE_ORDER,
+  type AutomationStatus,
   type Campaign,
   type ConversationSettings,
   type ImportedProspect,
@@ -20,6 +21,15 @@ import { RunOverlay } from "../../components/RunOverlay";
 import { useCachedFetch, invalidate, patch } from "../../hooks/useCachedFetch";
 import { ConfirmModal } from "../../components/ConfirmModal";
 import { routeToPath } from "../../router";
+
+/** UTC ISO timestamp -> short local-time string, "never" when absent. The
+ *  server stores and compares everything in UTC; this is display only. */
+function fmtUtc(iso: string | null | undefined): string {
+  if (!iso) return "never";
+  const d = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`);
+  if (Number.isNaN(d.getTime())) return "unknown";
+  return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
 
 const STAGE_LABEL: Record<Stage, string> = {
   needs_review: "Needs Review",
@@ -280,6 +290,53 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
       setConvSettings(updated);
     } catch (e) {
       setConvSettings(previous);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // Polling status line: last/next sync and the interval. Re-read every
+  // minute (cheap GET) so "next sync" stays honest without a manual refresh;
+  // when the scheduler completes a cycle the board is refreshed too.
+  const [automation, setAutomation] = useState<AutomationStatus | null>(null);
+  const lastSyncSeen = useRef<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      outreachApi.automationStatus()
+        .then((st) => {
+          if (cancelled) return;
+          setAutomation(st);
+          if (lastSyncSeen.current && st.last_success_at && st.last_success_at !== lastSyncSeen.current) {
+            refreshItems();
+          }
+          lastSyncSeen.current = st.last_success_at;
+        })
+        .catch(() => { /* status is informational; never block the page */ });
+    load();
+    const id = window.setInterval(load, 60_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaignId]);
+
+  // Optimistic like the Conversation Agent switch; persisted server-side, so
+  // it survives restarts. Off stops scheduled cycles only -- manual buttons
+  // and all stored state are untouched.
+  async function handleAutoSyncToggle() {
+    if (!automation) return;
+    const previous = automation;
+    setAutomation({ ...automation, enabled: !automation.enabled });
+    try {
+      setAutomation(await outreachApi.setAutomationEnabled(!previous.enabled));
+    } catch (e) {
+      setAutomation(previous);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function handleIntervalChange(minutes: number) {
+    try {
+      setAutomation(await outreachApi.setAutomationInterval(minutes));
+    } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }
@@ -816,6 +873,98 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
       </div>
 
       {error && <p className="error-text">{error}</p>}
+
+      <div className="sync-card" data-testid="automation-status">
+        <div className="sync-card-head">
+          <button
+            type="button"
+            className={`conv-switch${automation?.enabled ? " conv-switch--on" : ""}`}
+            role="switch"
+            aria-checked={automation?.enabled ?? false}
+            aria-label="Automatic Sync"
+            disabled={!automation}
+            onClick={handleAutoSyncToggle}
+          >
+            <span className="conv-switch-knob" />
+          </button>
+          <div className="sync-card-title">
+            <strong>Automatic Sync</strong>
+            <span className={`sync-pill${automation?.enabled ? " sync-pill--on" : ""}`}>
+              {automation ? (automation.enabled ? "On" : "Off") : "…"}
+            </span>
+          </div>
+          {automation && (
+            <label className="sync-card-interval">
+              Sync every
+              <select
+                value={automation.interval_minutes}
+                onChange={(e) => handleIntervalChange(Number(e.target.value))}
+              >
+                {[5, 10, 15, 30, 60, 120, 360].includes(automation.interval_minutes)
+                  ? null
+                  : <option value={automation.interval_minutes}>{automation.interval_minutes}</option>}
+                {[5, 10, 15, 30, 60, 120, 360].map((m) => (
+                  <option key={m} value={m}>{m} min</option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
+
+        {automation ? (
+          <div className="sync-card-stats">
+            <div className="sync-stat">
+              <span className="sync-stat-label">Inbox synced</span>
+              <span className="sync-stat-value">{fmtUtc(automation.last_inbox_success_at)}</span>
+            </div>
+            <div className="sync-stat">
+              <span className="sync-stat-label">Calendly synced</span>
+              <span className="sync-stat-value">{fmtUtc(automation.last_calendly_success_at)}</span>
+            </div>
+            <div className="sync-stat">
+              <span className="sync-stat-label">Next sync</span>
+              <span className="sync-stat-value">
+                {!automation.enabled
+                  ? "Paused"
+                  : !automation.scheduler_enabled
+                    ? "Not scheduled"
+                    : automation.running ? "Running now" : fmtUtc(automation.next_run_at)}
+              </span>
+            </div>
+            {convSettings && (
+              <div className="sync-stat">
+                <span className="sync-stat-label">Follow-ups</span>
+                <span className="sync-stat-value">
+                  {convSettings.enabled && convSettings.auto_reply ? "Sent automatically" : "Drafted for approval"}
+                </span>
+              </div>
+            )}
+          </div>
+        ) : (
+          <p className="hint">Loading sync status…</p>
+        )}
+
+        {automation && !automation.enabled && (
+          <p className="sync-note">Paused — manual “Check replies” and “Sync Calendly” still work.</p>
+        )}
+        {automation?.enabled && !automation.scheduler_enabled && (
+          <p className="sync-note sync-note--warn">
+            The server scheduler isn’t running, so nothing will sync on its own. Set AUTO_SYNC_ENABLED=true on the server.
+          </p>
+        )}
+        {automation?.last_error && (
+          <p className="sync-note sync-note--error">Last error: {automation.last_error}</p>
+        )}
+
+        {convSettings && (
+          <div className="sync-card-foot">
+            Schedule: waiting after day {convSettings.followup_after_days} · follow-ups on day{" "}
+            {convSettings.followup_days.slice(0, convSettings.max_followups).join(", ")} · marked failed on day{" "}
+            {convSettings.no_response_after_days}
+          </div>
+        )}
+      </div>
+
       {bulkRedraftResult && <p className="hint">{bulkRedraftResult}</p>}
 
       {tickResult && (
@@ -1467,10 +1616,21 @@ export function CampaignDetail({ campaignId, campaignName, onBack }: Props) {
                     </div>
                   )}
 
-                  {thread && thread.followup_count > 0 && (
-                    <p className="hint">
-                      {thread.followup_count} follow-up{thread.followup_count === 1 ? "" : "s"} sent
-                      {convSettings ? ` of ${convSettings.max_followups} allowed` : ""}.
+                  {thread && thread.followup && (
+                    <p className="hint" data-testid="followup-progress">
+                      Follow-ups sent: {thread.followup.followups_sent}/{thread.followup.followups_total}
+                      {" · "}
+                      {thread.followup.next_action
+                        ? <>Next: {thread.followup.next_action}{thread.followup.next_action_at
+                            ? ` on ${fmtUtc(thread.followup.next_action_at)}` : ""}</>
+                        : <>No further action ({thread.followup.next_action_reason || "done"})</>}
+                      {thread.followup.attempts.some((a) => a.status === "failed") && (
+                        <span className="error-text">
+                          {" "}· send failed: {thread.followup.attempts.find((a) => a.status === "failed")?.error}
+                        </span>
+                      )}
+                      {thread.followup.attempts.some((a) => a.status === "claimed") &&
+                        " · a follow-up may be in an unknown state — check the sent mail before retrying"}
                     </p>
                   )}
 

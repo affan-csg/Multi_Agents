@@ -34,6 +34,8 @@ Outreach_Agent/
 │   ├── personalization/    # Email drafting & personalization
 │   ├── channels/email.py   # SMTP email sender
 │   ├── conversation/       # Reply handling, LLM conversation agent
+│   ├── analytics/          # Read-only /analytics/v2 (per-sender/campaign/booking metrics)
+│   ├── automation/         # Scheduled inbox/Calendly polling + follow-ups
 │   ├── learning/           # Feedback/learning from edits & outcomes
 │   ├── optimization/       # Campaign-level strategy optimization
 │   ├── calendly/           # Calendly API & webhook integration
@@ -82,7 +84,8 @@ cd Dashboard && npm install && npm run dev
 Each project has a `.env.example` — copy to `.env` and fill in:
 - **Research_Agent/.env**: `RESEARCH_SUPABASE_*`, `GEMINI_API_KEY`, `HUNTER_API_KEY`, etc.
 - **Outreach_Agent/.env**: `OUTREACH_SUPABASE_*`, `SMTP_*`, `RESEARCH_API_BASE`, etc.
-- **Dashboard/.env**: `VITE_RESEARCH_API_BASE`, `VITE_OUTREACH_API_BASE` (or single `VITE_API_URL`)
+- **Dashboard/.env**: `VITE_API_URL` (backend origin; `/research` and `/outreach` are appended)
+- **Server/.env**: `DASHBOARD_PASSWORD` (login password; unset = protected routes return 503)
 
 ### Running tests
 ```bash
@@ -144,7 +147,7 @@ Both agents use PostgreSQL via Supabase PostgREST:
 - `learning_insights` — detected patterns from edits
 - `campaign_optimizations` — strategy recommendations + adoption tracking
 
-All migrations are numbered in `migrations/NNN_*.sql` and tracked in git.
+All migrations are numbered in `migrations/NNN_*.sql` and tracked in git. Outreach migrations 011-013 were folded into `schema.sql` and deleted; `014_sender_email.sql` adds `outreach_items.sender_email` (per-send sender attribution for analytics), and `014b_backfill_sender_email.sql` is an optional one-time backfill, only valid if every past send came from the single default account.
 
 ## Common issues & solutions
 

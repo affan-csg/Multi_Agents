@@ -53,11 +53,13 @@ def _stub_both_dbs(monkeypatch):
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
     # `with` form is required for the lifespan (and therefore _MAIN_LOOP on
     # both sub-apps) to actually run -- bare TestClient(app) does not invoke
     # lifespan, same caveat as each agent's own API test suite documents.
     with TestClient(server_app.app) as c:
+        c.headers["Authorization"] = f"Bearer {server_app._auth_token('test-pw')}"
         yield c
 
 
@@ -347,3 +349,34 @@ def test_configure_env_warns_on_shared_key_mismatch(tmp_path, monkeypatch, caplo
         server_app._configure_env()
 
     assert any("GEMINI_API_KEY" in rec.message for rec in caplog.records)
+
+
+# --- dashboard password protection ---------------------------------------
+
+def test_dashboard_auth(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw-for-test")
+    client = TestClient(server_app.app)
+
+    assert client.get("/research/runs").status_code == 401
+    assert client.get("/outreach/campaigns", headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert client.post("/auth/login", json={"password": "wrong"}).status_code == 401
+
+    token = client.post("/auth/login", json={"password": "pw-for-test"}).json()["token"]
+    ok = client.get("/research/runs", headers={"Authorization": f"Bearer {token}"})
+    assert ok.status_code != 401
+    assert client.get(f"/research/runs?token={token}").status_code != 401
+    # Unauthenticated websocket handshakes are refused.
+    with pytest.raises(Exception):
+        with client.websocket_connect("/research/jobs/x/ws"):
+            pass
+    # Third-party webhook stays reachable without the token.
+    # (its own signature check may still answer; it just isn't *our* gate)
+    hook = client.post("/calendly/webhook", content=b"{}")
+    assert hook.status_code != 503 and hook.json().get("detail") != "Unauthorized"
+
+
+def test_dashboard_auth_fails_closed_without_password(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    client = TestClient(server_app.app)
+    assert client.get("/research/runs").status_code == 503
+    assert client.post("/auth/login", json={"password": ""}).status_code == 503

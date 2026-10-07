@@ -66,6 +66,21 @@ For separate Render services, set only the matching pair on each agent
 service. Do not configure the legacy shared `SUPABASE_URL` or
 `SUPABASE_SERVICE_KEY` names.
 
+## Dashboard password
+
+Every route except `POST /auth/login` and the Calendly webhooks requires a
+token. Set `DASHBOARD_PASSWORD` (see [.env.example](.env.example)); the
+Dashboard's login screen posts it to `/auth/login` and gets back a stateless
+HMAC token, sent as `Authorization: Bearer <token>` (or `?token=` for
+WebSockets and download links). With the variable unset the server fails
+closed: every protected route returns 503.
+
+## Automatic polling
+
+`AUTO_SYNC_ENABLED=true` starts the background loop that syncs Calendly, reads
+the inbox and sends/drafts follow-ups. It is off by default; see the
+[Outreach README](../Outreach_Agent/README.md#automatic-polling-and-follow-ups).
+
 ## Run
 
 ```

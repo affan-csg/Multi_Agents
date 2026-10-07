@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import email
 import imaplib
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,8 @@ from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # How far back a fetch looks. Generous on purpose: the cost of re-reading an
 # already-stored reply is one rejected insert, while the cost of missing one
@@ -191,7 +194,65 @@ def imap_configured() -> bool:
     return bool(os.environ.get("IMAP_HOST") and imap_username())
 
 
-def fetch_replies(*, lookback_days: int = _DEFAULT_LOOKBACK_DAYS) -> list[InboundEmail]:
+_IMAP_TIMEOUT = 30.0
+_CONNECT_ATTEMPTS = 3
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can exercise the retry path without waiting."""
+    import time
+    time.sleep(seconds)
+
+
+def _connect(host: str, port: int) -> "imaplib.IMAP4_SSL":
+    """Open the IMAP connection with a socket timeout, retrying transient
+    network failures (timeouts, resets) with backoff. Authentication errors
+    are not retried -- they are raised by login(), after this."""
+    last: Exception | None = None
+    for attempt in range(1, _CONNECT_ATTEMPTS + 1):
+        try:
+            return imaplib.IMAP4_SSL(host, port, timeout=_IMAP_TIMEOUT)
+        except (imaplib.IMAP4.error, OSError) as exc:
+            last = exc
+            if attempt < _CONNECT_ATTEMPTS:
+                _sleep(2.0 ** attempt)
+    raise InboxError(f"could not connect to IMAP host {host}:{port} -- {last}") from last
+
+
+def _since_date(lookback_days: int, since: Optional[datetime]) -> str:
+    """IMAP SINCE date (day granularity, UTC). With `since`, only mail from
+    that day onward is searched, but never further back than the lookback
+    window. Day granularity means the same day is re-read on the next poll;
+    that is harmless because ingestion dedupes on provider message id."""
+    floor = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    if since is not None:
+        s = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+        floor = max(floor, s)
+    return floor.strftime("%d-%b-%Y")
+
+
+def fetch_all_replies(cfg, *, lookback_days: int = _DEFAULT_LOOKBACK_DAYS, since: Optional[datetime] = None) -> list[InboundEmail]:
+    """Replies from the default mailbox plus every additional configured
+    account that has IMAP credentials.
+
+    The default mailbox is fetched exactly as before (its errors propagate).
+    An additional account's failure is logged and skipped so one broken
+    mailbox can never stop reply detection for the others."""
+    emails = fetch_replies(lookback_days=lookback_days, since=since)
+    for account in cfg.accounts:
+        if account.is_default or not (account.imap_host and account.imap_username):
+            continue
+        try:
+            emails.extend(fetch_replies(lookback_days=lookback_days, since=since, account=account))
+        except Exception as exc:  # noqa: BLE001 -- isolate per-account failures
+            logger.warning("reply fetch failed for %s: %s", account.identity, exc)
+    return emails
+
+
+def fetch_replies(
+    *, lookback_days: int = _DEFAULT_LOOKBACK_DAYS, since: Optional[datetime] = None,
+    account=None,
+) -> list[InboundEmail]:
     """Fetch recent messages from the configured mailbox.
 
     Returns every message in the window, not just unread ones -- read-state
@@ -202,9 +263,12 @@ def fetch_replies(*, lookback_days: int = _DEFAULT_LOOKBACK_DAYS) -> list[Inboun
     bad credentials, unreachable host); an individual message that fails to
     parse is skipped rather than failing the whole batch, so one malformed
     mail cannot block every other reply in the mailbox."""
-    host = os.environ.get("IMAP_HOST")
-    username = imap_username()
-    password = imap_password()
+    if account is not None:
+        host, username, password = account.imap_host, account.imap_username, account.imap_password
+    else:
+        host = os.environ.get("IMAP_HOST")
+        username = imap_username()
+        password = imap_password()
 
     if not host or not username:
         raise InboxError(
@@ -213,14 +277,11 @@ def fetch_replies(*, lookback_days: int = _DEFAULT_LOOKBACK_DAYS) -> list[Inboun
             "land in the mailbox the outreach was sent from."
         )
 
-    port = int(os.environ.get("IMAP_PORT", "993"))
+    port = account.imap_port if account is not None else int(os.environ.get("IMAP_PORT", "993"))
     folder = os.environ.get("IMAP_FOLDER", "INBOX")
-    since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%d-%b-%Y")
+    since_date = _since_date(lookback_days, since)
 
-    try:
-        conn = imaplib.IMAP4_SSL(host, port)
-    except (imaplib.IMAP4.error, OSError) as exc:
-        raise InboxError(f"could not connect to IMAP host {host}:{port} -- {exc}") from exc
+    conn = _connect(host, port)
 
     try:
         try:
@@ -235,7 +296,7 @@ def fetch_replies(*, lookback_days: int = _DEFAULT_LOOKBACK_DAYS) -> list[Inboun
         if status != "OK":
             raise InboxError(f"could not open IMAP folder {folder!r}")
 
-        status, data = conn.search(None, "SINCE", since)
+        status, data = conn.search(None, "SINCE", since_date)
         if status != "OK":
             raise InboxError("IMAP search failed")
 

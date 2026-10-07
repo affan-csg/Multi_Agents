@@ -410,9 +410,46 @@ code changes needed to adjust it:
   `owned_by_this_agent`).
 - `conversation` — the Conversation Agent's defaults for a campaign that has
   never been configured (both switches off). The live switch is per campaign
-  and lives in the database, not here. `followup_after_days` (default `1`)
-  is exact elapsed hours since `sent_at`, not a calendar-day boundary — `1`
-  means precisely 24 hours of silence before a `sent` item moves to Waiting.
+  and lives in the database, not here. `followup_after_days` (default `2`)
+  is exact elapsed time since `sent_at`, not a calendar-day boundary, before a
+  `sent` item moves to Waiting. See "Automatic polling and follow-ups" below
+  for `followup_days` and `no_response_after_days`.
+
+## Automatic polling and follow-ups
+
+Every 30 minutes (configurable) the server can sync Calendly, read the inbox
+once, and tick every campaign whose Conversation Agent is ON.
+
+**Schedule**, measured from the original `sent_at` in UTC: day 0 Sent, day 2
+Waiting / No Reply, day 7 follow-up #1, day 14 follow-up #2 (prompted with #1
+so it differs), day 21 terminal Failed / No Response -- the terminal move
+happens only if follow-up #2 was actually *sent* and there is still no reply,
+booking, bounce or opt-out. Defaults live in `config/outreach.yaml`
+(`conversation:`), per campaign in `conversation_settings`.
+
+**Switches:** `enabled` (agent on/off; off = no automated moves or messages,
+manual pipeline management untouched) and `auto_reply`. Follow-ups at day 7 and
+14 are always *drafted* automatically (one per number); they are *sent*
+automatically only when `enabled` AND `auto_reply` are both on, otherwise a
+person sends the draft like any other. A draft sent by hand counts as sent, so
+the sequence (and the day-21 move) continues. There is no separate follow-up
+switch.
+
+**Safety:** a follow-up is claimed in the `followup_attempts` ledger
+(`UNIQUE(item_id, followup_number)`), then item, thread, Calendly rows and the
+toggle are re-read before *and after* composing. A failed inbox or stale
+Calendly sync skips the whole follow-up phase. A send that fails is retried up
+to 3 times; an attempt left `claimed` by a crash is never resent.
+
+**Scheduler:** `Server/app.py` starts it only when `AUTO_SYNC_ENABLED=true`
+(`AUTO_SYNC_INTERVAL_MINUTES` seeds the interval; afterwards the dashboard /
+`PATCH /automation/settings` value in `automation_state` wins). All timers and
+the overlap lease live in the database, so restarts neither reset nor duplicate
+anything. Without the server loop use `outreach automation run-once` from any
+cron, or `POST /automation/run`. `outreach automation status` /
+`GET /automation/status` show last and next sync and the last error.
+
+Automation tables and endpoints live in [src/outreach/automation/](src/outreach/automation/) — fully optional, and does not affect Conversation Agent behavior if disabled.
 
 ## Tests
 
@@ -420,12 +457,12 @@ code changes needed to adjust it:
 pytest
 ```
 
-524 tests, no network (a fake in-memory PostgREST fixture in
+592 tests, no network (a fake in-memory PostgREST fixture in
 [tests/conftest.py](tests/conftest.py) stands in for Supabase; the Calendly
 suite additionally never calls `api.calendly.com` — `httpx.Client.get/post`
 is monkeypatched per test, same convention as the Gemini/Anthropic/Tavily
 tests) — 114 Outreach + 155 Conversation + 105 Learning + 38 Campaign-Level
-Optimization + 60 Calendly Integration tests, roughly:
+Optimization + 60 Calendly Integration + 20 Analytics tests, roughly:
 
 - [test_ingest.py](tests/test_ingest.py) — importing prospects from
   Research's API response shape; that a tier-matching company with no
@@ -637,6 +674,17 @@ campaigns/strategies against each other rather than diffing single edits.
   all (the pre-existing classifier-only path) is completely unchanged —
   falls back to the shared account-wide `calendly_url` exactly as before.
 
+### Analytics Dashboard (20 of the 592)
+
+- [test_analytics_v2.py](tests/test_analytics_v2.py) — per-sender and
+  per-campaign metrics with multiple sending accounts; legacy (null sender)
+  handling; rate math with zero-division safety; positive-reply and booking
+  attribution; unmatched Calendly bookings excluded from campaign/sender but
+  counted in overall; follow-ups counted correctly; combined filters
+  (sender+campaign+date range); insufficient-data flagging below minimum
+  sample; paginated fetch for >1000-row result sets; and that analytics
+  failures never block any other Outreach behavior.
+
 ## Feedback Learning Agent
 
 The Learning Agent observes everything: captures AI-original vs. human-edited
@@ -739,6 +787,83 @@ No CLI commands. Access via:
   `/recommendations`, `/adoptions`, `/adoptions/{pattern_key}/outcome`, and
   `POST /optimization/adoptions` (see
   [src/outreach/optimization/routes.py](src/outreach/optimization/routes.py)).
+
+## Analytics Dashboard
+
+A real-time, multi-account, multi-campaign, drill-down analytics dashboard
+showing email and campaign performance by sending account, campaign, and
+individual prospect. Visible in the Dashboard's **Outreach Agent → Analytics**
+page.
+
+### Tabs and metrics
+
+- **Overview**: key metrics (prospects in scope, messages sent, reply rate,
+  booking rate, failure rate), pipeline funnel by stage, personalization source
+  distribution, prospect tier mix, and sends over time — filters by account and
+  campaign.
+- **Email Accounts**: per-sender metrics and trends — reply rate, booking rate,
+  failure rate across each sending account, with comparison to the overall
+  average.
+- **Campaigns**: campaign-level comparison table showing send volume, reply
+  counts, positive replies, bookings, and derived rates — sortable,
+  filterable by account and sender.
+- **Bookings**: booked prospects across all campaigns with sender, campaign,
+  contact, and booking time, with All/Upcoming/Past filter tabs.
+
+Every number carries numerator/denominator; rates always show an insufficient
+data flag (`insufficient_data: true`) when a sample is too small to trust
+(<20 sends per group).
+
+### Attribution
+
+Sender email is recorded per send (`outreach_items.sender_email`) at the time
+an email is sent, stamped from the account actually used. All metrics group by
+this recorded sender. Follow-ups and replies inherit the item's sender. A
+backfill migration (`014b_backfill_sender_email.sql`) is available if the
+system started with a single sending account. Run it once, and only after
+confirming every historical send came from `OUTREACH_FROM_EMAIL`; otherwise
+leave it, and older sends show as "Unknown / legacy".
+
+Calendly bookings are matched to items by invitee email (case-insensitive,
+most-recent-send tiebreak across campaigns). Unmatched Calendly bookings appear
+in the Bookings tab but do not contribute to campaign or sender metrics.
+
+### Adding more sending accounts
+
+The account in `OUTREACH_FROM_EMAIL` / `SMTP_*` / `IMAP_*` is the default.
+Extra accounts are listed in `config/outreach.yaml` and get their secrets from
+prefixed env vars:
+
+```yaml
+sending:
+  accounts:
+    - from_email: sales2@example.com
+      from_name: Alex at CSG        # optional, defaults to the default account's
+      env_prefix: SENDER2
+```
+
+```
+SENDER2_SMTP_USERNAME=sales2@example.com
+SENDER2_SMTP_PASSWORD=app-password
+# Optional; host/port fall back to the default account's SMTP_*/IMAP_* values:
+# SENDER2_SMTP_HOST, SENDER2_SMTP_PORT,
+# SENDER2_IMAP_USERNAME, SENDER2_IMAP_PASSWORD, SENDER2_IMAP_HOST, SENDER2_IMAP_PORT
+```
+
+An entry without `from_email` or `env_prefix`, or one that duplicates an
+existing address, is ignored. `sending.reply_to` applies to the default account
+only. New accounts show up in the Analytics filters automatically.
+
+### Setup
+
+No additional setup beyond the Outreach schema. The read-only endpoints
+`GET /analytics/v2/summary` and `GET /analytics/v2/prospects` (filters:
+`sender`, `campaign_id`, `date_from`, `date_to`) live in
+[src/outreach/analytics/](src/outreach/analytics/); the original
+`GET /analytics` is unchanged. The schema is in
+[schema.sql](schema.sql); apply [migrations/014_sender_email.sql](migrations/014_sender_email.sql)
+to stamp sender attribution on existing deployments (already in schema.sql for
+fresh projects).
 
 ## Calendly Integration
 

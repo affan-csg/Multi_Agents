@@ -34,16 +34,22 @@ is explicitly out of scope. So this module:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
+from urllib.parse import parse_qs
 
 from dotenv import dotenv_values
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 logger = logging.getLogger("csg_server")
 
@@ -119,6 +125,8 @@ _configure_env()
 # each module's own load_dotenv() call happens at this import.
 from csg.api import app as research_app  # noqa: E402
 from outreach.api import app as outreach_app  # noqa: E402
+from outreach.automation import loop as automation_loop  # noqa: E402
+from outreach.automation import runner as automation_runner  # noqa: E402
 from outreach.calendly.routes import calendly_webhook  # noqa: E402
 
 
@@ -152,11 +160,110 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     async with AsyncExitStack() as stack:
         await stack.enter_async_context(research_app.router.lifespan_context(research_app))
         await stack.enter_async_context(outreach_app.router.lifespan_context(outreach_app))
-        yield
+
+        # Automatic inbox/Calendly polling + follow-ups. OFF unless
+        # AUTO_SYNC_ENABLED=true (the scheduler reads/writes the
+        # automation_state table from Outreach schema.sql). All timers live in the database, so
+        # restarting this process neither resets nor duplicates anything.
+        scheduler = None
+        stop = None
+        if automation_runner.scheduler_enabled():
+            import asyncio
+
+            stop = asyncio.Event()
+            scheduler = asyncio.create_task(automation_loop.run_forever(stop))
+        try:
+            yield
+        finally:
+            if scheduler is not None and stop is not None:
+                stop.set()
+                scheduler.cancel()
+                try:
+                    await scheduler
+                except BaseException:  # CancelledError on a clean shutdown
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Dashboard password protection
+# ---------------------------------------------------------------------------
+# Password comes from the DASHBOARD_PASSWORD env var (never from code). The
+# dashboard exchanges it at POST /auth/login for a stateless HMAC token, which
+# it then sends as `Authorization: Bearer <token>` (HTTP) or `?token=` (WebSocket
+# handshakes and plain download links, which can't set headers). Fail closed:
+# with no DASHBOARD_PASSWORD configured every protected route returns 503.
+_AUTH_PUBLIC_PATHS = {
+    "/auth/login",
+    # Third-party webhook (Calendly can't send our token).
+    "/calendly/webhook",
+    "/outreach/calendly/webhook",
+}
+
+
+def _dashboard_password() -> str:
+    return os.environ.get("DASHBOARD_PASSWORD", "")
+
+
+def _auth_token(password: str) -> str:
+    return hmac.new(password.encode(), b"csg-dashboard-session", hashlib.sha256).hexdigest()
+
+
+class DashboardAuthMiddleware:
+    """Pure-ASGI so it covers WebSockets as well as HTTP."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+
+        path = scope.get("path", "")
+        # CORS preflights carry no credentials by design.
+        if path in _AUTH_PUBLIC_PATHS or (scope["type"] == "http" and scope["method"] == "OPTIONS"):
+            return await self.app(scope, receive, send)
+
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        # The agents call each other over loopback HTTP (research <-> outreach
+        # hand-off). Those server-side calls come from 127.0.0.1 and, unlike any
+        # browser request, carry no Origin header.
+        client_host = (scope.get("client") or ("", 0))[0]
+        if client_host in ("127.0.0.1", "::1") and "origin" not in headers:
+            return await self.app(scope, receive, send)
+
+        password = _dashboard_password()
+        if password:
+            supplied = ""
+            authz = headers.get("authorization", "")
+            if authz.lower().startswith("bearer "):
+                supplied = authz[7:].strip()
+            if not supplied:
+                query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+                supplied = (query.get("token") or [""])[0]
+            if hmac.compare_digest(supplied, _auth_token(password)):
+                return await self.app(scope, receive, send)
+            status, detail = 401, "Unauthorized"
+        else:
+            status, detail = 503, "DASHBOARD_PASSWORD is not configured on the server"
+
+        if scope["type"] == "websocket":
+            await receive()  # websocket.connect
+            await send({"type": "websocket.close", "code": 4401})
+            return
+        body = json.dumps({"detail": detail}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
 
 
 app = FastAPI(title="CSG Agents API", lifespan=_lifespan)
 
+# Added before CORS: the last-added middleware is outermost, so CORS wraps auth
+# and 401 responses still carry CORS headers the browser can read.
+app.add_middleware(DashboardAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://multi-agents-beta.vercel.app"],
@@ -175,3 +282,17 @@ app.mount("/outreach", outreach_app)
 # duplicated: this is the same function object, just also reachable at the
 # un-prefixed path.
 app.add_api_route("/calendly/webhook", calendly_webhook, methods=["POST"])
+
+
+class _LoginBody(BaseModel):
+    password: str = ""
+
+
+@app.post("/auth/login")
+def dashboard_login(body: _LoginBody):
+    password = _dashboard_password()
+    if not password:
+        return JSONResponse({"detail": "DASHBOARD_PASSWORD is not configured on the server"}, status_code=503)
+    if not hmac.compare_digest(body.password.encode(), password.encode()):
+        return JSONResponse({"detail": "Incorrect password"}, status_code=401)
+    return {"token": _auth_token(password)}

@@ -510,7 +510,9 @@ function App() {
           />
         )}
 
-        {route.name === "outreach-analytics" && <OutreachAnalytics campaignId={scopeCampaign} campaigns={campaigns} />}
+        {route.name === "outreach-analytics" && (
+          <OutreachAnalytics campaignId={scopeCampaign} campaigns={campaigns} onCampaignChange={setScopeCampaign} />
+        )}
 
         {route.name === "outreach-learning" && <OutreachLearning />}
       </main>

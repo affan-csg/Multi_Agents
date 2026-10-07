@@ -22,6 +22,36 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config" / "outreach.yaml"
 load_dotenv(PROJECT_ROOT / ".env")
 
 
+@dataclass(frozen=True)
+class SenderAccount:
+    """One sending mailbox. `from_email` is the identity analytics group by --
+    it is stamped on every item/message the account sends, so it must be
+    unique per account (compared case-insensitively)."""
+
+    from_email: str
+    from_name: str
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_username: str = ""
+    imap_password: str = ""
+    is_default: bool = False
+
+    @property
+    def identity(self) -> str:
+        """What gets stored as the sender: the From address, or the SMTP login
+        when no From address is configured (the From header then defaults to
+        the login on most relays)."""
+        return self.from_email or self.smtp_username
+
+
+def _account_env(prefix: str, name: str, fallback: str = "") -> str:
+    return (os.environ.get(f"{prefix}_{name}") or fallback or "").strip()
+
+
 @dataclass
 class Config:
     raw: dict[str, Any]
@@ -59,6 +89,68 @@ class Config:
     @property
     def from_name(self) -> str:
         return os.environ.get("OUTREACH_FROM_NAME") or self.sending.get("from_name") or "Outreach"
+
+    @property
+    def accounts(self) -> list[SenderAccount]:
+        """Every sending account, default first.
+
+        The default account is the pre-existing single-account setup
+        (OUTREACH_FROM_EMAIL / SMTP_* / IMAP_* env vars), unchanged. Further
+        accounts are listed in outreach.yaml under `sending.accounts`; each
+        entry has `from_email`, optional `from_name`, and an `env_prefix` whose
+        `<PREFIX>_SMTP_USERNAME`, `_SMTP_PASSWORD`, `_SMTP_HOST`, `_SMTP_PORT`,
+        `_IMAP_USERNAME`, `_IMAP_PASSWORD`, `_IMAP_HOST`, `_IMAP_PORT` env vars
+        hold its secrets (host/port fall back to the default account's, so two
+        mailboxes on one provider need only a username and password)."""
+        default = SenderAccount(
+            from_email=self.from_email,
+            from_name=self.from_name,
+            smtp_host=(os.environ.get("SMTP_HOST") or "").strip(),
+            smtp_port=int(os.environ.get("SMTP_PORT") or 587),
+            smtp_username=(os.environ.get("SMTP_USERNAME") or "").strip(),
+            smtp_password=os.environ.get("SMTP_PASSWORD") or "",
+            imap_host=(os.environ.get("IMAP_HOST") or "").strip(),
+            imap_port=int(os.environ.get("IMAP_PORT") or 993),
+            imap_username=(os.environ.get("IMAP_USERNAME") or os.environ.get("SMTP_USERNAME") or "").strip(),
+            imap_password=os.environ.get("IMAP_PASSWORD") or os.environ.get("SMTP_PASSWORD") or "",
+            is_default=True,
+        )
+        out = [default]
+        seen = {default.from_email.lower()}
+        for entry in self.sending.get("accounts") or []:
+            email_addr = str(entry.get("from_email") or "").strip()
+            prefix = str(entry.get("env_prefix") or "").strip()
+            if not email_addr or not prefix or email_addr.lower() in seen:
+                continue
+            seen.add(email_addr.lower())
+            smtp_user = _account_env(prefix, "SMTP_USERNAME")
+            smtp_pass = os.environ.get(f"{prefix}_SMTP_PASSWORD") or ""
+            out.append(SenderAccount(
+                from_email=email_addr,
+                from_name=str(entry.get("from_name") or default.from_name),
+                smtp_host=_account_env(prefix, "SMTP_HOST", default.smtp_host),
+                smtp_port=int(_account_env(prefix, "SMTP_PORT") or default.smtp_port),
+                smtp_username=smtp_user,
+                smtp_password=smtp_pass,
+                imap_host=_account_env(prefix, "IMAP_HOST", default.imap_host),
+                imap_port=int(_account_env(prefix, "IMAP_PORT") or default.imap_port),
+                imap_username=_account_env(prefix, "IMAP_USERNAME", smtp_user),
+                imap_password=os.environ.get(f"{prefix}_IMAP_PASSWORD") or smtp_pass,
+            ))
+        return out
+
+    def account_for(self, sender_email: str | None = None) -> SenderAccount:
+        """The account that sends as `sender_email`, or the default account
+        when none is given or it is no longer configured. Follow-ups and
+        replies pass the item's stored sender so a conversation always
+        continues from the mailbox that started it."""
+        accounts = self.accounts
+        wanted = (sender_email or "").strip().lower()
+        if wanted:
+            for acct in accounts:
+                if acct.from_email.lower() == wanted:
+                    return acct
+        return accounts[0]
 
     @property
     def dry_run(self) -> bool:
@@ -123,8 +215,10 @@ class Config:
             # never by itself authorize sending.
             "enabled": bool(cfg.get("enabled", False)),
             "auto_reply": bool(cfg.get("auto_reply", False)),
-            "followup_after_days": int(cfg.get("followup_after_days", 3)),
+            "followup_after_days": int(cfg.get("followup_after_days", 2)),
             "max_followups": int(cfg.get("max_followups", 2)),
+            "followup_days": [int(d) for d in cfg.get("followup_days", [7, 14])],
+            "no_response_after_days": int(cfg.get("no_response_after_days", 21)),
         }
 
     @property

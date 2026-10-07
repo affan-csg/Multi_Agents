@@ -5,6 +5,7 @@
  *  as that agent's API changes. */
 
 import { agentBaseUrl } from "./registry";
+import { withToken } from "../auth";
 
 const BASE = agentBaseUrl("research");
 
@@ -478,14 +479,14 @@ export const researchApi = {
    *  GET /runs/{run_id}/export/excel|pdf) -- plain download links, not
    *  fetch() calls, so the browser's native file-download flow handles the
    *  streamed response (same pattern as any `<a href>` file download). */
-  exportExcelUrl: (runId: string) => `${BASE}/runs/${runId}/export/excel`,
-  exportPdfUrl: (runId: string) => `${BASE}/runs/${runId}/export/pdf`,
+  exportExcelUrl: (runId: string) => withToken(`${BASE}/runs/${runId}/export/excel`),
+  exportPdfUrl: (runId: string) => withToken(`${BASE}/runs/${runId}/export/pdf`),
 
   jobStatus: (jobId: string) => req<JobSnapshot>(`/jobs/${jobId}`),
 
   jobSocket: (jobId: string, onMessage: (s: JobSnapshot) => void): WebSocket => {
     const wsBase = BASE.replace(/^http/, "ws");
-    const ws = new WebSocket(`${wsBase}/jobs/${jobId}/ws`);
+    const ws = new WebSocket(withToken(`${wsBase}/jobs/${jobId}/ws`));
     ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
     return ws;
   },

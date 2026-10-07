@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from . import db
-from .channels import SendError, send as send_via_channel
+from .channels import SendError, send as send_via_channel, sender_identity
 from .config import Config
 from .db import SupabaseConn
 from .personalize import draft_message
@@ -36,7 +36,7 @@ class SendStats:
 
 def send_campaign(
     conn: SupabaseConn, cfg: Config, campaign_id: str, *,
-    on_progress: Optional[ProgressFn] = None,
+    on_progress: Optional[ProgressFn] = None, sender_email: Optional[str] = None,
 ) -> SendStats:
     """Send every `pending` item in a campaign: draft a message, send it via
     the item's channel, and record the outcome. Rate-limited per
@@ -78,15 +78,19 @@ def send_campaign(
                 personalized_from=draft.personalized_from, to_email=prospect.contact_email,
             )
 
+        # Resolve once and use the same value for the send and the stored
+        # sender, so analytics attribute the email to the mailbox that
+        # actually sent it (never to a campaign-level setting).
+        actual_sender = sender_identity(cfg, sender_email)
         try:
             message_id = send_via_channel(
                 cfg, item.channel, to_email=prospect.contact_email,
-                subject=subject, body=body,
+                subject=subject, body=body, sender_email=actual_sender,
             )
-            db.mark_sent(conn, item.item_id, provider_message_id=message_id)
+            db.mark_sent(conn, item.item_id, provider_message_id=message_id, sender_email=actual_sender)
             stats.sent += 1
         except SendError as exc:
-            db.mark_failed(conn, item.item_id, str(exc))
+            db.mark_failed(conn, item.item_id, str(exc), sender_email=actual_sender)
             stats.failed += 1
             stats.errors[item.research_domain] = str(exc)
 

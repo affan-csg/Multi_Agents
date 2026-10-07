@@ -57,10 +57,9 @@ def test_does_not_move_to_waiting_before_the_threshold():
     assert followup.should_move_to_waiting(_item(sent_at=NOW - timedelta(days=1)), _settings(), now=NOW) is False
 
 
-def test_default_followup_after_days_is_one_ie_24_hours():
-    """The actual default a brand-new campaign gets: exactly 24 hours of
-    silence, not a calendar-day boundary -- should_move_to_waiting compares
-    exact elapsed time since sent_at (see followup.days_since)."""
+def test_waiting_threshold_is_exact_elapsed_time_not_a_calendar_day():
+    """should_move_to_waiting compares exact elapsed time since sent_at (see
+    followup.days_since): with a 1-day setting, precisely 24 hours."""
     settings = _settings(followup_after_days=1)
 
     just_under_24h = _item(sent_at=NOW - timedelta(hours=23, minutes=59))
@@ -72,14 +71,17 @@ def test_default_followup_after_days_is_one_ie_24_hours():
     assert followup.should_move_to_waiting(just_over_24h, settings, now=NOW) is True
 
 
-def test_new_campaign_settings_default_to_24h_followup(conn):
+def test_new_campaign_settings_default_to_the_day_2_7_14_21_schedule(conn):
     """What a campaign that has never been configured actually gets --
-    get_settings' constructed default, not just the ConversationSettings
-    model's own field default."""
+    get_settings' constructed default, not just the model's field default."""
     from outreach.conversation.settings import get_settings
 
     settings = get_settings(conn, "never-configured-campaign")
-    assert settings.followup_after_days == 1
+    assert settings.followup_after_days == 2
+    assert settings.followup_days == [7, 14]
+    assert settings.no_response_after_days == 21
+    # Never sends on its own until someone turns it on.
+    assert settings.auto_reply is False and settings.enabled is False
 
 
 def test_never_moves_to_waiting_once_they_replied():
@@ -95,58 +97,61 @@ def test_only_sent_items_move_to_waiting():
 
 
 # ---------------------------------------------------------------------------
-# sending a nudge
+# which follow-up is due (pure; full day-by-day coverage is in
+# test_followup_schedule.py)
 # ---------------------------------------------------------------------------
 
+def _action(item, settings=None, **ctx):
+    return followup.next_action(
+        item, settings or _settings(), followup.FollowupContext(**ctx), now=NOW,
+    )
+
+
 def test_followup_due_for_a_silent_waiting_item():
-    item = _item(stage="waiting", sent_at=NOW - timedelta(days=5), followup_count=0)
-    assert followup.should_send_followup(item, _settings(), None, now=NOW) is True
+    item = _item(stage="waiting", sent_at=NOW - timedelta(days=8), followup_count=0)
+    action = _action(item)
+    assert action.kind == "send_followup" and action.number == 1
 
 
 def test_never_follows_up_someone_who_replied():
     """The most damaging possible follow-up bug."""
     item = _item(stage="waiting", sent_at=NOW - timedelta(days=30),
                  last_inbound_at=NOW - timedelta(days=1), followup_count=0)
-    assert followup.should_send_followup(item, _settings(), None, now=NOW) is False
+    assert _action(item).kind == "none"
 
 
 def test_respects_the_max_followups_cap():
-    item = _item(stage="waiting", sent_at=NOW - timedelta(days=30), followup_count=2)
-    assert followup.should_send_followup(item, _settings(max_followups=2), None, now=NOW) is False
+    item = _item(stage="waiting", sent_at=NOW - timedelta(days=15), followup_count=2)
+    action = _action(item, _settings(max_followups=2, no_response_after_days=60), followups_sent=2,
+                     last_followup_sent_at=NOW - timedelta(days=4))
+    assert action.kind != "send_followup"
 
 
 def test_max_followups_zero_disables_nudges_entirely():
     item = _item(stage="waiting", sent_at=NOW - timedelta(days=30), followup_count=0)
-    assert followup.should_send_followup(item, _settings(max_followups=0), None, now=NOW) is False
+    assert _action(item, _settings(max_followups=0)).kind == "none"
 
 
 def test_only_waiting_items_get_a_followup_not_failed_ones():
-    """A Failed (not_interested) prospect must never be nudged -- same
-    stage-gate guarantee as pending/replied/booked, exercised directly here
-    since it's the specific case a rejection must respect."""
     item = _item(stage="not_interested", sent_at=NOW - timedelta(days=30), followup_count=0)
-    assert followup.should_send_followup(item, _settings(), None, now=NOW) is False
+    assert _action(item).kind == "none"
 
 
 def test_consecutive_followups_are_spaced_out():
-    """Without minimum spacing, raising max_followups would fire every
-    remaining nudge on a single tick -- each would see the same long silence
-    since the original send."""
     item = _item(stage="waiting", sent_at=NOW - timedelta(days=30), followup_count=1)
 
-    just_sent = followup.should_send_followup(item, _settings(), NOW - timedelta(hours=6), now=NOW)
-    assert just_sent is False
-
-    long_ago = followup.should_send_followup(item, _settings(), NOW - timedelta(days=7), now=NOW)
-    assert long_ago is True
+    assert _action(item, followups_sent=1, last_followup_sent_at=NOW - timedelta(hours=6)).kind == "none"
+    long_ago = _action(item, followups_sent=1, last_followup_sent_at=NOW - timedelta(days=7))
+    assert long_ago.kind == "send_followup" and long_ago.number == 2
 
 
 def test_no_followup_for_items_not_in_waiting():
-    """A nudge is never the first thing that happens to a card -- it must be
-    parked in Waiting first."""
-    for stage in ("sent", "replied", "booked"):
-        item = _item(stage=stage, sent_at=NOW - timedelta(days=30))
-        assert followup.should_send_followup(item, _settings(), None, now=NOW) is False
+    """A nudge is never the first thing that happens to a card -- sent items
+    are moved to Waiting first."""
+    for stage in ("replied", "booked"):
+        assert _action(_item(stage=stage, sent_at=NOW - timedelta(days=30))).kind == "none"
+    sent = _action(_item(stage="sent", sent_at=NOW - timedelta(days=30)))
+    assert sent.kind == "move_waiting"
 
 
 # ---------------------------------------------------------------------------
@@ -180,37 +185,36 @@ def test_engine_moves_silent_item_to_waiting(conn, cfg, monkeypatch):
     assert db.get_item(conn, "item-1").stage == "waiting"
 
 
-def test_engine_drafts_followup_without_sending_when_auto_reply_off(conn, cfg, monkeypatch):
-    """A nudge obeys auto_reply exactly as a reply does."""
-    _seed(conn, stage="waiting", sent_days_ago=5)
-    set_settings(conn, "camp-1", enabled=True, auto_reply=False, followup_after_days=3)
-    monkeypatch.setattr(responder, "compose_followup", lambda *a, **kw: ("Re: Hiring support", "Quick thought."))
-
+def _capture_sends(monkeypatch):
     sent = []
     monkeypatch.setattr(
         "outreach.conversation.responder.send_via_channel",
-        lambda *a, **kw: sent.append(kw) or "<sent@csg>",
+        lambda *a, **kw: sent.append(kw) or f"<sent{len(sent)}@csg>",
     )
+    return sent
 
-    result = engine.tick(conn, cfg, "camp-1", emails=[], now=NOW)
+
+def test_engine_drafts_followup_once_without_sending_when_auto_reply_off(conn, cfg, monkeypatch):
+    """Auto Reply OFF (the default): one draft per number, never a send."""
+    _seed(conn, stage="waiting", sent_days_ago=8)
+    set_settings(conn, "camp-1", enabled=True, auto_reply=False)
+    monkeypatch.setattr(responder, "compose_followup", lambda *a, **kw: ("Re: Hiring support", "Quick thought."))
+    sent = _capture_sends(monkeypatch)
+
+    first = engine.tick(conn, cfg, "camp-1", emails=[], now=NOW)
+    second = engine.tick(conn, cfg, "camp-1", emails=[], now=NOW + timedelta(minutes=30))
 
     assert sent == []
-    assert result.followups_drafted == 1
-    assert result.followups_sent == 0
-    # An unsent draft must not consume the allowance.
+    assert first.followups_drafted == 1 and second.followups_drafted == 0
+    assert len(db.list_pending_drafts(conn, "item-1")) == 1
     assert db.get_item(conn, "item-1").followup_count == 0
 
 
 def test_engine_sends_followup_and_counts_it(conn, cfg, monkeypatch):
-    _seed(conn, stage="waiting", sent_days_ago=5)
-    set_settings(conn, "camp-1", enabled=True, auto_reply=True, followup_after_days=3, max_followups=2)
+    _seed(conn, stage="waiting", sent_days_ago=8)
+    set_settings(conn, "camp-1", enabled=True, auto_reply=True)
     monkeypatch.setattr(responder, "compose_followup", lambda *a, **kw: ("Re: Hiring support", "Quick thought."))
-
-    sent = []
-    monkeypatch.setattr(
-        "outreach.conversation.responder.send_via_channel",
-        lambda *a, **kw: sent.append(kw) or "<sent@csg>",
-    )
+    sent = _capture_sends(monkeypatch)
 
     result = engine.tick(conn, cfg, "camp-1", emails=[], now=NOW)
 
@@ -223,19 +227,13 @@ def test_engine_sends_followup_and_counts_it(conn, cfg, monkeypatch):
 
 
 def test_repeated_ticks_do_not_exceed_the_cap(conn, cfg, monkeypatch):
-    """Ticking ten times in a row still respects max_followups -- the counter
-    is persisted, not per-tick."""
+    """Ticking again and again still respects the cap -- the counter and the
+    ledger are persisted, not per-tick."""
     _seed(conn, stage="waiting", sent_days_ago=60)
-    set_settings(conn, "camp-1", enabled=True, auto_reply=True, followup_after_days=3, max_followups=2)
+    set_settings(conn, "camp-1", enabled=True, auto_reply=True)
     monkeypatch.setattr(responder, "compose_followup", lambda *a, **kw: ("Re: Hiring support", "Quick thought."))
+    sent = _capture_sends(monkeypatch)
 
-    sent = []
-    monkeypatch.setattr(
-        "outreach.conversation.responder.send_via_channel",
-        lambda *a, **kw: sent.append(kw) or "<sent@csg>",
-    )
-
-    # Ticks spread far enough apart to clear the minimum spacing rule.
     for day in range(0, 100, 10):
         engine.tick(conn, cfg, "camp-1", emails=[], now=NOW + timedelta(days=day))
 
@@ -246,7 +244,7 @@ def test_repeated_ticks_do_not_exceed_the_cap(conn, cfg, monkeypatch):
 def test_reply_stops_further_followups(conn, cfg, monkeypatch):
     """Once they answer, the nudges stop -- even with allowance remaining."""
     _seed(conn, stage="waiting", sent_days_ago=30)
-    set_settings(conn, "camp-1", enabled=True, auto_reply=True, followup_after_days=3, max_followups=5)
+    set_settings(conn, "camp-1", enabled=True, auto_reply=True)
     monkeypatch.setattr(classifier, "classify", lambda cfg_, e, **kw: "interested")
     monkeypatch.setattr(responder, "compose_reply", lambda *a, **kw: ("Re: x", "Sure."))
     monkeypatch.setattr(responder, "compose_followup", lambda *a, **kw: ("Re: x", "Bump."))

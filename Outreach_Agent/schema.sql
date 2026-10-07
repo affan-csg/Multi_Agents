@@ -184,8 +184,13 @@ CREATE TABLE IF NOT EXISTS conversation_settings (
     -- separate from `enabled` so "let the agent watch the inbox" and "let
     -- the agent talk to prospects unattended" are two different decisions.
     auto_reply          BOOLEAN NOT NULL DEFAULT false,
-    followup_after_days INT NOT NULL DEFAULT 3,          -- sent -> waiting once this much silence has passed
+    followup_after_days INT NOT NULL DEFAULT 2,          -- sent -> waiting once this much silence has passed
     max_followups       INT NOT NULL DEFAULT 2,          -- hard cap on nudges per item, never exceeded
+    -- Automatic follow-up sequence (migration 011). Days are measured from the
+    -- original outreach_items.sent_at. Follow-ups are always drafted; they are
+    -- sent unattended only when enabled AND auto_reply are true.
+    followup_days          INT[]   NOT NULL DEFAULT '{7,14}',
+    no_response_after_days INT     NOT NULL DEFAULT 21,
     updated_at          TIMESTAMPTZ NOT NULL
 );
 
@@ -244,6 +249,12 @@ CREATE INDEX IF NOT EXISTS idx_conv_msgs_direction ON conversation_messages(dire
 ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS followup_count         INT NOT NULL DEFAULT 0;
 ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS last_inbound_at        TIMESTAMPTZ;
 ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS conversation_locked_at TIMESTAMPTZ;
+
+-- The mailbox that actually sent the item's first email (stamped at send time;
+-- see migrations/014_sender_email.sql). Follow-ups/replies continue from it and
+-- Analytics group by it. NULL = sent before sender tracking, not yet backfilled.
+ALTER TABLE outreach_items ADD COLUMN IF NOT EXISTS sender_email TEXT;
+CREATE INDEX IF NOT EXISTS idx_items_sender ON outreach_items(sender_email);
 
 -- ===========================================================================
 -- FEEDBACK LEARNING / OPTIMIZATION AGENT
@@ -425,3 +436,40 @@ CREATE INDEX IF NOT EXISTS idx_calendly_events_item   ON calendly_events(item_id
 CREATE INDEX IF NOT EXISTS idx_calendly_events_email  ON calendly_events(invitee_email);
 CREATE INDEX IF NOT EXISTS idx_calendly_events_status ON calendly_events(status);
 CREATE INDEX IF NOT EXISTS idx_opt_adoptions_campaign ON optimization_recommendation_adoptions(campaign_id);
+
+-- Idempotency ledger: one row per (item, follow-up number), ever. The UNIQUE
+-- constraint is what makes "send follow-up #1" happen at most once across
+-- overlapping ticks, restarts and replicas.
+CREATE TABLE IF NOT EXISTS followup_attempts (
+    attempt_id          TEXT PRIMARY KEY,
+    item_id             TEXT NOT NULL REFERENCES outreach_items(item_id) ON DELETE CASCADE,
+    followup_number     INT NOT NULL,
+    status              TEXT NOT NULL,        -- claimed | sent | drafted | failed | skipped
+    attempts            INT NOT NULL DEFAULT 0,
+    provider_message_id TEXT,
+    message_id          TEXT,
+    error               TEXT,
+    claimed_at          TIMESTAMPTZ NOT NULL,
+    updated_at          TIMESTAMPTZ NOT NULL,
+    UNIQUE (item_id, followup_number)
+);
+CREATE INDEX IF NOT EXISTS idx_followup_attempts_item ON followup_attempts(item_id);
+
+-- Scheduler state: one row per job ('sync'). Timers live here, not in process
+-- memory, so a restart or redeploy resumes the schedule instead of resetting it.
+CREATE TABLE IF NOT EXISTS automation_state (
+    job                      TEXT PRIMARY KEY,
+    interval_minutes         INT NOT NULL DEFAULT 30,
+    enabled                  BOOLEAN NOT NULL DEFAULT true,  -- Automatic Sync toggle (migration 012)
+    locked_by                TEXT,
+    locked_until             TIMESTAMPTZ,
+    last_started_at          TIMESTAMPTZ,
+    last_success_at          TIMESTAMPTZ,
+    next_run_at              TIMESTAMPTZ,
+    last_inbox_success_at    TIMESTAMPTZ,
+    last_calendly_success_at TIMESTAMPTZ,
+    last_error               TEXT,
+    consecutive_failures     INT NOT NULL DEFAULT 0,
+    last_result              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at               TIMESTAMPTZ NOT NULL
+);

@@ -21,6 +21,8 @@ _KEYS = {
     "campaign_optimization_insights": ("pattern_key",),
     "optimization_recommendation_adoptions": ("adoption_id",),
     "calendly_events": ("event_uri",),
+    "followup_attempts": ("item_id", "followup_number"),
+    "automation_state": ("job",),
 }
 
 _UNIQUE = {
@@ -28,6 +30,10 @@ _UNIQUE = {
     # create_item's on_conflict -- mirrored here so upsert-by-alt-key works.
     "outreach_items": ("campaign_id", "research_domain"),
 }
+
+
+# Tables whose primary key the real database enforces on plain INSERT.
+_STRICT_INSERT = {"followup_attempts"}
 
 
 def _as_text(value: Any) -> str:
@@ -68,11 +74,17 @@ class FakeConn:
 
     def insert(self, table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         store = self.tables.setdefault(table, [])
+        if table in _STRICT_INSERT:
+            for r in rows:
+                if any(self._pk(table, e) == self._pk(table, r) for e in store):
+                    from outreach.db import SupabaseError
+                    raise SupabaseError(f"POST {table} -> 409: duplicate key value (23505)")
         store.extend(dict(r) for r in rows)
         return rows
 
     def select(self, table: str, select: str = "*", limit: int | None = None,
-               order: str | None = None, **filters: str) -> list[dict[str, Any]]:
+               order: str | None = None, offset: int | None = None,
+               **filters: str) -> list[dict[str, Any]]:
         rows = self.tables.get(table, [])
         for field, expr in filters.items():
             if expr.startswith("eq."):
@@ -109,7 +121,8 @@ class FakeConn:
             field = order.split(".")[0]
             desc = "desc" in order
             rows = sorted(rows, key=lambda r: (r.get(field) is None, r.get(field)), reverse=desc)
-        return rows[:limit] if limit else list(rows)
+        rows = list(rows)[offset:] if offset else list(rows)
+        return rows[:limit] if limit else rows
 
     def update(self, table: str, values: dict[str, Any], **filters: str) -> None:
         for row in self.select(table, **filters):
@@ -138,3 +151,11 @@ class FakeConn:
 @pytest.fixture
 def conn():
     return FakeConn()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_integrations(monkeypatch):
+    """Tests must not depend on whatever .env the developer has: a real
+    Calendly token would make the engine demand a fresh Calendly sync before
+    following up, and real IMAP settings would invite network access."""
+    monkeypatch.delenv("CALENDLY_API_TOKEN", raising=False)

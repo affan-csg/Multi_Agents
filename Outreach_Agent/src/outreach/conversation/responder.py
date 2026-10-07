@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import Optional
 
 from .. import db, personalize
-from ..channels import SendError, send as send_via_channel
+from ..channels import SendError, send as send_via_channel, sender_identity
 from ..config import PROJECT_ROOT, Config
 from ..db import SupabaseConn, utcnow
 from ..models import (
@@ -250,8 +250,15 @@ def compose_followup(
     *,
     followup_number: int,
     max_followups: int,
+    previous_followups: Optional[list[str]] = None,
+    conversation_history: str = "",
 ) -> Optional[tuple[str, str]]:
-    """Draft a follow-up to an unanswered outreach email."""
+    """Draft a follow-up to an unanswered outreach email.
+
+    `previous_followups` are the bodies of follow-ups already sent to this
+    prospect, and `conversation_history` the thread so far; both go into the
+    prompt so a later follow-up takes a different angle instead of repeating
+    an earlier one."""
     signature = personalize._sender_signature(cfg)
     template = _FOLLOWUP_PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -268,6 +275,11 @@ def compose_followup(
         .replace("{{original_message}}", original[:4000])
         .replace("{{followup_number}}", str(followup_number))
         .replace("{{max_followups}}", str(max_followups))
+        .replace("{{previous_followups}}", (
+            "\n\n---\n\n".join(b[:1500] for b in previous_followups)
+            if previous_followups else "(none -- this is the first follow-up)"
+        ))
+        .replace("{{conversation_history}}", conversation_history[:4000] or "(only the original email)")
         .replace("{{signature}}", signature)
     )
 
@@ -297,8 +309,14 @@ def store_and_maybe_send(
     to_email: str,
     in_reply_to: Optional[str] = None,
     now: Optional[datetime] = None,
+    keep_draft_on_error: bool = True,
 ) -> ComposedReply:
     """Record an outbound message, then send it only if auto_reply is on.
+
+    Replies and automatic follow-ups share this gate.
+    `keep_draft_on_error=False` stores nothing when a send fails -- the
+    follow-up ledger records the failure and a retry recomposes, so failed
+    attempts do not pile up as duplicate drafts.
 
     The order matters: the draft is written to conversation_messages BEFORE
     any send is attempted, so a network failure mid-send leaves a recoverable
@@ -315,6 +333,9 @@ def store_and_maybe_send(
     than the one that scheduled it makes that rule incoherent."""
     message_id = f"conv-{uuid.uuid4()}"
     now = now or utcnow()
+    # Continue from the mailbox that sent the original email; this is the
+    # address stored on the message and used to send it.
+    sender = sender_identity(cfg, item.sender_email)
 
     if not settings.auto_reply:
         # Composed, stored, and deliberately not sent. A person approves it.
@@ -326,7 +347,7 @@ def store_and_maybe_send(
             in_reply_to=in_reply_to,
             subject=subject,
             body=body,
-            from_email=cfg.from_email,
+            from_email=sender,
             to_email=to_email,
             draft_pending=True,
             created_at=now,
@@ -338,10 +359,15 @@ def store_and_maybe_send(
     try:
         provider_message_id = send_via_channel(
             cfg, item.channel, to_email=to_email, subject=subject, body=body,
-            in_reply_to=in_reply_to,
+            in_reply_to=in_reply_to, sender_email=sender,
         )
     except SendError as exc:
         # Keep the draft so the work is not lost and a person can send it.
+        if not keep_draft_on_error:
+            return ComposedReply(
+                subject=subject, body=body, draft_pending=False,
+                message_id=message_id, error=str(exc),
+            )
         db.add_conversation_message(conn, ConversationMessage(
             message_id=message_id,
             item_id=item.item_id,
@@ -349,7 +375,7 @@ def store_and_maybe_send(
             in_reply_to=in_reply_to,
             subject=subject,
             body=body,
-            from_email=cfg.from_email,
+            from_email=sender,
             to_email=to_email,
             draft_pending=True,
             created_at=now,
@@ -367,7 +393,7 @@ def store_and_maybe_send(
         in_reply_to=in_reply_to,
         subject=subject,
         body=body,
-        from_email=cfg.from_email,
+        from_email=sender,
         to_email=to_email,
         draft_pending=False,
         sent_at=now,
@@ -395,11 +421,13 @@ def send_pending_draft(
     if not to_email:
         raise ValueError("no recipient address for this message")
 
+    sender = sender_identity(cfg, item.sender_email)
     provider_message_id = send_via_channel(
         cfg, item.channel,
         to_email=to_email,
         subject=message.subject or "",
         body=message.body or "",
+        sender_email=sender,
         # The draft's own in_reply_to, stored when it was composed (see
         # store_and_maybe_send) -- previously dropped here entirely, so a
         # draft approved and sent from the UI went out as a brand-new
@@ -411,6 +439,7 @@ def send_pending_draft(
         conn, message.message_id,
         draft_pending=False,
         provider_message_id=provider_message_id,
+        from_email=sender,
         sent_at=now.isoformat(),
     )
     return ComposedReply(

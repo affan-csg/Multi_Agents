@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from .. import db
 from ..channels import SendError
 from ..config import load_config
+from ..db import utcnow
 from ..models import ConversationMessage
 from . import engine
 from .quoting import strip_quoted
@@ -40,6 +41,8 @@ class ConversationSettingsRequest(BaseModel):
     auto_reply: Optional[bool] = None
     followup_after_days: Optional[int] = None
     max_followups: Optional[int] = None
+    followup_days: Optional[list[int]] = None
+    no_response_after_days: Optional[int] = None
 
 
 @router.get("/campaigns/{campaign_id}/conversation/settings")
@@ -72,12 +75,23 @@ def write_settings(campaign_id: str, req: ConversationSettingsRequest) -> dict[s
             raise HTTPException(400, "followup_after_days must be at least 1")
         if req.max_followups is not None and req.max_followups < 0:
             raise HTTPException(400, "max_followups cannot be negative")
+        if req.followup_days is not None:
+            days = req.followup_days
+            if any(d < 1 for d in days) or days != sorted(set(days)):
+                raise HTTPException(400, "followup_days must be positive, strictly increasing days")
+        if req.no_response_after_days is not None:
+            last = (req.followup_days if req.followup_days is not None
+                    else get_settings(conn, campaign_id).followup_days)
+            if req.no_response_after_days < 1 or (last and req.no_response_after_days <= max(last)):
+                raise HTTPException(400, "no_response_after_days must be after the last follow-up day")
 
         updated = set_settings(
             conn, campaign_id,
             enabled=req.enabled, auto_reply=req.auto_reply,
             followup_after_days=req.followup_after_days,
             max_followups=req.max_followups,
+            followup_days=req.followup_days,
+            no_response_after_days=req.no_response_after_days,
         )
         return updated.model_dump(mode="json")
     finally:
@@ -116,6 +130,51 @@ def _message_payload(m: ConversationMessage) -> dict[str, Any]:
     return payload
 
 
+def _followup_summary(conn: Any, item: Any, settings: Any, thread: list[ConversationMessage]) -> dict[str, Any]:
+    """Where this item is on the follow-up schedule, for the drawer: how many
+    went out and what happens next (and when, in UTC). Derived through the
+    same pure policy the scheduler uses, so the UI can never disagree."""
+    from datetime import timedelta
+
+    from . import followup
+    from .engine import _build_context
+
+    now = utcnow()
+    ctx = _build_context(conn, item, thread)
+    action = followup.next_action(item, settings, ctx, now=now)
+    total = followup.total_followups(settings)
+
+    label = {
+        "move_waiting": "Move to Waiting",
+        "send_followup": f"Follow-up #{action.number}",
+        "mark_no_response": "Mark Failed / No Response",
+    }.get(action.kind)
+    next_at = None
+    if action.kind != "none":
+        next_at = now
+    elif action.due_in_days is not None:
+        next_at = now + timedelta(days=action.due_in_days)
+        # Name what is coming, not "none": the reason says which step is pending.
+        if item.stage == "sent":
+            label = "Move to Waiting"
+        elif action.number:
+            label = f"Follow-up #{action.number}"
+        else:
+            label = "Mark Failed / No Response"
+
+    return {
+        "followups_sent": ctx.followups_sent,
+        "followups_total": total,
+        "next_action": label,
+        "next_action_at": next_at.isoformat() if next_at else None,
+        "next_action_reason": action.reason,
+        "attempts": [
+            {"followup_number": a.followup_number, "status": a.status, "error": a.error}
+            for a in db.list_followup_attempts(conn, item.item_id)
+        ],
+    }
+
+
 @router.get("/items/{item_id}/conversation")
 def item_conversation(item_id: str) -> dict[str, Any]:
     """The full message thread for one item, for the drawer's conversation
@@ -139,6 +198,7 @@ def item_conversation(item_id: str) -> dict[str, Any]:
             "last_inbound_at": item.last_inbound_at.isoformat() if item.last_inbound_at else None,
             "enabled": settings.enabled,
             "auto_reply": settings.auto_reply,
+            "followup": _followup_summary(conn, item, settings, messages),
             "messages": [_message_payload(m) for m in messages],
             "pending_drafts": [_message_payload(m) for m in messages if m.draft_pending],
         }

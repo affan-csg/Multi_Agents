@@ -177,6 +177,9 @@ class OutreachItem(BaseModel):
     personalized_from: Optional[str] = None
     to_email: Optional[str] = None
     provider_message_id: Optional[str] = None
+    # The mailbox that actually sent the first email (None for rows sent
+    # before sender tracking that were never backfilled).
+    sender_email: Optional[str] = None
     error: Optional[str] = None
     scheduled_at: Optional[datetime] = None  # user-picked send time; informational only, nothing auto-fires it yet
     created_at: Optional[datetime] = None
@@ -244,13 +247,58 @@ class ConversationSettings(BaseModel):
     # agent still detects, classifies, moves cards and drafts replies -- it
     # just never sends one itself. See conversation/responder.py.
     auto_reply: bool = False
-    # 24 hours of silence after sending moves a card from Sent to Waiting
-    # (No Reply). The comparison in followup.should_move_to_waiting is
-    # against exact elapsed time, so this is a real 24h, not a calendar-day
-    # boundary. See config/outreach.yaml's conversation section, the actual
-    # source of truth for a brand-new campaign's seed value.
-    followup_after_days: int = 1
+    # Silence after which a sent card moves to Waiting (No Reply). Compared
+    # against exact elapsed time since sent_at, not a calendar-day boundary.
+    # Bookkeeping only -- no email. config/outreach.yaml seeds new campaigns.
+    followup_after_days: int = 2
+    # Hard cap on nudges per prospect; the effective count is
+    # min(max_followups, len(followup_days)).
     max_followups: int = 2
+    # Days since the ORIGINAL send at which follow-up #1, #2, ... are due.
+    followup_days: list[int] = Field(default_factory=lambda: [7, 14])
+    # Day on which an unanswered card, after its last follow-up actually went
+    # out, moves to the terminal Failed / No Response state.
+    no_response_after_days: int = 21
+    updated_at: Optional[datetime] = None
+
+
+FollowupStatus = Literal["claimed", "sent", "drafted", "failed", "skipped"]
+
+
+class FollowupAttempt(BaseModel):
+    """Idempotency ledger row: one per (item, follow-up number), ever."""
+
+    attempt_id: str
+    item_id: str
+    followup_number: int
+    status: FollowupStatus = "claimed"
+    attempts: int = 0
+    provider_message_id: Optional[str] = None
+    message_id: Optional[str] = None
+    error: Optional[str] = None
+    claimed_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class AutomationState(BaseModel):
+    """Persisted scheduler state for one job (the polling cycle). Lives in the
+    database so a restart resumes the schedule instead of resetting it."""
+
+    job: str = "sync"
+    interval_minutes: int = 30
+    # Automatic Sync toggle. Off stops scheduled cycles only; manual
+    # actions and all stored state are untouched.
+    enabled: bool = True
+    locked_by: Optional[str] = None
+    locked_until: Optional[datetime] = None
+    last_started_at: Optional[datetime] = None
+    last_success_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
+    last_inbox_success_at: Optional[datetime] = None
+    last_calendly_success_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    consecutive_failures: int = 0
+    last_result: dict[str, Any] = Field(default_factory=dict)
     updated_at: Optional[datetime] = None
 
 

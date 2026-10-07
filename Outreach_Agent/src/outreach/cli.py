@@ -34,6 +34,8 @@ app.add_typer(campaign_app, name="campaign")
 app.add_typer(item_app, name="item")
 app.add_typer(conversation_app, name="conversation")
 app.add_typer(calendly_app, name="calendly")
+automation_app = typer.Typer(add_completion=False, help="Automatic inbox/Calendly polling and follow-ups")
+app.add_typer(automation_app, name="automation")
 
 console = Console()
 
@@ -380,6 +382,49 @@ def calendly_sync_cmd(
         )
         for err in result.errors:
             console.print(f"[red]{err}[/red]")
+    finally:
+        conn.close()
+
+
+@automation_app.command("run-once")
+def automation_run_once(config: Optional[Path] = typer.Option(None, "--config")) -> None:
+    """Run one polling cycle now (Calendly sync, inbox read, conversation
+    ticks incl. follow-ups). Same lease as the scheduler, so it is safe to
+    call from an external cron or alongside a running server."""
+    from .automation import runner
+
+    cfg = _cfg(config)
+    conn = db.connect()
+    try:
+        r = runner.run_cycle(conn, cfg)
+        color = {"ok": "green", "partial": "yellow", "skipped_locked": "dim"}.get(r.status, "red")
+        console.print(f"[{color}]{r.status}[/{color}]")
+        if r.calendly:
+            console.print(f"  calendly: {r.calendly}")
+        if r.inbox:
+            console.print(f"  inbox: {r.inbox}")
+        for c in r.campaigns:
+            console.print(
+                f"  {c['campaign_id']}: waiting={c['moved_to_waiting']} "
+                f"followups_sent={c['followups_sent']} drafted={c['followups_drafted']} "
+                f"no_response={c['moved_to_no_response']} {c.get('message') or ''}"
+            )
+        for err in r.errors:
+            console.print(f"  [red]{err}[/red]")
+    finally:
+        conn.close()
+
+
+@automation_app.command("status")
+def automation_status_cmd() -> None:
+    """Show the last/next sync times, interval and last error."""
+    from .automation import routes
+
+    conn = db.connect()
+    try:
+        for key, value in routes.status_payload(conn).items():
+            if key != "last_result":
+                console.print(f"{key}: {value}")
     finally:
         conn.close()
 

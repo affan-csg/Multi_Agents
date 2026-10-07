@@ -3,6 +3,7 @@
  *  that agent's own HTTP API. */
 
 import { agentBaseUrl } from "./registry";
+import { withToken } from "../auth";
 
 const BASE = agentBaseUrl("outreach");
 
@@ -183,9 +184,49 @@ export interface ConversationSettings {
    *  detected, classified, cards move and drafts are written -- but nothing
    *  is emailed without a person approving it. */
   auto_reply: boolean;
+  /** Days of silence (from the original send) before Sent moves to Waiting. */
   followup_after_days: number;
   max_followups: number;
+  /** Days since the original send at which follow-up #1, #2, ... are due. */
+  followup_days: number[];
+  /** Day an unanswered card (after its last follow-up was sent) moves to the
+   *  terminal Failed / No Response state. */
+  no_response_after_days: number;
   updated_at: string | null;
+}
+
+/** Where one item is on the follow-up schedule (GET /items/{id}/conversation). */
+export interface FollowupProgress {
+  followups_sent: number;
+  followups_total: number;
+  /** e.g. "Follow-up #2"; null when nothing further is scheduled. */
+  next_action: string | null;
+  /** UTC ISO timestamp the next action is due. */
+  next_action_at: string | null;
+  next_action_reason: string;
+  attempts: Array<{ followup_number: number; status: string; error: string | null }>;
+}
+
+/** Polling status (GET /automation/status). All times are UTC ISO strings. */
+export interface AutomationStatus {
+  job: string;
+  interval_minutes: number;
+  /** Automatic Sync toggle (persisted); off stops scheduled cycles only. */
+  enabled: boolean;
+  min_interval_minutes: number;
+  max_interval_minutes: number;
+  /** Whether the server process was started with AUTO_SYNC_ENABLED=true. */
+  scheduler_enabled: boolean;
+  running: boolean;
+  due: boolean;
+  last_started_at: string | null;
+  last_success_at: string | null;
+  next_run_at: string | null;
+  last_inbox_success_at: string | null;
+  last_calendly_success_at: string | null;
+  last_error: string | null;
+  consecutive_failures: number;
+  now: string;
 }
 
 export interface ConversationMessage {
@@ -220,6 +261,7 @@ export interface ItemConversation {
   last_inbound_at: string | null;
   enabled: boolean;
   auto_reply: boolean;
+  followup: FollowupProgress;
   messages: ConversationMessage[];
   pending_drafts: ConversationMessage[];
 }
@@ -240,7 +282,9 @@ export interface TickResult {
   replies_drafted: number;
   followups_sent: number;
   followups_drafted: number;
+  followups_failed: number;
   moved_to_waiting: number;
+  moved_to_no_response: number;
   skipped_locked: number;
   errors: Record<string, string>;
   message: string | null;
@@ -317,6 +361,8 @@ export interface ConversationSettingsUpdate {
   auto_reply?: boolean;
   followup_after_days?: number;
   max_followups?: number;
+  followup_days?: number[];
+  no_response_after_days?: number;
 }
 
 export interface JobSnapshot {
@@ -471,6 +517,28 @@ export const outreachApi = {
   conversationTick: (campaignId: string) =>
     req<TickResult>(`/campaigns/${campaignId}/conversation/tick`, { method: "POST" }),
 
+  // --- Automatic polling -----------------------------------------------------
+
+  automationStatus: () => req<AutomationStatus>(`/automation/status`),
+
+  setAutomationInterval: (intervalMinutes: number) =>
+    req<AutomationStatus>(`/automation/settings`, {
+      method: "PATCH",
+      body: JSON.stringify({ interval_minutes: intervalMinutes }),
+    }),
+
+  setAutomationEnabled: (enabled: boolean) =>
+    req<AutomationStatus>(`/automation/settings`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    }),
+
+  /** Run one polling cycle now (same lease as the scheduler). */
+  runAutomation: () =>
+    req<{ result: { status: string; errors: string[] }; status: AutomationStatus }>(
+      `/automation/run`, { method: "POST" },
+    ),
+
   itemConversation: (itemId: string) => req<ItemConversation>(`/items/${itemId}/conversation`),
 
   // Compose a reply to the item's latest inbound message on demand -- the
@@ -536,7 +604,7 @@ export const outreachApi = {
 
   jobSocket: (jobId: string, onMessage: (s: JobSnapshot) => void): WebSocket => {
     const wsBase = BASE.replace(/^http/, "ws");
-    const ws = new WebSocket(`${wsBase}/jobs/${jobId}/ws`);
+    const ws = new WebSocket(withToken(`${wsBase}/jobs/${jobId}/ws`));
     ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
     return ws;
   },

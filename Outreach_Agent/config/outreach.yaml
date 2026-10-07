@@ -108,10 +108,16 @@ stages:
 conversation:
   enabled: false
   auto_reply: false
-  # Silence after which a `sent` item moves to `waiting` (No Reply) -- the
-  # comparison is against exact elapsed time since sent_at (see
-  # followup.days_since), not a calendar-day boundary, so 1 here means
-  # precisely 24 hours after the send, not "the next day arrives".
-  followup_after_days: 1
+  # Day schedule, all measured in exact elapsed time since the ORIGINAL
+  # sent_at (UTC), not calendar-day boundaries:
+  #   day 2  -> sent moves to waiting (No Reply); bookkeeping, no email
+  #   day 7  -> follow-up #1     day 14 -> follow-up #2 (different from #1)
+  #   day 21 -> terminal Failed / No Response, ONLY if follow-up #2 was
+  #             actually sent and there is still no reply or booking
+  followup_after_days: 2
+  followup_days: [7, 14]
   max_followups: 2           # hard cap on nudges per prospect
+  no_response_after_days: 21
+  # Follow-ups are drafted automatically; they are SENT automatically only
+  # when enabled AND auto_reply are both true (otherwise a person sends them).
   imap_lookback_days: 14     # how far back each inbox check reads

@@ -22,11 +22,13 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from .automation.routes import router as automation_router
 from . import db, ingest, personalize, pipeline
 from .calendly import db as calendly_db
 from .calendly.routes import router as calendly_router
 from .config import load_config
 from .conversation.routes import router as conversation_router
+from .analytics import router as analytics_router
 from .learning.routes import router as learning_router
 from .models import STAGE_ORDER
 from .optimization.routes import router as optimization_router
@@ -61,6 +63,12 @@ app.include_router(conversation_router)
 # hook into this app. See src/outreach/learning/__init__.py.
 app.include_router(learning_router)
 
+# Analytics dashboard (overall / per sending account / per campaign /
+# bookings, with prospect drill-down) -- read-only over the existing tables.
+# Self-contained in analytics/; this mount is its only hook into this app.
+# The pre-existing GET /analytics below is unchanged.
+app.include_router(analytics_router)
+
 # Campaign-Level Optimization layer -- read-only against everything but its
 # own two tables (plus one opt-in adoption-recording write). Self-contained
 # in optimization/; this mount is its only hook into this app. Independent
@@ -74,6 +82,11 @@ app.include_router(optimization_router)
 # is extended separately to surface its data). See
 # src/outreach/calendly/__init__.py.
 app.include_router(calendly_router)
+
+# Automatic polling status / interval / run-now. The scheduler itself is
+# started by Server/app.py (opt-in via AUTO_SYNC_ENABLED), not here, so the
+# standalone and serverless entry points never run a background loop.
+app.include_router(automation_router)
 
 
 # ----------------------------------------------------------------------------

@@ -10,6 +10,7 @@ IMPORTANT:
 * Do NOT guilt, chase, or imply they were rude for not answering. No "just bumping this", "circling back", "did you see my last email", or "I'll assume you're not interested".
 * Do NOT invent facts: no rates, client names, case studies, or claims that are not in the context below.
 * This is follow-up number {{followup_number}} of a maximum of {{max_followups}}. On the final one, close warmly and make it genuinely easy to say no — leave the door open rather than pressing.
+* If earlier follow-ups are shown below, this one MUST take a clearly different angle and use different wording and a different ask. Never repeat, paraphrase, or lightly reword a previous follow-up.
 * If a scheduling link is provided below, you may offer it as the easy ask ("if it's easier, grab 15 minutes here: <link>") — but only as one option among the low-pressure asks, never as the entire follow-up.
 * Plain text, no markdown.
 * Always preserve the exact signature block provided below, verbatim.
@@ -25,6 +26,12 @@ SCHEDULING LINK (optional, see the instruction above — do not invent a differe
 
 THE ORIGINAL EMAIL THEY DID NOT ANSWER:
 {{original_message}}
+
+FOLLOW-UPS ALREADY SENT TO THEM (do not repeat these):
+{{previous_followups}}
+
+THE CONVERSATION SO FAR:
+{{conversation_history}}
 
 SIGNATURE BLOCK (use exactly as given, on its own lines at the end of the email):
 {{signature}}

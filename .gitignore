@@ -91,11 +91,12 @@ build/
 scratchpad/
 .claude/
 
-# Marketing/Demo artifacts
-brag-output-*
+# Marketing/Demo/Generated artifacts
+brag-output-*/
 *.demo.json
+*.generated.json
 
-# Temporary files
+# Temporary/lock files
 *.tmp
 *.bak
 *~

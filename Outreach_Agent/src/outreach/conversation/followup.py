@@ -22,8 +22,9 @@ thing an outreach automation can do.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Literal, Optional
 
 from ..models import ConversationSettings, OutreachItem
 
@@ -65,43 +66,131 @@ def should_move_to_waiting(
     return elapsed >= settings.followup_after_days
 
 
-def should_send_followup(
+@dataclass
+class FollowupContext:
+    """Facts outside the item row that decide eligibility. Gathered by the
+    engine from the thread and Calendly tables, so this module stays pure."""
+
+    inbound_intents: set[str] = field(default_factory=set)
+    has_booking: bool = False  # any calendly_events row, active OR canceled
+    last_followup_sent_at: Optional[datetime] = None
+    followups_sent: int = 0    # ledger rows with status "sent" (or the item's count)
+    # followup_number -> ledger status / failed-send count, so a number that is
+    # already claimed, drafted or out of retries is never selected again.
+    attempt_status: dict[int, str] = field(default_factory=dict)
+    attempt_failures: dict[int, int] = field(default_factory=dict)
+
+
+NextActionKind = Literal["none", "move_waiting", "send_followup", "mark_no_response"]
+
+
+@dataclass
+class Action:
+    kind: NextActionKind
+    reason: str = ""
+    number: Optional[int] = None       # follow-up number for send_followup
+    due_in_days: Optional[float] = None  # for "none": days until the next action
+
+    @property
+    def is_due(self) -> bool:
+        return self.kind != "none"
+
+
+# Intents that end a sequence the same way a reply does. An out-of-office is
+# deliberately NOT here: it is not a human decision, so the sequence continues.
+# An inbound message nobody classified yet is treated as blocking too: until
+# we know what it says, we do not email the person who wrote it.
+_BLOCKING_INTENTS = frozenset(
+    {"bounce", "not_interested", "interested", "booked", "unclear", "unclassified"}
+)
+
+# A failed send is retried on later ticks up to this many times in total.
+MAX_SEND_ATTEMPTS = 3
+
+
+def total_followups(settings: ConversationSettings) -> int:
+    """Number of follow-ups this campaign will ever send."""
+    return max(0, min(settings.max_followups, len(settings.followup_days)))
+
+
+def ineligible_reason(item: OutreachItem, ctx: FollowupContext) -> Optional[str]:
+    """Why this item must never be contacted automatically, or None."""
+    if item.stage not in ("sent", "waiting"):
+        return f"stage is {item.stage}"
+    if item.last_inbound_at is not None:
+        return "prospect replied"
+    blocking = ctx.inbound_intents & _BLOCKING_INTENTS
+    if blocking:
+        return f"inbound intent: {sorted(blocking)[0]}"
+    if ctx.has_booking:
+        return "has a Calendly booking"
+    return None
+
+
+def next_action(
     item: OutreachItem,
     settings: ConversationSettings,
-    last_outbound_at: Optional[datetime],
+    ctx: FollowupContext,
     *,
     now: datetime,
-) -> bool:
-    """Whether to send an actual nudge email now.
+) -> Action:
+    """The single next thing the schedule calls for. Pure; sends nothing.
 
-    Every condition here is a reason NOT to send; the default is silence.
-    The caller must still check auto_reply -- this answers "is a nudge due?",
-    not "are we allowed to send it?"."""
-    # Only genuinely unanswered items, and only ones already parked in
-    # waiting -- sent items get moved to waiting first, on an earlier tick,
-    # so a nudge is never the very first thing that happens to a card.
-    if item.stage != "waiting":
-        return False
-    if item.last_inbound_at is not None:
-        return False
+    Schedule (UTC, all measured from the ORIGINAL sent_at):
+        followup_after_days  -> sent -> waiting
+        followup_days[n-1]   -> follow-up n (one per tick, 3 days apart at least)
+        no_response_after_days -> terminal, only after the LAST follow-up was
+                                  actually sent (ledger status "sent")"""
+    reason = ineligible_reason(item, ctx)
+    if reason:
+        return Action("none", reason)
 
-    if settings.max_followups <= 0:
-        return False
-    if item.followup_count >= settings.max_followups:
-        return False
+    elapsed = days_since(item.sent_at, now=now)
+    if elapsed is None:
+        return Action("none", "no sent_at")
 
-    elapsed_since_send = days_since(item.sent_at, now=now)
-    if elapsed_since_send is None or elapsed_since_send < settings.followup_after_days:
-        return False
+    if item.stage == "sent":
+        if elapsed >= settings.followup_after_days:
+            return Action("move_waiting", f"no reply after {settings.followup_after_days} days")
+        return Action("none", "waiting period not reached",
+                      due_in_days=settings.followup_after_days - elapsed)
 
-    # Space consecutive nudges out, measured from the last thing we actually
-    # sent rather than from the original email.
-    if item.followup_count > 0:
-        elapsed_since_last = days_since(last_outbound_at, now=now)
-        if elapsed_since_last is None or elapsed_since_last < _MIN_DAYS_BETWEEN_FOLLOWUPS:
-            return False
+    # stage == waiting from here on
+    total = total_followups(settings)
+    sent = item.followup_count
+    since_last = days_since(ctx.last_followup_sent_at, now=now) if sent > 0 else None
+    spaced = sent == 0 or (since_last is not None and since_last >= _MIN_DAYS_BETWEEN_FOLLOWUPS)
+    spacing_wait = (
+        0.0 if sent == 0 or since_last is None else max(0.0, _MIN_DAYS_BETWEEN_FOLLOWUPS - since_last)
+    )
 
-    return True
+    if sent < total:
+        n = sent + 1
+        status = ctx.attempt_status.get(n)
+        if status in ("claimed", "drafted", "skipped", "sent"):
+            return Action("none", f"follow-up #{n} already {status}", number=n)
+        if status == "failed" and ctx.attempt_failures.get(n, 0) >= MAX_SEND_ATTEMPTS:
+            return Action("none", f"follow-up #{n} failed {MAX_SEND_ATTEMPTS} times", number=n)
+        due_day = settings.followup_days[n - 1]
+        if elapsed < due_day:
+            return Action("none", f"follow-up #{n} not due", number=n,
+                          due_in_days=max(due_day - elapsed, spacing_wait))
+        if not spaced:
+            return Action("none", f"follow-up #{n} waiting for spacing", number=n,
+                          due_in_days=spacing_wait)
+        return Action("send_followup", f"follow-up #{n} due at day {due_day}", number=n)
+
+    # Every follow-up has gone out. The terminal move needs the last one to be
+    # a real SENT email (not a draft, not a failure) -- ctx.followups_sent is
+    # the ledger count, item.followup_count is incremented only on a real send.
+    if total == 0 or ctx.followups_sent < total:
+        return Action("none", "last follow-up was not actually sent")
+    if elapsed < settings.no_response_after_days:
+        return Action("none", "no-response day not reached",
+                      due_in_days=max(settings.no_response_after_days - elapsed, spacing_wait))
+    if not spaced:
+        return Action("none", "waiting for spacing after last follow-up", due_in_days=spacing_wait)
+    return Action("mark_no_response", f"no response after {settings.no_response_after_days} days")
 
 
 def next_followup_number(item: OutreachItem) -> int:

@@ -10,6 +10,7 @@ gracefully instead of raising at import time.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 import httpx
@@ -19,8 +20,22 @@ from ..config import Config
 API_BASE = "https://api.calendly.com"
 
 
+# Transient-failure handling for the scheduled sync: a 429 or 5xx or a
+# timeout is retried with capped exponential backoff (honoring Retry-After).
+# 4xx other than 429 is a real error and fails immediately.
+MAX_ATTEMPTS = 4
+_BACKOFF_BASE = 1.0
+_BACKOFF_CAP = 30.0
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
 class CalendlyClientError(RuntimeError):
     pass
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can run retry paths without waiting."""
+    time.sleep(seconds)
 
 
 class CalendlyClient:
@@ -51,10 +66,29 @@ class CalendlyClient:
             raise CalendlyClientError(
                 "CALENDLY_API_TOKEN is not set -- see .env.example"
             )
-        try:
-            r = fn(path, **kwargs)
-        except httpx.RequestError as exc:
-            raise CalendlyClientError(f"Calendly API unreachable at {API_BASE}{path}: {exc}") from exc
+        r = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            last = attempt == MAX_ATTEMPTS
+            try:
+                r = fn(path, **kwargs)
+            except httpx.RequestError as exc:  # timeouts, connection resets, DNS
+                if last:
+                    raise CalendlyClientError(
+                        f"Calendly API unreachable at {API_BASE}{path}: {exc}"
+                    ) from exc
+                _sleep(min(_BACKOFF_CAP, _BACKOFF_BASE * 2 ** (attempt - 1)))
+                continue
+            if r.status_code in _RETRY_STATUS and not last:
+                delay = min(_BACKOFF_CAP, _BACKOFF_BASE * 2 ** (attempt - 1))
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = min(_BACKOFF_CAP, max(delay, float(retry_after)))
+                    except ValueError:
+                        pass
+                _sleep(delay)
+                continue
+            break
         if r.status_code >= 400:
             raise CalendlyClientError(f"{method} {API_BASE}{path} -> {r.status_code}: {r.text}")
         return r.json() if r.content else None

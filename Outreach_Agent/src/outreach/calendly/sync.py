@@ -18,12 +18,12 @@ db.upsert_event's on_conflict=event_uri) rather than duplicating it.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .. import db as core_db
 from ..config import Config
 from ..db import SupabaseConn
-from ..models import OutreachItem
+from ..models import CONVERSATION_STAGES, OutreachItem
 from .client import CalendlyClient, CalendlyClientError
 from .models import CalendlyEvent
 
@@ -38,6 +38,7 @@ class SyncResult:
         self.fetched = 0
         self.created = 0
         self.updated = 0
+        self.unchanged = 0
         self.matched = 0
         self.unmatched = 0
         self.advanced_to_booked = 0
@@ -49,6 +50,7 @@ class SyncResult:
             "fetched": self.fetched,
             "created": self.created,
             "updated": self.updated,
+            "unchanged": self.unchanged,
             "matched": self.matched,
             "unmatched": self.unmatched,
             "advanced_to_booked": self.advanced_to_booked,
@@ -133,7 +135,27 @@ def match_item(conn: SupabaseConn, invitee_email: Optional[str]) -> Optional[Out
     return max(candidates, key=lambda i: (i.sent_at is not None, i.sent_at or i.created_at))
 
 
-def apply_event(conn: SupabaseConn, raw_event: CalendlyEvent, result: SyncResult) -> CalendlyEvent:
+def _unchanged(existing: CalendlyEvent, incoming: CalendlyEvent) -> bool:
+    """Whether a re-fetched event carries nothing new -- the incremental-sync
+    short-circuit. Compares only what Calendly can change after the fact."""
+    def norm(dt: Optional[datetime]) -> Optional[datetime]:
+        return dt.replace(tzinfo=None) if dt is not None and dt.tzinfo else dt
+
+    return (
+        existing.status == incoming.status
+        and norm(existing.starts_at) == norm(incoming.starts_at)
+        and norm(existing.ends_at) == norm(incoming.ends_at)
+        and existing.cancel_reason == incoming.cancel_reason
+        and (existing.invitee_email or "").lower() == (incoming.invitee_email or "").lower()
+        and existing.item_id is not None  # an unmatched row is re-tried: an item may exist now
+    )
+
+
+def apply_event(
+    conn: SupabaseConn, raw_event: CalendlyEvent, result: SyncResult,
+    *, move_stages: Optional[Callable[[OutreachItem], bool]] = None,
+    skip_unchanged: bool = False,
+) -> CalendlyEvent:
     """Store/update one normalized event, match it to an item, and keep that
     item's pipeline stage in sync -- the single path both run_sync and
     ingest_webhook_event funnel through, so a booking behaves identically
@@ -144,6 +166,20 @@ def apply_event(conn: SupabaseConn, raw_event: CalendlyEvent, result: SyncResult
         existing = calendly_db.get_event(conn, raw_event.event_uri)
     except Exception:
         pass
+
+    if skip_unchanged and existing is not None and _unchanged(existing, raw_event):
+        # Unchanged data is only skippable if the card already reflects it: a
+        # booking recorded while the agent was OFF must still move the card
+        # once the agent is switched on.
+        linked = core_db.get_item(conn, existing.item_id) if existing.item_id else None
+        needs_move = linked is not None and (move_stages is None or move_stages(linked)) and (
+            (existing.status == "active" and linked.stage != "booked"
+             and linked.stage in CONVERSATION_STAGES)
+            or (existing.status == "canceled" and linked.stage == "booked")
+        )
+        if not needs_move:
+            result.unchanged += 1
+            return existing
 
     item = match_item(conn, raw_event.invitee_email)
     stored = raw_event.model_copy(update={
@@ -170,7 +206,10 @@ def apply_event(conn: SupabaseConn, raw_event: CalendlyEvent, result: SyncResult
 
     if item:
         result.matched += 1
-        _sync_item_stage(conn, item, stored, result)
+        # The booking row above is always recorded. Moving the card is the
+        # part the scheduled run gates on the agent being ON for the campaign.
+        if move_stages is None or move_stages(item):
+            _sync_item_stage(conn, item, stored, result)
     else:
         result.unmatched += 1
 
@@ -364,7 +403,11 @@ def unmark_no_show(conn: SupabaseConn, cfg: Config, event_uri: str) -> CalendlyE
     return calendly_db.upsert_event(conn, updated)
 
 
-def run_sync(conn: SupabaseConn, cfg: Config, *, lookback_days: int = 90) -> SyncResult:
+def run_sync(
+    conn: SupabaseConn, cfg: Config, *, lookback_days: int = 90,
+    move_stages: Optional[Callable[[OutreachItem], bool]] = None,
+    skip_unchanged: bool = False,
+) -> SyncResult:
     """Pull every scheduled event from Calendly's API (paginated) and apply
     each one. `lookback_days` bounds min_start_time so a long-lived account
     doesn't re-walk years of history on every sync -- 90 days comfortably
@@ -395,7 +438,10 @@ def run_sync(conn: SupabaseConn, cfg: Config, *, lookback_days: int = 90) -> Syn
                     try:
                         invitees_page = client.list_event_invitees(event["uri"])
                         for invitee in invitees_page.get("collection", []):
-                            apply_event(conn, normalize_scheduled_event(event, invitee), result)
+                            apply_event(
+                                conn, normalize_scheduled_event(event, invitee), result,
+                                move_stages=move_stages, skip_unchanged=skip_unchanged,
+                            )
                     except CalendlyClientError as exc:
                         result.errors.append(f"{event.get('uri')}: {exc}")
                 next_token = (page.get("pagination") or {}).get("next_page_token")

@@ -5,10 +5,11 @@ Two independent switches, deliberately not collapsed into one:
     enabled     -- the master switch. False means the agent does nothing at
                    all for this campaign: no IMAP fetch, no classification,
                    no stage moves, no sends.
-    auto_reply  -- whether the agent may actually SEND a reply it composed.
-                   False (the default) means it still detects replies,
-                   classifies them, moves cards and writes a draft -- a
-                   person just has to approve the send.
+    auto_reply  -- whether the agent may actually SEND what it composed: both
+                   replies and the day-7/day-14 follow-ups. False (the
+                   default) means it still detects replies, classifies
+                   them, moves cards and writes drafts -- a person just has
+                   to approve the send.
 
 "Watch my inbox and keep the board current" and "talk to my prospects
 unattended" are genuinely different levels of trust, so they are two
@@ -41,7 +42,11 @@ def _defaults(cfg: Optional[Config]) -> dict:
     try:
         return (cfg or load_config()).conversation_defaults
     except Exception:
-        return {"enabled": False, "auto_reply": False, "followup_after_days": 1, "max_followups": 2}
+        return {
+            "enabled": False, "auto_reply": False, "followup_after_days": 2,
+            "max_followups": 2,
+            "followup_days": [7, 14], "no_response_after_days": 21,
+        }
 
 
 def get_settings(
@@ -77,6 +82,8 @@ def set_settings(
     auto_reply: bool | None = None,
     followup_after_days: int | None = None,
     max_followups: int | None = None,
+    followup_days: list[int] | None = None,
+    no_response_after_days: int | None = None,
 ) -> ConversationSettings:
     """Update some or all of a campaign's settings, leaving the rest as they
     were. Every parameter is optional so the UI's toggle can flip `enabled`
@@ -96,6 +103,11 @@ def set_settings(
             current.followup_after_days if followup_after_days is None else followup_after_days
         ),
         max_followups=current.max_followups if max_followups is None else max_followups,
+        followup_days=current.followup_days if followup_days is None else list(followup_days),
+        no_response_after_days=(
+            current.no_response_after_days if no_response_after_days is None
+            else no_response_after_days
+        ),
         updated_at=utcnow(),
     )
     db.upsert_conversation_settings(conn, updated)

@@ -63,6 +63,12 @@ through `python.exe` directly instead. Also, on Windows PowerShell (not
 pwsh/PowerShell 7), `&&` is not a valid command separator — put each command
 on its own line, as above, or use `;` to chain them.
 
+The app opens on a password screen (`src/components/PasswordGate.tsx`,
+`src/auth.ts`). The password is never in the bundle: it is checked by the
+server's `DASHBOARD_PASSWORD` at `POST /auth/login`, and the returned token is
+kept in `sessionStorage`, so access lasts for the browser session. `vercel.json`
+rewrites all paths to `index.html` for SPA routing on Vercel.
+
 If an agent's API is unreachable, its section of the Dashboard shows an
 empty/error state and the nav's status pill reads "One or more agents
 unreachable" rather than failing the whole app. That almost always means one
@@ -117,6 +123,11 @@ of the two backends above isn't running yet — start it and refresh.
   each insight, plus the Campaign-Level Optimization layer's own Strategy
   Insights and Adoption Tracking sections — six tabs total on one page,
   `src/pages/outreach/Learning.tsx`).
+- `src/pages/outreach/Analytics.tsx` + `AnalyticsDashboard.tsx` — tabbed
+  Overview / Email Accounts / Campaigns / Bookings analytics with account,
+  campaign and date filters and prospect drill-down; the original pipeline
+  charts live under Overview. Data comes from `src/agents/analytics.ts`
+  (`/analytics/v2/*`); shared chart styling is in `src/components/charts.ts`.
 - `src/components/` — shared UI (`ui.tsx` design system, Nav, drawers,
   modals) — one visual system for every agent's pages.
 - `src/agents/learning.ts` / `src/agents/optimization.ts` — typed HTTP

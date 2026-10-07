@@ -38,7 +38,6 @@ Agent's reply path (responder.py) always does.
 
 from __future__ import annotations
 
-import os
 import smtplib
 import uuid
 from email.message import EmailMessage
@@ -46,38 +45,47 @@ from email.utils import make_msgid
 from typing import Optional
 
 from ..config import Config
+from . import SendError
 
 
-class EmailSendError(RuntimeError):
+class EmailSendError(SendError):
     pass
 
 
-def send(cfg: Config, *, to_email: str, subject: str, body: str, in_reply_to: Optional[str] = None) -> str:
+def send(
+    cfg: Config, *, to_email: str, subject: str, body: str,
+    in_reply_to: Optional[str] = None, sender_email: Optional[str] = None,
+) -> str:
+    """`sender_email` picks the sending account (see Config.accounts); None or
+    an unknown address uses the default account, exactly as before."""
     if not to_email:
         raise EmailSendError("to_email is required")
 
     if cfg.dry_run:
         return f"dry-run-{uuid.uuid4()}"
 
-    host = os.environ.get("SMTP_HOST")
+    account = cfg.account_for(sender_email)
+    host = account.smtp_host
     if not host:
         raise EmailSendError("SMTP_HOST is not set in .env -- required to send email (or set sending.dry_run: true)")
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    username = os.environ.get("SMTP_USERNAME")
-    password = os.environ.get("SMTP_PASSWORD")
+    port = account.smtp_port
+    username = account.smtp_username
+    password = account.smtp_password
+    from_email = account.from_email
+    from_name = account.from_name
 
     # The domain half of a generated Message-ID should be ours, not the
     # relay's -- make_msgid's own hostname guess is whatever this machine's
     # local hostname resolves to, which means nothing to a recipient and
     # nothing to us later. Derived from from_email so it is at least
     # traceable back to CSG's own domain.
-    id_domain = (cfg.from_email or "").split("@")[-1] or "csg-outreach.local"
+    id_domain = (from_email or "").split("@")[-1] or "csg-outreach.local"
     message_id = make_msgid(domain=id_domain)
 
     msg = EmailMessage()
     msg["Message-ID"] = message_id
     msg["Subject"] = subject
-    msg["From"] = f"{cfg.from_name} <{cfg.from_email}>" if cfg.from_name else cfg.from_email
+    msg["From"] = f"{from_name} <{from_email}>" if from_name else from_email
     msg["To"] = to_email
     # Reply-To is set explicitly to from_email even when outreach.yaml's
     # sending.reply_to is blank. Leaving the header off entirely relies on
@@ -87,7 +95,10 @@ def send(cfg: Config, *, to_email: str, subject: str, body: str, in_reply_to: Op
     # must consult Reply-To) -- setting it ourselves removes the ambiguity
     # and is what the Conversation Agent's own reply drafts (responder.py)
     # rely on being consistent.
-    msg["Reply-To"] = cfg.sending.get("reply_to") or cfg.from_email
+    # sending.reply_to applies to the default account only: a shared Reply-To
+    # on a second account would route its replies into the wrong mailbox.
+    reply_to = cfg.sending.get("reply_to") if account.is_default else None
+    msg["Reply-To"] = reply_to or from_email
     if in_reply_to:
         # RFC 5322 5.3: References SHOULD list every ancestor message, but a
         # single entry (the immediate parent) is valid and is what every
