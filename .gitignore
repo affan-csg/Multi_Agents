@@ -12,19 +12,36 @@
 !.env.example
 !*/.env.example
 
-# Editors / OS
+# Editors / IDE
 .vscode/*
 !.vscode/extensions.json
 .idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+.sublime-project
+.sublime-workspace
+
+# OS
 .DS_Store
 Thumbs.db
+.Spotlight-V100
+.Trashes
 
-# Python (in case anything is ever added at the root outside the two agents)
+# Python (in case anything is ever added at the root outside the agents)
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 .pytest_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
+env/
 
 # Node (in case anything is ever added at the root outside Dashboard)
 node_modules/
@@ -32,11 +49,15 @@ dist/
 dist-ssr/
 *.local
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 
 # Scratch space used by Claude Code sessions working in this repo
 scratchpad/
 .claude/
 
-brag-output-ProductDemo
-brag-output-ProductOverview
-brag-output-SalesDemo
+# Marketing/Demo artifacts
+brag-output-*
+*.demo.json

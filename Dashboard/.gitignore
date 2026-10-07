@@ -7,18 +7,43 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Dependencies
 node_modules
+package-lock.json.backup
+
+# Build outputs
 dist
 dist-ssr
+.vite
 *.local
 
-# Editor directories and files
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Editor / IDE
 .vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
+.project
+.classpath
+.c9/
+
+# VS Code specific
+*.code-workspace
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Scratch/temp
+scratchpad/
+.claude/

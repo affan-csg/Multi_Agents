@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: pip install -e .
       - name: Run tests
-        run: pytest -q
+        run: pytest -v
 
   outreach-agent:
     name: Outreach Agent tests (Outreach + Conversation + Learning + Optimization)
@@ -43,8 +43,8 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -e .
-      - name: Run tests (412 total)
-        run: pytest -q
+      - name: Run tests
+        run: pytest -v
 
   server:
     name: Server tests (single-port composition)
@@ -58,7 +58,7 @@ jobs:
         run: pip install -e Research_Agent -e Outreach_Agent -e Server
       - name: Run tests
         working-directory: Server
-        run: pytest -q
+        run: pytest -v
 
   dashboard:
     name: Dashboard typecheck
@@ -76,8 +76,4 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Typecheck
-        # Known pre-existing failure in src/pages/research/UsageTab.tsx --
-        # not a regression gate until that's fixed; remove continue-on-error
-        # once it is.
         run: npx tsc -b --noEmit
-        continue-on-error: true

@@ -1,13 +1,41 @@
-data/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
 .pytest_cache/
+.coverage
+htmlcov/
 .venv/
+venv/
+env/
+
+# Environment
 .env
+.env.local
+.env.*.local
+
+# Editors / IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scratch/Local data
+data/
 scratchpad/
 .claude/
 
-# frontend
+# Frontend (if any)
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/

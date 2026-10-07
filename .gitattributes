@@ -1,18 +1,35 @@
-# Normalize line endings to LF in the repo; Git still checks files out using
-# each platform's native line endings unless a more specific rule below says
-# otherwise. Keeps diffs stable across the Windows dev machine this was
-# built on and any Linux CI/other contributors.
+# Normalize line endings to LF in the repo
 * text=auto eol=lf
 
-# Windows-only scripts should keep CRLF regardless of platform.
+# Text files - explicitly use LF
+*.py text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.sql text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.txt text eol=lf
+
+# Windows-only scripts should keep CRLF
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 
-# Binary files -- never let Git attempt text diffing/EOL conversion on these.
+# Binary files - never let Git attempt text diffing/EOL conversion
 *.png binary
 *.jpg binary
 *.jpeg binary
 *.gif binary
 *.ico binary
 *.pdf binary
+*.mov binary
+*.mp4 binary
+*.mp3 binary
+*.jar binary
+*.zip binary

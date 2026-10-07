@@ -1,25 +1,30 @@
-cd Dashboard
-npm run dev
+# CSG Agents Quick Start
+# See README.md for full setup and architecture details
 
-# One-time setup: one venv holding all three packages editable.
+# === ONE-TIME SETUP ===
 python -m venv .venv
-.venv/Scripts/activate   (or: source .venv/bin/activate on macOS/Linux)
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate    # macOS/Linux
 pip install -e Research_Agent -e Outreach_Agent -e Server
-python -m uvicorn app:app --app-dir Server --reload --port 8000
 
-
+# === TERMINAL 1: Backend (both agents on :8000) ===
 python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
+# → http://127.0.0.1:8000/research/docs
+# → http://127.0.0.1:8000/outreach/docs
+# → http://127.0.0.1:8000/docs
 
+# === TERMINAL 2: Dashboard (:5173) ===
+cd Dashboard && npm run dev
 
+# === OPTIONAL: Run an agent standalone (e.g., debugging) ===
+# Research Agent on :8000
+cd Research_Agent && python -m uvicorn csg.api:app --app-dir src --reload --port 8000
 
-# Both agents, served through one port (recommended -- see Server/app.py):
-python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
-# Research Agent routes:  http://127.0.0.1:8000/research/...
-# Outreach Agent routes:  http://127.0.0.1:8000/outreach/...
+# Outreach Agent on :8001
+cd Outreach_Agent && python -m uvicorn outreach.api:app --app-dir src --reload --port 8001
 
-# Running an agent standalone on its own port (e.g. isolated debugging)
-# still works exactly as before:
-cd Outreach_Agent
-python -m uvicorn outreach.api:app --app-dir src --reload --port 8001
-cd Research_Agent
-python -m uvicorn csg.api:app --app-dir src --reload --port 8000
+# === Testing ===
+cd Research_Agent && pytest      # Offline, 299+ tests
+cd Outreach_Agent && pytest      # Offline, 592+ tests (Outreach + Conversation + Learning)
+cd Server && pytest               # Single-port tests
+cd Dashboard && npx tsc -b --noEmit  # Type check only
