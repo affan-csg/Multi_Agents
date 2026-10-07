@@ -51,9 +51,6 @@ updates:
     labels:
       - "dependencies"
       - "javascript"
-    # Batch minor and patch updates; keep major updates separate for safety
     groups:
-      - dependency-type: "dev-dependencies"
-        update-types: ["minor", "patch"]
-      - dependency-type: "production"
+      npm-minor-patch:
         update-types: ["minor", "patch"]

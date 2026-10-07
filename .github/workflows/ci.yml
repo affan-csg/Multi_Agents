@@ -76,4 +76,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Typecheck
-        # Known pre-existing failure in src/pages/research/UsageTab.tsx; drop continue-on-error once fixed.`n        run: npx tsc -b --noEmit`n        continue-on-error: true`n
+        # Known pre-existing failure in src/pages/research/UsageTab.tsx; drop continue-on-error once fixed.
+        run: npx tsc -b --noEmit
+        continue-on-error: true
