@@ -134,7 +134,7 @@ cd Dashboard && npx tsc -b --noEmit  # Type checking only
 
 6. **Dashboard auth lives in Server**: `DashboardAuthMiddleware` in `Server/app.py` guards every route (HTTP and WebSocket) except `/auth/login` and the Calendly webhooks, using an HMAC token derived from `DASHBOARD_PASSWORD`. Loopback calls without an `Origin` header (the Research<->Outreach hand-off) bypass it. Standalone agent processes have no auth.
 7. **Background automation is opt-in**: with `AUTO_SYNC_ENABLED=true` the Server lifespan starts `outreach.automation.loop`, which syncs Calendly, reads IMAP and runs follow-ups on a DB-leased interval (state in `automation_state`). Off by default.
-8. **Global company de-duplication (Research)**: a company found again by a later run is matched (`run_company_matches`), not re-inserted, re-scored or re-handed to Outreach. See `csg/dedupe.py`.
+8. **Global company de-duplication (Research)**: a company found again by a later run is matched (`run_company_matches`), not re-inserted, re-scored or re-handed to Outreach, **only if it was previously qualified in any run**. Companies that were discovered, scored-but-unqualified, or had only failed qualifications remain eligible and compete in the new run's top-N pool. See `csg/dedupe.py`.
 
 ## Common tasks
 

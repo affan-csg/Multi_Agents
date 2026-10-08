@@ -115,11 +115,19 @@ region it uses `geo.search_regions.active` from the ICP.
 3. **Global de-duplication.** All existing companies (from any prior run) are
    loaded once. Each discovered candidate is checked against them by normalized
    domain (primary key) or normalized name (fallback, for exact name matches ≥5
-   characters). A match is recorded as an existing company (shown in the run
-   with an "Already exists" badge, never re-enriched/scored/handed to Outreach)
-   and excluded from the rest of the pipeline. A concurrent run that claims the
-   company first wins atomically, and the race loser treats it as an existing
-   match instead of duplicating it.
+   characters). A match is classified as a true duplicate (and excluded from
+   the rest of the pipeline) only if it has a successful qualification in any
+   prior run, or is suppressed/disqualified. All other matches are **re-eligible**:
+   they remain in the pipeline, reuse their stored domain (and region), and
+   compete in this run's own scoring and top-N pool — they are enriched, scored,
+   and handed to Outreach anew if they rank high enough in this run.
+   
+   Truly duplicated companies are recorded in `run_company_matches` and shown
+   with an "Already exists" badge in the run, never re-enriched or re-scored.
+   Re-eligible companies do not appear in `run_company_matches` and flow through
+   the normal pipeline. A concurrent run that claims the company first wins
+   atomically, and the race loser treats it correctly (as duplicate or re-eligible)
+   based on its actual qualification/suppression status.
 4. **Research.** Each *new* (genuinely discovered, not matched) company gets
    one Gemini call for headcount, revenue, funding, industry, and description.
    Companies already researched in a previous run are skipped — firmographics

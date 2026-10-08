@@ -295,6 +295,17 @@ def create_item(conn: SupabaseConn, item: OutreachItem) -> None:
     conn.upsert("outreach_items", [row], on_conflict="campaign_id,research_domain")
 
 
+def domains_with_existing_items(conn: SupabaseConn, domains: list[str]) -> set[str]:
+    """Of `domains`, those that already have an outreach item in any campaign
+    other than a failed one. Used so a company already contacted (or queued,
+    or declined) is never given a second campaign item."""
+    if not domains:
+        return set()
+    rows = conn.select("outreach_items", research_domain=f"in.({','.join(domains)})",
+                       select="research_domain,stage")
+    return {r["research_domain"] for r in rows if r.get("stage") != "failed"}
+
+
 def get_item(conn: SupabaseConn, item_id: str) -> Optional[OutreachItem]:
     rows = conn.select("outreach_items", item_id=f"eq.{item_id}", limit=1)
     return OutreachItem(**rows[0]) if rows else None

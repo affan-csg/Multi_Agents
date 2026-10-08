@@ -360,11 +360,20 @@ below for the current live-run status.
 
 ## Global company de-duplication
 
-A company that already exists is never duplicated across research runs. The
-same company under different domain strings (e.g., `company.com`,
-`https://www.Company.com/careers`, `company.com:443`) or similar names (e.g.,
-"Acme Inc." vs. "ACME Staffing LLC") is recognized as a match and reused
-without inserting, re-scoring, or handing off to Outreach a second time.
+A company is never duplicated *if it was already qualified*. The same company
+under different domain strings (e.g., `company.com`, `https://www.Company.com/careers`,
+`company.com:443`) or similar names (e.g., "Acme Inc." vs. "ACME Staffing LLC") is
+recognized as a match. A match is only treated as a true duplicate (not
+re-inserted, re-scored, or handed off to Outreach) if one of these holds:
+
+1. It already has a successful qualification in any prior run.
+2. It is suppressed or disqualified, or is on the suppression list.
+
+All other matches are **re-eligible**: discovered-only, scored-but-not-qualified
+(did not make that run's top-N), error/no_ats/no_reqs status, or only failed
+qualifications. These companies are reused (same domain key, same stored region)
+but re-scored and compete in the new run's top-N pool, qualifying and being
+handed to Outreach if they rank high enough in the fresh run.
 
 **How it works:**
 - Each research run loads every existing company once (at start) and checks
@@ -375,18 +384,26 @@ without inserting, re-scoring, or handing off to Outreach a second time.
 - **Name matching** — fallback when domain doesn't match but a company's
   normalized name (case, accents, suffixes like "Inc" dropped) does, and the
   name key is at least 5 characters long (too-short keys like "Ace Co" are
-  ignored to avoid false matches).
-- **Existing companies are shown but not re-processed.** A match is recorded
-  in the `run_company_matches` table, shown in the run's Companies list with
-  an "Already exists" badge, but is never enriched, scored, or handed to
-  Outreach as a new campaign.
+  ignored to avoid false matches). For re-eligible name matches, the stored
+  domain is reused so the match resolves to the existing row.
+- **Duplicate vs. re-eligible check** — matches are classified by
+  `db.settled_domains()`: qualified (any successful qualification in any run),
+  terminal status (suppressed, disqualified), or on the suppression list. Only
+  these are treated as true duplicates (recorded in `run_company_matches`,
+  shown in the run with "Already exists", never enriched/scored/handed to Outreach).
+  All other matches remain eligible.
+- **Re-eligible flow** — re-eligible companies skip the enrichment cost and
+  `run_company_matches` recording; they load their stored region and re-enter
+  the normal pipeline (ATS detection, job discovery, scoring, top-N qualify,
+  contacts, hand-off) with the new run's ICP, tier, and scoring.
 - **Race-safe and idempotent.** Concurrent runs can discover the same company
   without creating duplicates (atomic insert-if-absent via PostgREST's
   `ignore-duplicates` preference). Re-running the same research run with the
   same ID doesn't turn its own companies into matches.
 - **Deletion still works.** Deleting a run keeps the company alive only if
   another run still scores it. A company with no remaining scores is deleted
-  and can be rediscovered fresh in a later run.
+  and can be rediscovered fresh in a later run. Once deleted, any prior qualification
+  is also deleted, so a re-discovery makes it eligible again.
 
 **Database requirement:** migration 005 must be applied (see **Applying schema
 migrations** below). Without it, attempting to save a match will fail.

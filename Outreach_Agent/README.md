@@ -46,24 +46,20 @@ Research Agent's API ─► Import ─► Campaign (top-N) ─► Personalize �
 
 A research run is *meant* to back at most one real campaign — creating a
 second against the same run is blocked in the Dashboard's campaign-creation
-form, but **`POST /campaigns` itself enforces nothing server-side**; the
-guard is a client-side UX rule in
-`Dashboard/src/pages/outreach/Campaigns.tsx`, checked against the
-already-loaded campaign list. The synthetic Test Campaign above is exempt
-since its `research_run_id` is always `null`.
+form (client-side UX rule in
+`Dashboard/src/pages/outreach/Campaigns.tsx`). Additionally, `POST /campaigns`
+now enforces a server-side guard: any prospect domain that already has an
+active `outreach_items` row (stage is not `failed`) in another campaign is
+skipped from this campaign, preventing re-queuing of companies already in
+flight. The synthetic Test Campaign is exempt since its `research_run_id` is
+always `null`.
 
-This means the automatic Research→Outreach hand-off (see above), which
-calls `POST /campaigns` directly and bypasses the Dashboard form entirely,
-is **not** covered by that guard either. In practice this is not a problem
-today — a fresh `csg discover`/`POST /discover` always mints a new
-timestamp-based `run_id`, and resuming a stalled run
-([discover.resume_stalled()](../Research_Agent/src/csg/discover.py)) does
-not re-trigger the hand-off at all — but if you ever build a path that could
-call the automatic hand-off twice for the same `run_id` (e.g. manually
-re-invoking it, or a future retry mechanism), know that it would currently
-create a second campaign, not skip it. Worth a real server-side guard on
-`POST /campaigns` if that ever becomes a live risk rather than a
-theoretical one.
+This server-side guard protects genuinely qualified/active prospects even if
+the Research deduplication check ever misses — a safety net against the edge
+case of clicking "Create Campaign" twice for the same run. If every prospect
+is already queued elsewhere, the existing "no contactable prospects" error fires.
+(Failed items do not block — a company that said no can be re-queued if
+a later research run qualifies it anew.)
 
 ## Stack
 

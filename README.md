@@ -136,8 +136,12 @@ project — see each one's own README:
    Tavily + Groq when every Gemini key is out of quota) finds companies in the
    chosen region and researches their firmographics. Each candidate is checked
    against every company already stored (normalized domain, then normalized
-   name); a match is listed in the run as "Already exists" but is not
-   re-inserted, re-scored or re-handed to Outreach.
+   name). A match is only skipped (shown as "Already exists" and not
+   re-inserted/re-scored/re-handed to Outreach) if it has a successful
+   qualification in any run, or is suppressed/disqualified. Companies that were
+   previously discovered but never qualified, scored but didn't make the
+   top-N cut, or had only failed qualification attempts remain eligible and
+   will be re-evaluated in the new run, competing in that run's own top-N pool.
 2. **Score / tier** (Research Agent) — rules-based scoring assigns a tier
    (A/B/C/D). `csg qualify` is a separate, optional LLM pass that adds a
    `pain_summary`/`recommended_angle` on top of a tier — it can lag behind or
@@ -279,7 +283,8 @@ in CI.
 - CI's Dashboard typecheck step is still marked `continue-on-error` for a
   historical `UsageTab.tsx` error; `npx tsc -b --noEmit` currently passes
   cleanly, so that flag can be dropped.
-- Research's de-duplication needs migration 005 on any existing Research
-  project, and name matching only applies to normalized names of 5+
-  characters. See
+- Research's de-duplication (migration 005 required) distinguishes between
+  genuinely qualified companies (which are never re-scored) and
+  re-eligible companies (discovered, scored, or attempted-but-failed in an
+  earlier run). See
   [Research_Agent/README.md](Research_Agent/README.md#global-company-de-duplication).

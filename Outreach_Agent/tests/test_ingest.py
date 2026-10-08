@@ -310,3 +310,33 @@ def test_to_imported_prospect_never_attempted_is_not_flagged_as_failed():
     }
     prospect = ingest._to_imported_prospect(detail, "run1")
     assert prospect.qualification_failed is False
+
+
+def test_prospect_already_in_an_active_campaign_is_not_queued_again(conn):
+    cfg = load_config()
+    _seed(conn, "once.com", "A", 90)
+    _seed(conn, "fresh.com", "A", 80)
+    first, _ = ingest.create_campaign_from_prospects(conn, cfg, limit=1, tiers=["A"])
+    assert [i.research_domain for i in db.list_items(conn, campaign_id=first.campaign_id)] == ["once.com"]
+
+    second, _ = ingest.create_campaign_from_prospects(conn, cfg, limit=5, tiers=["A"])
+    assert [i.research_domain for i in db.list_items(conn, campaign_id=second.campaign_id)] == ["fresh.com"]
+
+
+def test_failed_item_does_not_block_a_new_campaign_item(conn):
+    cfg = load_config()
+    _seed(conn, "retry.com", "A", 90)
+    first, _ = ingest.create_campaign_from_prospects(conn, cfg, limit=5, tiers=["A"])
+    (item,) = db.list_items(conn, campaign_id=first.campaign_id)
+    db.update_item_fields(conn, item.item_id, stage="failed")
+
+    second, _ = ingest.create_campaign_from_prospects(conn, cfg, limit=5, tiers=["A"])
+    assert [i.research_domain for i in db.list_items(conn, campaign_id=second.campaign_id)] == ["retry.com"]
+
+
+def test_every_prospect_already_queued_raises_instead_of_empty_campaign(conn):
+    cfg = load_config()
+    _seed(conn, "only.com", "A", 90)
+    ingest.create_campaign_from_prospects(conn, cfg, limit=5, tiers=["A"])
+    with pytest.raises(ValueError):
+        ingest.create_campaign_from_prospects(conn, cfg, limit=5, tiers=["A"])

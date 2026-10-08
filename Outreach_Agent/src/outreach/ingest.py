@@ -154,6 +154,9 @@ def create_campaign_from_prospects(
     prospects = [p for p in prospects if p.tier in tiers]
 
     contactable = [p for p in prospects if p.has_contact]
+    # Already has a (non-failed) item in some campaign: never queue it twice.
+    already = db.domains_with_existing_items(conn, [p.research_domain for p in contactable])
+    contactable = [p for p in contactable if p.research_domain not in already]
     excluded = [
         {"domain": p.research_domain, "name": p.name or p.research_domain, "tier": p.tier}
         for p in prospects if not p.has_contact

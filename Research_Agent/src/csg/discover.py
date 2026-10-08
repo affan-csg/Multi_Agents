@@ -63,6 +63,9 @@ class DiscoveryStats:
     auto_qualify_top_n: int = 0
     auto_qualify_skipped_tier: int = 0
     duplicates_existing: int = 0
+    reeligible: int = 0
+    """Previously discovered companies that were never qualified (or hand-off
+    eligible) and so re-entered scoring/qualification in this run."""
     existing_matches: list[dict[str, str]] = field(default_factory=list)
     """Companies this run found that ALREADY exist in the database (by
     normalized domain, else normalized name): [{"domain", "matched_by"}]. They
@@ -93,6 +96,7 @@ class DiscoveryStats:
             "enrich_skipped": self.enrich_skipped,
             "enrich_failures": self.enrich_failures,
             "duplicates_existing": self.duplicates_existing,
+            "reeligible": self.reeligible,
             "existing_matches": self.existing_matches,
             "companies": p.companies if p else 0,
             "suppressed": p.suppressed if p else 0,
@@ -146,7 +150,7 @@ async def _enrich_all(
         company = Company(
             domain=c.domain,
             name=c.name or (existing.name if existing else None),
-            region=region,
+            region=(existing.region if existing and existing.region else region),
             industry=c.industry or (existing.industry if existing else None),
             status="discovered",
         )
@@ -263,11 +267,25 @@ async def run_discovery(
         # (a resumed/re-run run_id), not duplicates.
         existing = ExistingCompanies.load(conn)
         own = {r["domain"] for r in conn.select("scores", run_id=f"eq.{rid}", select="domain")}
+        # "Already discovered" is not "already qualified": only a company that
+        # was qualified in some run (or is suppressed/disqualified) is a true
+        # duplicate. One that was merely discovered/scored and missed an
+        # earlier top-N stays eligible and re-enters the pipeline below.
+        found = [(c, existing.lookup(c.domain, c.name)) for c in candidates]
+        settled = db.settled_domains(conn, sorted({m.domain for _, m in found if m is not None}))
         matches: dict[str, Match] = {}
+        reeligible: set[str] = set()
         fresh = []
-        for c in candidates:
-            m = existing.lookup(c.domain, c.name)
-            if m is not None and m.domain not in own:
+        for c, m in found:
+            if m is not None and m.domain not in own and m.domain not in settled:
+                # Resolve to the stored domain so a name-match updates the
+                # existing row instead of inserting a second company.
+                if m.domain != c.domain:
+                    c = c.model_copy(update={"domain": m.domain})
+                if m.domain not in reeligible:
+                    reeligible.add(m.domain)
+                    fresh.append(c)
+            elif m is not None and m.domain not in own:
                 matches.setdefault(m.domain, m)  # first (strongest) match wins
                 provider_rows = [{
                     "domain": m.domain, "provider_name": provider_name, "url": c.source_url,
@@ -295,7 +313,8 @@ async def run_discovery(
         rows = []
         claimed_pairs = []
         for candidate, company in pairs:
-            if not db.claim_company(conn, company) and company.domain not in own:
+            if (not db.claim_company(conn, company) and company.domain not in own
+                    and company.domain not in reeligible):
                 matches[company.domain] = Match(company.domain, "domain")
                 continue
             claimed_pairs.append((candidate, company))
@@ -316,6 +335,7 @@ async def run_discovery(
         stats.existing_matches = [{"domain": m.domain, "matched_by": m.matched_by}
                                   for m in matches.values()]
         stats.duplicates_existing = len(stats.existing_matches)
+        stats.reeligible = sum(1 for _, c in pairs if c.domain in reeligible)
         stats.discovered = len(pairs) + stats.duplicates_existing
         if matches:
             db.save_run_matches(conn, rid, stats.existing_matches)

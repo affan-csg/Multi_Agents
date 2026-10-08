@@ -549,6 +549,22 @@ def get_qualifications(conn: SupabaseConn, run_id: str) -> dict[str, dict[str, A
     return {r["domain"]: r for r in rows}
 
 
+def settled_domains(conn: SupabaseConn, domains: list[str]) -> set[str]:
+    """Of `domains`, those a later run must NOT pick up again: already
+    successfully qualified in ANY run, or terminal (suppressed/disqualified,
+    or on the suppression list). Merely discovered/scored/errored companies
+    are not settled -- they never won a top-N slot and stay eligible."""
+    if not domains:
+        return set()
+    in_list = f"in.({','.join(domains)})"
+    settled = {r["domain"] for r in conn.select("qualifications", domain=in_list, select="domain")}
+    for r in conn.select("companies", domain=in_list, select="domain,status"):
+        if r.get("status") in ("suppressed", "disqualified"):
+            settled.add(r["domain"])
+    settled |= set(domains) & set(load_suppression(conn))
+    return settled
+
+
 def save_qualification_attempt(
     conn: SupabaseConn, run_id: str, domain: str, status: str,
     error_reason: Optional[str] = None, error_detail: Optional[str] = None,

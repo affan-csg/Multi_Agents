@@ -227,6 +227,11 @@ class _Env:
                   "cache_ttl_hours": 1, "max_concurrency": 1},
         )
 
+    def mark_qualified(self, domain: str, run_id: str) -> None:
+        self.conn.upsert("qualifications", [{"domain": domain, "run_id": run_id,
+                                             "qualified_at": "2026-10-07T00:00:00"}],
+                         on_conflict="domain,run_id")
+
     def run(self, run_id: str, region: str = "GA"):
         return asyncio.run(discover.run_discovery(self.cfg, region=region, conn=self.conn, run_id=run_id))
 
@@ -245,6 +250,7 @@ def test_same_company_in_two_runs_is_not_duplicated(env):
     a = env.run("disc-A", region="GA")
     assert a.duplicates_existing == 0 and len(env.companies) == 1
     env.companies[0]["status"] = "scored"
+    env.mark_qualified("acme.com", "disc-A")
 
     env.found = [("acme.com", "Acme Staffing")]
     b = env.run("disc-B", region="TX")
@@ -260,6 +266,7 @@ def test_same_company_in_two_runs_is_not_duplicated(env):
 def test_url_and_name_formatting_variants_match_the_existing_company(env):
     env.found = [("acme.com", "Acme Staffing, Inc.")]
     env.run("disc-A")
+    env.mark_qualified("acme.com", "disc-A")
     env.found = [("https://www.ACME.com/careers", "Other Name"), ("acme-jobs.io", "ACME STAFFING INC"),
                  ("brandnew.com", "Brand New Co Ltd")]
     b = env.run("disc-B")
@@ -315,6 +322,7 @@ def test_existing_company_does_not_create_another_campaign(env):
     env.found = [("acme.com", "Acme Staffing")]
     env.run("disc-A")
     assert env.import_calls == ["disc-A"] and len(env.campaigns) == 1
+    env.mark_qualified("acme.com", "disc-A")
 
     env.found = [("www.Acme.com", "Acme Staffing")]
     b = env.run("disc-B")
@@ -328,6 +336,7 @@ def test_existing_company_does_not_create_another_campaign(env):
 def test_matches_are_listed_for_the_run_but_never_keep_a_company_alive(env):
     env.found = [("acme.com", "Acme Staffing")]
     env.run("disc-A")
+    env.mark_qualified("acme.com", "disc-A")
     env.found = [("acme.com", "Acme Staffing"), ("new.com", "New Thing")]
     env.run("disc-B")
 
@@ -341,3 +350,53 @@ def test_matches_are_listed_for_the_run_but_never_keep_a_company_alive(env):
     # Deleting A removes the company (B's match never counted as a reference).
     db.delete_run(env.conn, "disc-A")
     assert "acme.com" not in [c["domain"] for c in env.companies]
+
+
+# --- already discovered != already qualified -----------------------------------
+
+def test_discovered_but_unqualified_company_is_requalified_in_later_run(env):
+    env.found = [("acme.com", "Acme Staffing")]
+    env.run("disc-A")                       # scored but never qualified (missed the top-N)
+
+    env.found = [("www.Acme.com", "Acme Staffing")]
+    b = env.run("disc-B", region="TX")
+
+    assert b.duplicates_existing == 0 and b.reeligible == 1
+    assert len(env.companies) == 1                        # same row, not a second company
+    assert env.companies[0]["region"] == "GA"             # stored region kept
+    assert env.pipeline_domains[-1] == ["acme.com"]       # scored again in run B
+    assert sorted(s["run_id"] for s in env.conn.tables["scores"]) == ["disc-A", "disc-B"]
+    assert env.import_calls == ["disc-A", "disc-B"] and len(env.campaigns) == 2
+    assert env.conn.tables.get("run_company_matches", []) == []
+
+
+def test_name_match_of_unqualified_company_reuses_stored_domain(env):
+    env.found = [("acme.com", "Acme Staffing, Inc.")]
+    env.run("disc-A")
+    env.found = [("acme-jobs.io", "ACME STAFFING INC")]
+    b = env.run("disc-B")
+
+    assert b.reeligible == 1
+    assert [c["domain"] for c in env.companies] == ["acme.com"]   # no second company
+    assert env.pipeline_domains[-1] == ["acme.com"]
+
+
+def test_company_with_only_failed_qualification_is_still_eligible(env):
+    env.found = [("acme.com", "Acme Staffing")]
+    env.run("disc-A")
+    env.conn.upsert("qualification_attempts", [{"domain": "acme.com", "run_id": "disc-A", "status": "failed",
+                                                "attempt_count": 3}], on_conflict="domain,run_id")
+    env.found = [("acme.com", "Acme Staffing")]
+    b = env.run("disc-B")
+    assert b.reeligible == 1 and env.pipeline_domains[-1] == ["acme.com"]
+
+
+@pytest.mark.parametrize("status", ["suppressed", "disqualified"])
+def test_terminal_status_company_stays_skipped(env, status):
+    env.found = [("acme.com", "Acme Staffing")]
+    env.run("disc-A")
+    env.companies[0]["status"] = status
+    env.found = [("acme.com", "Acme Staffing")]
+    b = env.run("disc-B")
+    assert b.duplicates_existing == 1 and b.reeligible == 0
+    assert env.pipeline_domains == [["acme.com"]]  # only run A's

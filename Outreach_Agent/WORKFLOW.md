@@ -80,14 +80,18 @@ A Research run happens → Import + campaign (by hand, or automatic) → review 
    excluded company is reported back as `excluded_no_contact`, e.g. "No
    contacts found for Acme Co, so it was not added to prospects."
 2. **Create campaign** — select the top N *contactable* cached prospects
-   (ranked by Research's score — see step 1 below), draft every message up
-   front, and file each item into `pending` (genuinely personalized) or
-   `needs_review` (generic template only — held for review, never dropped
-   from the campaign). A cached prospect can only reach this step already
-   having a contact (import already filtered on that), so nothing here gets
-   excluded for lacking one — but `limit` is still a ceiling on however many
-   contactable prospects exist for this run/tier, never padded past that with
-   anything else. Same by-hand-or-automatic split as import.
+   (ranked by Research's score — see step 1 below) that are not already queued
+   in another campaign, draft every message up front, and file each item into
+   `pending` (genuinely personalized) or `needs_review` (generic template only —
+   held for review, never dropped from the campaign). A cached prospect can only
+   reach this step already having a contact (import already filtered on that), so
+   nothing here gets excluded for lacking one. Any domain with an active
+   `outreach_items` row (stage is not `failed`) in another campaign is skipped
+   to prevent re-queuing; failed items do not block, allowing a company that
+   said no to be re-queued if re-discovered and qualified anew. `limit` is still
+   a ceiling on however many *eligible* contactable prospects exist for this
+   run/tier. If every prospect is already queued, the existing "no contactable
+   prospects" error fires. Same by-hand-or-automatic split as import.
 3. **Review** — a person reads `needs_review` items in the Dashboard kanban,
    and either approves the generic/no-contact draft as-is, asks for a
    redraft, or edits it with a free-text revise instruction.
