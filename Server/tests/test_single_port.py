@@ -161,11 +161,28 @@ def test_cors_preflight_allows_vercel_origin(client, prefix):
         prefix,
         headers={
             "Origin": origin,
-            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization, content-type",
         },
     )
     assert resp.status_code in (200, 204)
     assert resp.headers.get("access-control-allow-origin") == origin
+    assert resp.headers.get("access-control-allow-credentials") == "true"
+    assert "POST" in resp.headers.get("access-control-allow-methods", "")
+    allowed_headers = resp.headers.get("access-control-allow-headers", "").lower()
+    assert "authorization" in allowed_headers
+    assert "content-type" in allowed_headers
+
+
+def test_cors_keeps_authentication_on_cross_origin_requests(client):
+    client.headers.pop("Authorization", None)
+    resp = client.get(
+        "/research/regions",
+        headers={"Origin": "https://multi-agents-beta.vercel.app"},
+    )
+    assert resp.status_code == 401
+    assert resp.headers.get("access-control-allow-origin") == "https://multi-agents-beta.vercel.app"
+    assert resp.headers.get("access-control-allow-credentials") == "true"
 
 
 # ---------------------------------------------------------------------------
