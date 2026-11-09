@@ -18,7 +18,26 @@ from __future__ import annotations
 import pytest
 
 from outreach import personalize
-from outreach.gemini_keys import GeminiKeyPool, is_daily_quota_exhausted
+from outreach.gemini_keys import (
+    GEMINI_MODEL,
+    GeminiKeyPool,
+    is_daily_quota_exhausted,
+    make_gemini_client,
+)
+
+
+def test_client_uses_agent_platform_express_mode(monkeypatch):
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+    make_gemini_client("test-key")
+
+    assert captured == {"enterprise": True, "api_key": "test-key"}
+    assert GEMINI_MODEL == "gemini-3.8-flash"
 
 
 class _QuotaExhausted(Exception):
@@ -155,7 +174,7 @@ def test_second_key_used_when_first_key_quota_exhausted(monkeypatch):
     calls: list[str] = []
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.api_key = api_key
             self.models = self
 
@@ -179,7 +198,7 @@ def test_returns_none_when_every_key_quota_exhausted(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY_2", "fake-gemini-key-2")
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.models = self
 
         def generate_content(self, model, contents):
@@ -200,7 +219,7 @@ def test_non_quota_error_is_not_caught_by_the_pool(monkeypatch):
     calls: list[str] = []
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.api_key = api_key
             self.models = self
 

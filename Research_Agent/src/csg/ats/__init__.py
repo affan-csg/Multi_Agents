@@ -178,8 +178,28 @@ def candidate_tokens(domain: str, name: Optional[str]) -> list[str]:
     return result
 
 
+def _owner_tokens(domain: str, name: Optional[str]) -> set[str]:
+    tokens = {re.sub(r"[^a-z0-9]", "", domain.split(".")[0].lower())}
+    words = re.findall(r"[a-z0-9]+", (name or "").lower())
+    ignored = {"a", "an", "the", "and", "of", "inc", "llc", "ltd", "corp", "corporation", "company", "co", "group", "holdings"}
+    meaningful = [word for word in words if word not in ignored]
+    if meaningful:
+        tokens.add("".join(meaningful))
+        acronym = "".join(word[0] for word in meaningful)
+        if len(acronym) >= 3:
+            tokens.add(acronym)
+    return {token for token in tokens if token}
+
+
+def _board_matches_company(provider: str, token: str, domain: str, name: Optional[str]) -> bool:
+    owners = _owner_tokens(domain, name)
+    board_parts = token.split("/") if provider == "workday" else [token]
+    normalized_parts = [re.sub(r"[^a-z0-9]", "", part.lower()) for part in board_parts]
+    return any(part in owners for part in normalized_parts)
+
+
 async def _scan_body_for_board(
-    fetcher: Fetcher, url: str, body: str
+    fetcher: Fetcher, url: str, body: str, domain: str, name: Optional[str]
 ) -> Optional[tuple[AtsProvider, str, str, Optional[str]]]:
     """Look for a verifiable ATS board link directly in one fetched page's
     HTML. Shared by the top-level careers pages and the one-hop subpages
@@ -190,12 +210,16 @@ async def _scan_body_for_board(
                 token = m.group(1)
                 if token.lower() in TOKEN_BLOCKLIST:
                     continue
+                if not _board_matches_company(provider, token, domain, name):
+                    continue
                 if await ADAPTERS[provider].verify(fetcher, token):
                     return provider, token, "careers_page", url
 
     for m in workday.LINK_RE.finditer(body):
         tenant, shard, site = m.group(1), m.group(2), m.group(3)
         token = workday.encode_token(tenant, shard, site)
+        if not _board_matches_company("workday", token, domain, name):
+            continue
         if await workday.verify(fetcher, token):
             return "workday", token, "careers_page", url
 
@@ -203,7 +227,7 @@ async def _scan_body_for_board(
 
 
 async def _scan_urls(
-    fetcher: Fetcher, urls: list[str]
+    fetcher: Fetcher, urls: list[str], domain: str, name: Optional[str]
 ) -> tuple[Optional[tuple[AtsProvider, str, str, Optional[str]]], list[str]]:
     """Fetch and scan each URL for a board link; on a miss, collect
     same-domain listing-shaped subpages found in it. Returns as soon as one
@@ -214,7 +238,7 @@ async def _scan_urls(
         if status != 200 or not body:
             continue
 
-        found = await _scan_body_for_board(fetcher, url, body)
+        found = await _scan_body_for_board(fetcher, url, body, domain, name)
         if found:
             return found, subpages
 
@@ -230,12 +254,12 @@ async def detect(
     """Return (provider, token, detected_by, careers_url) or None."""
     # --- 1. careers page scan, on the apex domain ---
     apex_urls = [f"https://{domain}{path}" for path in CAREERS_PATHS]
-    found, subpages = await _scan_urls(fetcher, apex_urls)
+    found, subpages = await _scan_urls(fetcher, apex_urls, domain, name)
     if found:
         return found
 
     # --- 1b. one hop into whatever open-positions-looking subpages we found ---
-    found, _ = await _scan_urls(fetcher, subpages[:MAX_SUBPAGES])
+    found, _ = await _scan_urls(fetcher, subpages[:MAX_SUBPAGES], domain, name)
     if found:
         return found
 
@@ -248,17 +272,17 @@ async def detect(
     # correct even for a multi-label public suffix like "acme.co.uk" --
     # there is no second label to (wrongly) strip off first. ---
     subdomain_urls = [f"https://{sub}.{domain}" for sub in CAREERS_SUBDOMAINS if not domain.startswith(f"{sub}.")]
-    found, subdomain_subpages = await _scan_urls(fetcher, subdomain_urls)
+    found, subdomain_subpages = await _scan_urls(fetcher, subdomain_urls, domain, name)
     if found:
         return found
-    found, _ = await _scan_urls(fetcher, subdomain_subpages[:MAX_SUBPAGES])
+    found, _ = await _scan_urls(fetcher, subdomain_subpages[:MAX_SUBPAGES], domain, name)
     if found:
         return found
 
     # --- 2. token probe (not applicable to Workday -- shard is unguessable) ---
     for token in candidate_tokens(domain, name):
         for provider in PROBEABLE_PROVIDERS:
-            if await ADAPTERS[provider].verify(fetcher, token):
+            if _board_matches_company(provider, token, domain, name) and await ADAPTERS[provider].verify(fetcher, token):
                 return provider, token, "token_probe", None
 
     return None

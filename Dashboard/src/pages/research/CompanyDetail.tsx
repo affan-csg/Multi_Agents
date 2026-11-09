@@ -1,6 +1,7 @@
 import { researchApi, type CompanyDetail as Detail, type ProvenanceValue } from "../../agents/research";
 import { useCachedFetch } from "../../hooks/useCachedFetch";
 import { AtsBadge, Avatar, CompanyDetailSkeleton, EmptyState, Icon, relativeTime } from "../../components/ui";
+import { ResearchAssessmentPanel } from "../../components/ResearchAssessment";
 
 function provenanceTitle(p: ProvenanceValue<unknown>): string {
   const method = p.method ?? "unknown";
@@ -21,6 +22,16 @@ function estimateMark(p: ProvenanceValue<unknown>) {
       ~
     </span>
   );
+}
+
+function identityValue<T>(p: ProvenanceValue<T> | null | undefined): string | null {
+  if (!p) return null;
+  if (typeof p.value === "string") return p.value;
+  if (p.value && typeof p.value === "object") {
+    const hq = p.value as { city?: string; state?: string; country?: string };
+    return [hq.city, hq.state, hq.country].filter(Boolean).join(", ") || null;
+  }
+  return null;
 }
 
 interface Props {
@@ -114,6 +125,25 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
               </span>
             )}
           </div>
+          {(company.website || company.headquarters || company.company_type) && (
+            <div className="detail-meta-row" style={{ marginTop: 12 }}>
+              {company.website && identityValue(company.website) && (
+                <a href={identityValue(company.website) || undefined} target="_blank" rel="noreferrer" title={provenanceTitle(company.website)}>
+                  <Icon name="link" size={14} /> Official website
+                </a>
+              )}
+              {company.headquarters && identityValue(company.headquarters) && (
+                <span className="meta-chip" title={provenanceTitle(company.headquarters)}>
+                  <Icon name="pin" size={14} /> HQ: {identityValue(company.headquarters)}
+                </span>
+              )}
+              {company.company_type && identityValue(company.company_type) && (
+                <span className="meta-chip" title={provenanceTitle(company.company_type)}>
+                  {identityValue(company.company_type)}
+                </span>
+              )}
+            </div>
+          )}
         </div>
         {score && (
           <div className="tier-callout">
@@ -139,6 +169,8 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
           Suppress
         </button>
       </div>
+
+      <ResearchAssessmentPanel assessment={detail.research_assessment} />
 
       <div className="detail-grid">
         <div className="card">

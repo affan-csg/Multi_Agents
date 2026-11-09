@@ -126,6 +126,23 @@ def test_ai_ml_and_mlops_outweight_generic_software_dev(cfg):
     assert m_ai["relevant_share"] > m_sd["relevant_share"]
 
 
+def test_delivery_fit_counts_use_all_unique_eligible_postings(cfg):
+    reqs = [
+        req("Software Engineer", location="Austin, TX", i=1),
+        req("Data Engineer", location="Remote, Mexico", i=2),
+        req("QA Engineer", location="Remote, Pakistan", i=3),
+        req("Product Manager", location="Remote, India", i=4),
+        req("Chief of Staff", location=None, i=5),
+    ]
+    for posting, fit in zip(reqs, ["US", "LATAM", "Pakistan", None, None]):
+        posting.delivery_fit = fit
+    metrics = compute_metrics(cfg, reqs, NOW)
+    result = evaluate(cfg, company(), reqs, NOW)
+    counts = result.metrics["delivery_fit_counts"]
+    assert counts == {"US": 1, "LATAM": 1, "Pakistan": 1, "Other": 1, "Unknown": 1, "eligible_total": 5}
+    assert sum(counts[key] for key in ("US", "LATAM", "Pakistan", "Other", "Unknown")) == counts["eligible_total"]
+
+
 # --- scoring -------------------------------------------------------------
 
 def test_strong_prospect_scores_high(cfg):

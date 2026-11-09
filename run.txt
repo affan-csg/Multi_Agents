@@ -1,30 +1,23 @@
-# CSG Agents Quick Start
-# See README.md for full setup and architecture details
+# CSG Agents: local full-system run (PowerShell)
+# Run these commands from the repository root.
 
-# === ONE-TIME SETUP ===
+# One-time setup
 python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate    # macOS/Linux
+.venv\Scripts\Activate.ps1
 pip install -e Research_Agent -e Outreach_Agent -e Server
+Set-Location Dashboard
+npm install
+Set-Location ..
 
-# === TERMINAL 1: Backend (both agents on :8000) ===
+# Terminal 1: backend (Research + Outreach)
 python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
-# → http://127.0.0.1:8000/research/docs
-# → http://127.0.0.1:8000/outreach/docs
-# → http://127.0.0.1:8000/docs
 
-# === TERMINAL 2: Dashboard (:5173) ===
-cd Dashboard && npm run dev
+# Terminal 2: Dashboard
+Set-Location Dashboard
+npm run dev
 
-# === OPTIONAL: Run an agent standalone (e.g., debugging) ===
-# Research Agent on :8000
-cd Research_Agent && python -m uvicorn csg.api:app --app-dir src --reload --port 8000
-
-# Outreach Agent on :8001
-cd Outreach_Agent && python -m uvicorn outreach.api:app --app-dir src --reload --port 8001
-
-# === Testing ===
-cd Research_Agent && pytest      # Offline, 299+ tests
-cd Outreach_Agent && pytest      # Offline, 592+ tests (Outreach + Conversation + Learning)
-cd Server && pytest               # Single-port tests
-cd Dashboard && npx tsc -b --noEmit  # Type check only
+# Open:
+# Dashboard:       http://localhost:5173
+# Research API:    http://127.0.0.1:8000/research/docs
+# Outreach API:    http://127.0.0.1:8000/outreach/docs
+# Combined API:    http://127.0.0.1:8000/docs

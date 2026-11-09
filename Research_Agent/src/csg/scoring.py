@@ -428,19 +428,31 @@ def _csg_delivery_fit(cfg: Config, postings: list[JobPosting], m: dict[str, Any]
     weight = cfg.weights.get("csg_delivery_fit", 10.0)
     d = _Dimension("CSG Delivery Fit", weight)
 
-    classified = [p.delivery_fit for p in postings if p.delivery_fit]
-    if not classified:
+    if not postings:
         d.skip("delivery fit (no reqs could be classified)")
         return d
 
+    def bucket(posting: JobPosting) -> str:
+        if posting.delivery_fit in {"US", "LATAM", "Pakistan"}:
+            return posting.delivery_fit
+        location = (posting.location or "").lower()
+        if not location.strip():
+            return "Unknown"
+        if any(marker in location for marker in ("india", "canada", "united kingdom", "europe", "asia", "australia")):
+            return "Other"
+        return "Unknown"
+
     counts = {
-        "LATAM": sum(1 for f in classified if f == "LATAM"),
-        "Pakistan": sum(1 for f in classified if f == "Pakistan"),
-        "US": sum(1 for f in classified if f == "US"),
+        "US": sum(1 for p in postings if bucket(p) == "US"),
+        "LATAM": sum(1 for p in postings if bucket(p) == "LATAM"),
+        "Pakistan": sum(1 for p in postings if bucket(p) == "Pakistan"),
+        "Other": sum(1 for p in postings if bucket(p) == "Other"),
+        "Unknown": sum(1 for p in postings if bucket(p) == "Unknown"),
+        "eligible_total": len(postings),
     }
     m["delivery_fit_counts"] = counts
 
-    total = len(classified)
+    total = counts["eligible_total"]
     nearshore_offshore = counts["LATAM"] + counts["Pakistan"]
     offshore_pts = weight * 0.6
     onshore_pts = weight * 0.4

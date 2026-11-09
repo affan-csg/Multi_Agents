@@ -134,6 +134,8 @@ def classify_error(exc: Exception) -> str:
     message = str(exc)
     if "timed out" in message.lower() or "timeout" in type(exc).__name__.lower():
         return "timeout"
+    if isinstance(exc, ValueError) or "parse" in type(exc).__name__.lower() or "json" in message.lower():
+        return "parse_error"
     if "429" in message or "RESOURCE_EXHAUSTED" in message or "rate limit" in message.lower():
         return "rate_limited"
     return "other"

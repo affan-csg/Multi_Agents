@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 
 from .usage_tracker import track
+from .research_assessment_generation import refresh_company_assessment_safely
 
 if TYPE_CHECKING:
     from .db import SupabaseConn
@@ -44,6 +45,8 @@ def _api_key() -> str:
     return key
 
 
+
+
 def _parse_emails(data: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for e in data.get("data", {}).get("emails", []) or []:
@@ -61,7 +64,6 @@ def _parse_emails(data: dict[str, Any]) -> list[dict[str, Any]]:
             "verification": (e.get("verification") or {}).get("status"),
         })
     return out
-
 
 async def _search(domain: str, api_key: str, limit: int, department: Optional[str], seniority: Optional[str]) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"domain": domain, "api_key": api_key, "limit": limit}
@@ -151,5 +153,8 @@ async def discover_run(
             stats["error_details"][domain] = f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"
         if on_progress:
             on_progress(i + 1, len(pending), domain)
+
+    for domain in domains:
+        refresh_company_assessment_safely(conn, domain)
 
     return stats

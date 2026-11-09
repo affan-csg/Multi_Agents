@@ -73,7 +73,7 @@ def make_ipv4_httpx_clients() -> tuple:
 
 
 def make_gemini_client(api_key: str):
-    """Build a genai.Client that connects to Google over IPv4.
+    """Build an Express Mode Agent Platform client over IPv4.
 
     See make_ipv4_httpx_clients for why. Pinning the outbound connection to
     IPv4 sidesteps a broken/blackholed IPv6 route entirely.
@@ -86,7 +86,11 @@ def make_gemini_client(api_key: str):
         httpx_client=sync_client,
         httpx_async_client=async_client,
     )
-    return genai.Client(api_key=api_key, http_options=http_options)
+    return genai.Client(
+        enterprise=True,
+        api_key=api_key,
+        http_options=http_options,
+    )
 
 
 def is_connection_error(exc: Exception) -> bool:

@@ -9,7 +9,25 @@ from __future__ import annotations
 
 import pytest
 
-from csg.discovery.gemini_keys import GeminiKeyPool, is_daily_quota_exhausted
+from csg.discovery.gemini_keys import (
+    GeminiKeyPool,
+    is_daily_quota_exhausted,
+    make_gemini_client,
+)
+
+
+def test_client_uses_agent_platform_express_mode(monkeypatch):
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+    make_gemini_client("test-key")
+
+    assert captured["enterprise"] is True
+    assert captured["api_key"] == "test-key"
 
 
 class _FakeError(Exception):

@@ -100,6 +100,18 @@ def test_no_ats_careers_page_scrape_finds_jobs():
     assert "Senior Backend Engineer" in titles
     assert all(p.source == "careers_page" for p in result.postings)
     assert all(p.ats_provider is None for p in result.postings)
+    assert all(jobs_discovery.is_scoring_eligible(p) for p in result.postings)
+
+
+def test_careers_page_rejects_off_domain_job_links():
+    careers_url = "https://acme.com/careers"
+    body = '<a href="https://jobs.other-company.com/jobs/platform-engineer">Platform Engineer</a>'
+    fetcher = FakeFetcher(gets={careers_url: (200, body)})
+
+    result = asyncio.run(discover_jobs(fetcher, _company(), None))
+
+    assert result.postings == []
+    assert result.hiring_signal == "unknown"
 
 
 def test_careers_page_jsonld_jobposting_parsed():
@@ -124,6 +136,22 @@ def test_careers_page_jsonld_jobposting_parsed():
     assert p.external_id == "REQ-42"
     assert p.location == "Austin, TX"
     assert p.employment_type == "FULL_TIME"
+    assert jobs_discovery.is_scoring_eligible(p)
+
+
+def test_careers_page_rejects_jsonld_for_different_employer():
+    careers_url = "https://acme.com/careers"
+    jsonld = {
+        "@type": "JobPosting", "title": "Engineer", "identifier": "REQ-9",
+        "hiringOrganization": {"name": "Other Company"},
+        "url": "https://jobs.other-company.com/engineer",
+    }
+    body = f'<script type="application/ld+json">{json.dumps(jsonld)}</script>'
+    fetcher = FakeFetcher(gets={careers_url: (200, body)})
+
+    result = asyncio.run(discover_jobs(fetcher, _company(), None))
+
+    assert result.postings == []
 
 
 # --------------------------------------------------------------------------
@@ -144,10 +172,11 @@ def test_no_ats_careers_empty_falls_through_to_external_search(monkeypatch):
     result = asyncio.run(discover_jobs(fetcher, _company(), None))
 
     assert result.method == "web_search"
-    assert result.hiring_signal == "confirmed"
+    assert result.hiring_signal == "unknown"
     assert result.source == "tavily search"
     assert len(result.postings) == 1
     assert result.postings[0].source == "web_search"
+    assert not jobs_discovery.is_scoring_eligible(result.postings[0])
 
 
 # --------------------------------------------------------------------------
@@ -300,7 +329,7 @@ def test_tavily_dns_failure_then_success_recovers_within_retry_budget(monkeypatc
 
     assert calls["n"] == 2  # exactly one retry, not a second full pass through the chain
     assert result.method == "web_search"
-    assert result.hiring_signal == "confirmed"
+    assert result.hiring_signal == "unknown"
     assert len(result.postings) == 1
 
 
@@ -358,7 +387,7 @@ def test_tavily_connection_error_retry_does_not_consume_rate_limit_budget(monkey
 
     assert calls["n"] == 3
     assert result.method == "web_search"
-    assert result.hiring_signal == "confirmed"
+    assert result.hiring_signal == "unknown"
 
 
 def test_tavily_timeout_is_also_retried(monkeypatch):
@@ -385,4 +414,4 @@ def test_tavily_timeout_is_also_retried(monkeypatch):
 
     assert calls["n"] == 2
     assert result.method == "web_search"
-    assert result.hiring_signal == "confirmed"
+    assert result.hiring_signal == "unknown"

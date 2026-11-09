@@ -259,8 +259,42 @@ def test_same_company_in_two_runs_is_not_duplicated(env):
     assert env.companies[0]["region"] == "GA" and env.companies[0]["status"] == "scored"  # not reset
     assert b.duplicates_existing == 1
     assert b.existing_matches == [{"domain": "acme.com", "matched_by": "domain"}]
-    assert [s["run_id"] for s in env.conn.tables["scores"]] == ["disc-A"]  # no second score row
-    assert env.enriched.count("acme.com") == 1  # not re-enriched for run B
+    assert [s["run_id"] for s in env.conn.tables["scores"]] == ["disc-A"]
+    assert env.enriched.count("acme.com") == 1
+
+
+def test_incomplete_firmographic_provenance_retries_after_cooldown():
+    from datetime import datetime, timedelta, timezone
+
+    from csg.discover import _needs_enrichment
+    from csg.models import Company, ProvenanceValue
+
+    recent = Company(
+        domain="recent.example",
+        employee_count=ProvenanceValue(
+            value=100, source="search", fetched_at=datetime.now(timezone.utc),
+            method="estimated", confidence="medium",
+        ),
+    )
+    stale = Company(
+        domain="stale.example",
+        employee_count=ProvenanceValue(
+            value=100, source="search", fetched_at=datetime.now(timezone.utc) - timedelta(days=31),
+            method="estimated", confidence="medium",
+        ),
+    )
+    complete = Company(
+        domain="complete.example",
+        employee_count=ProvenanceValue(
+            value=100, source="profile", url="https://complete.example/about",
+            fetched_at=datetime.now(timezone.utc) - timedelta(days=365),
+            method="estimated", confidence="medium",
+        ),
+    )
+
+    assert not _needs_enrichment(recent)
+    assert _needs_enrichment(stale)
+    assert not _needs_enrichment(complete)
 
 
 def test_url_and_name_formatting_variants_match_the_existing_company(env):

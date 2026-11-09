@@ -14,6 +14,17 @@ import { Avatar, EmptyState, Icon, ScorePill, StatCard, TableRowsSkeleton } from
 import { RunOverlay } from "../../components/RunOverlay";
 import { ConfirmModal } from "../../components/ConfirmModal";
 import { invalidate } from "../../hooks/useCachedFetch";
+import {
+  AssessmentSummary,
+} from "../../components/ResearchAssessment";
+import {
+  AssessmentFilterControls,
+} from "../../components/ResearchAssessmentFilters";
+import {
+  EMPTY_ASSESSMENT_FILTERS,
+  matchesAssessmentFilters,
+  type AssessmentFilters,
+} from "../../components/assessmentFilterLogic";
 
 const columnHelper = createColumnHelper<ImportedProspect>();
 
@@ -62,6 +73,11 @@ function makeColumns(runLabels: Map<string, string>) {
   columnHelper.accessor("industry", {
     header: "Industry",
     cell: (info) => <span className="cell-muted">{info.getValue() || "—"}</span>,
+  }),
+  columnHelper.display({
+    id: "assessment",
+    header: "Targeting",
+    cell: (info) => <AssessmentSummary assessment={info.row.original.raw_prospect?.research_assessment} />,
   }),
   columnHelper.accessor("contact_name", {
     header: "Contact",
@@ -127,6 +143,7 @@ export function Prospects() {
 
   const [tierFilter, setTierFilter] = useState<Set<string>>(new Set());
   const [contactFilter, setContactFilter] = useState<ContactFilter>("all");
+  const [assessmentFilters, setAssessmentFilters] = useState<AssessmentFilters>(EMPTY_ASSESSMENT_FILTERS);
   const [search, setSearch] = useState("");
   // "" = view prospects from every research run pooled together (the
   // previous, only, behavior); any other value scopes the table to just
@@ -151,6 +168,7 @@ export function Prospects() {
     if (contactFilter === "with-contact") rows = rows.filter((p) => p.contact_email);
     if (contactFilter === "qualified") rows = rows.filter((p) => p.pain_summary);
     if (contactFilter === "qualification-failed") rows = rows.filter((p) => p.qualification_failed);
+    rows = rows.filter((p) => matchesAssessmentFilters(p.raw_prospect?.research_assessment, assessmentFilters));
     if (search.trim()) {
       const needle = search.toLowerCase();
       rows = rows.filter(
@@ -161,7 +179,7 @@ export function Prospects() {
       );
     }
     return rows;
-  }, [allProspects, tierFilter, contactFilter, search]);
+  }, [allProspects, tierFilter, contactFilter, assessmentFilters, search]);
 
   function toggleTier(tier: string) {
     setTierFilter((prev) => {
@@ -172,11 +190,12 @@ export function Prospects() {
     });
   }
 
-  const hasActiveFilters = tierFilter.size > 0 || contactFilter !== "all" || search.trim() !== "" || viewRun !== "";
+  const hasActiveFilters = tierFilter.size > 0 || contactFilter !== "all" || Object.values(assessmentFilters).some(Boolean) || search.trim() !== "" || viewRun !== "";
 
   function clearFilters() {
     setTierFilter(new Set());
     setContactFilter("all");
+    setAssessmentFilters(EMPTY_ASSESSMENT_FILTERS);
     setSearch("");
     setViewRun("");
   }
@@ -405,6 +424,7 @@ export function Prospects() {
             </button>
           )}
         </div>
+        <AssessmentFilterControls filters={assessmentFilters} onChange={setAssessmentFilters} />
         <div className="search-wrap">
           <Icon name="search" size={16} />
           <input

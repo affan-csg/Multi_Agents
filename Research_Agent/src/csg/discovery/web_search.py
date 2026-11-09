@@ -42,7 +42,7 @@ _BLACKLIST_DOMAINS = {
     "deel.com", "remote.com", "revature.com",
 }
 
-_GEMINI_MODEL = "gemini-3.6-flash"
+_GEMINI_MODEL = "gemini-3.8-flash"
 
 # Plain-English labels for the practice areas, used when describing the ICP to
 # the search model. Keyed by the practice_areas keys in icp.yaml.

@@ -34,12 +34,13 @@ def client():
 @pytest.fixture(autouse=True)
 def _stub_db(monkeypatch):
     monkeypatch.setattr(db, "connect", lambda: _FakeConn())
+    monkeypatch.setattr(db, "latest_research_assessment", lambda conn, domain: None)
     # Background job runners are never exercised here -- these tests lock in
     # the synchronous "should a job be queued at all, and with what count"
     # contract, not qualify_run's own behavior (covered by test_qualify_run.py).
     monkeypatch.setattr(api, "_run_qualify_job", lambda job, run_id, req: None)
     monkeypatch.setattr(api, "_run_qualify_retry_job", lambda job, run_id: None)
-    monkeypatch.setattr(qualify_mod, "backend_name", lambda: "gemini-3.6-flash")
+    monkeypatch.setattr(qualify_mod, "backend_name", lambda: "gemini-3.8-flash")
 
 
 # --- POST /runs/{run_id}/qualify ---------------------------------------------

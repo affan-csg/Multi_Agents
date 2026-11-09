@@ -109,6 +109,18 @@ def test_detect_finds_smartrecruiters_board_link_on_careers_page():
     assert result == ("smartrecruiters", "Acme", "careers_page", "https://acme.com")
 
 
+def test_detect_rejects_unrelated_ats_board_linked_from_company_site():
+    body = '<a href="https://jobs.lever.co/sophos">Open roles</a>'
+    fetcher = FakeFetcher(
+        gets={"https://secureworks.com": (200, body)},
+        posts={"https://api.lever.co/v0/postings/sophos?mode=json": (200, [{"id": "role-1"}])},
+    )
+
+    result = asyncio.run(detect(fetcher, "secureworks.com", name="SecureWorks"))
+
+    assert result is None
+
+
 def test_detect_finds_workable_board_link_on_careers_page():
     body = '<a href="https://apply.workable.com/acme/">See open roles</a>'
     fetcher = FakeFetcher(

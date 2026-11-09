@@ -82,9 +82,13 @@ def provenance_value(v: Any) -> Any:
 class Company(BaseModel):
     domain: str
     name: Optional[str] = None
+    website: Optional[ProvenanceValue] = None
+    headquarters: Optional[ProvenanceValue] = None
+    company_type: Optional[ProvenanceValue] = None
     employee_count: Optional[ProvenanceValue] = None
     revenue: Optional[ProvenanceValue] = None
     funding: Optional[ProvenanceValue] = None
+    classification_evidence: list[dict[str, Any]] = Field(default_factory=list)
     description: Optional[str] = None
     region: Optional[str] = None
     industry: Optional[str] = None
@@ -106,7 +110,7 @@ class Company(BaseModel):
     hiring_signal: Optional[HiringSignal] = None
     job_discovery_notes: Optional[str] = None  # failure reason when hiring_signal == "unknown"
 
-    @field_validator("employee_count", "revenue", "funding", mode="before")
+    @field_validator("website", "headquarters", "company_type", "employee_count", "revenue", "funding", mode="before")
     @classmethod
     def _wrap_provenance(cls, v: Any) -> Any:
         # A bare scalar (hand-entered value, older DB row) is

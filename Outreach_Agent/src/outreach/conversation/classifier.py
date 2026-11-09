@@ -30,6 +30,7 @@ import re
 from typing import Optional
 
 from ..config import PROJECT_ROOT, Config
+from ..gemini_keys import GEMINI_MODEL, make_gemini_client
 from ..models import ReplyIntent
 from .inbox import InboundEmail
 from .quoting import strip_quoted
@@ -143,9 +144,8 @@ def _call_llm(prompt: str) -> Optional[str]:
     else Anthropic, and None on any failure so the caller can degrade."""
     try:
         if os.environ.get("GEMINI_API_KEY"):
-            from google import genai
-            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-            resp = client.models.generate_content(model="gemini-3.6-flash", contents=prompt)
+            client = make_gemini_client(os.environ["GEMINI_API_KEY"])
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             return resp.text
         if os.environ.get("ANTHROPIC_API_KEY"):
             import anthropic

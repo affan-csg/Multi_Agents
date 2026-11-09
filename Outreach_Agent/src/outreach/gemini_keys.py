@@ -40,6 +40,14 @@ from dataclasses import dataclass, field
 from typing import Iterator
 
 _KEY_VAR_PATTERN = re.compile(r"^GEMINI_API_KEY(?:_(\d+))?$")
+GEMINI_MODEL = "gemini-3.8-flash"
+
+
+def make_gemini_client(api_key: str):
+    """Build the Google Cloud Agent Platform Express Mode client."""
+    from google import genai
+
+    return genai.Client(enterprise=True, api_key=api_key)
 
 
 def _discover_keys() -> list[str]:

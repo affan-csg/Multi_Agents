@@ -47,16 +47,28 @@ class SupabaseError(RuntimeError):
     pass
 
 
+def _supabase_headers(api_key: str) -> dict[str, str]:
+    """The modern `sb_secret_...` and `sb_publishable_...` keys are not JWTs.
+
+    For those keys, PostgREST authenticates via `apikey` and not via an
+    `Authorization: Bearer` token. Legacy `service_role` / `anon` JWTs still
+    need the bearer header for compatibility.
+    """
+    headers: dict[str, str] = {
+        "apikey": api_key,
+        "Content-Type": "application/json",
+    }
+    if not api_key.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 class SupabaseConn:
     def __init__(self, url: str, service_key: str) -> None:
         self.base = url.rstrip("/") + "/rest/v1"
         self._client = httpx.Client(
             base_url=self.base,
-            headers={
-                "apikey": service_key,
-                "Authorization": f"Bearer {service_key}",
-                "Content-Type": "application/json",
-            },
+            headers=_supabase_headers(service_key),
             timeout=30.0,
         )
 
@@ -150,7 +162,12 @@ def upsert_prospect(conn: SupabaseConn, p: ImportedProspect) -> None:
     run_ids = list(existing.research_run_ids) if existing else []
     if p.research_run_id and p.research_run_id not in run_ids:
         run_ids.append(p.research_run_id)
-    p = p.model_copy(update={"research_run_ids": run_ids})
+    raw_prospect = dict(p.raw_prospect)
+    if existing and "research_assessment" not in raw_prospect:
+        prior_snapshot = existing.raw_prospect or {}
+        if "research_assessment" in prior_snapshot:
+            raw_prospect["research_assessment"] = prior_snapshot["research_assessment"]
+    p = p.model_copy(update={"research_run_ids": run_ids, "raw_prospect": raw_prospect})
     _write_prospect(conn, p)
 
 

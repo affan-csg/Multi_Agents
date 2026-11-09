@@ -52,8 +52,10 @@ def stub(monkeypatch):
     monkeypatch.setattr(db, "get_postings", lambda c, d: [JobPosting(
         domain="acme.com", ats_provider="greenhouse", external_id="1",
         title="Senior AI Engineer", location="Atlanta, GA",
-        posted_at=datetime(2026, 7, 1), description="",
-        practice_area="ai_ml", delivery_fit="LATAM")])
+        posted_at=datetime(2026, 11, 1), description="",
+        practice_area="ai_ml", delivery_fit="LATAM",
+        raw={"_csg_validation": {"ownership": "verified", "current": "verified",
+                      "active_source": "live_ats_board", "run_id": "t1"}})])
     return _StubConn()
 
 

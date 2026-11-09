@@ -52,6 +52,8 @@ export interface RunResult {
   contacts?: { found: number; skipped: number; errors: number; contacts_saved: number; error_details: Record<string, string> } | { error: string } | null;
   auto_qualify_top_n?: number;
   auto_qualify_skipped_tier?: number;
+  qualification_failure_count?: number;
+  qualification_failure_reasons?: Record<string, number>;
 }
 
 export interface Region {
@@ -104,6 +106,8 @@ export interface RunSummary {
    *  the signature of every provider being exhausted for them. Resume is
    *  only meaningful (and only shown in the UI) when this is > 0. */
   stalled_count: number;
+  qualification_failure_count?: number;
+  qualification_failure_reasons?: Record<string, number>;
 }
 
 export interface ScoredCompany {
@@ -137,12 +141,95 @@ export interface ScoredCompany {
    *  'unknown' must never be displayed or treated the same as a confirmed
    *  zero -- see Research_Agent's models.HiringSignal. */
   hiring_signal?: "confirmed" | "unknown" | null;
+  research_assessment?: CompanyResearchAssessmentSummary | null;
+}
+
+export type AssessmentEvidenceStatus = "verified" | "inferred" | "unavailable";
+export type AssessmentMembership = "match" | "no_match" | "unknown" | "conflicted";
+export type AssessmentHiringModel = "onshore" | "nearshore" | "offshore";
+export type AssessmentOpenness = "open" | "not_open" | "mixed" | "unknown";
+export type ResearchReadiness =
+  | "unverified_pipeline"
+  | "contact_enrichment_pending"
+  | "fully_researched"
+  | "rejected";
+
+export interface CompanyEvidence {
+  evidence_id: string;
+  criterion: string;
+  subject: string | null;
+  claim: Record<string, unknown>;
+  evidence_status: AssessmentEvidenceStatus;
+  confidence: "high" | "medium" | "low";
+  source_name: string | null;
+  source_type: string | null;
+  source_url: string | null;
+  source_published_at: string | null;
+  retrieved_at: string | null;
+  excerpt: string | null;
+  conflict_group: string | null;
+  unavailable_reason: string | null;
+}
+
+export interface CompanyResearchAssessmentSummary {
+  assessment_id: string;
+  domain: string;
+  assessment_version: number;
+  schema_version: number;
+  source_run_id: string | null;
+  readiness_status: ResearchReadiness;
+  assessed_at: string;
+  category_assessments: Array<{
+    category: "startup" | "smb" | "system_integrator";
+    membership: AssessmentMembership;
+    evidence_status: AssessmentEvidenceStatus;
+    evidence_ids: string[];
+  }>;
+  hiring_model_assessments: Array<{
+    model: AssessmentHiringModel;
+    regional_hiring: AssessmentOpenness;
+    regional_hiring_evidence_status: AssessmentEvidenceStatus;
+    regional_hiring_evidence_ids: string[];
+    openness: AssessmentOpenness;
+    evidence_status: AssessmentEvidenceStatus;
+    confidence: "high" | "medium" | "low" | null;
+    evidence_ids: string[];
+  }>;
+}
+
+export interface CompanyResearchAssessment extends CompanyResearchAssessmentSummary {
+  prospecting_disposition: string;
+  rejection_reason: string | null;
+  criteria_assessments: Array<{
+    criterion: string;
+    result: "met" | "not_met" | "unknown";
+    evidence_ids: string[];
+    notes: string | null;
+  }>;
+  decision_makers: Array<{
+    decision_maker_id: string;
+    name: string;
+    title: string;
+    persona: string;
+    linkedin_validation: string;
+    official_site_validation: string;
+    linkedin_evidence_ids: string[];
+    official_site_evidence_ids: string[];
+    evidence_ids: string[];
+    hunter_outcome: "valid" | "invalid" | "accept_all" | "not_found" | "unverified" | null;
+    hunter_email: string | null;
+    hunter_checked_at: string | null;
+  }>;
+  evidence: CompanyEvidence[];
 }
 
 export interface CompanyDetail {
   company: {
     domain: string;
     name: string | null;
+    website?: ProvenanceValue<string> | null;
+    headquarters?: ProvenanceValue<{ city?: string; state?: string; country?: string }> | null;
+    company_type?: ProvenanceValue<string> | null;
     employee_count: ProvenanceValue<number> | null;
     revenue: ProvenanceValue<string> | null;
     funding: ProvenanceValue<string> | null;
@@ -209,6 +296,7 @@ export interface CompanyDetail {
   }>;
   outreach_ready?: boolean;
   has_linkedin_contact?: boolean;
+  research_assessment?: CompanyResearchAssessment | null;
 }
 
 export interface CompanyFilter {

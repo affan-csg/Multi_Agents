@@ -4,6 +4,7 @@
 
 import { agentBaseUrl } from "./registry";
 import { withToken } from "../auth";
+import type { CompanyResearchAssessment } from "./research";
 
 const BASE = agentBaseUrl("outreach");
 
@@ -90,6 +91,9 @@ export interface ImportedProspect {
   contact_position: string | null;
   contact_linkedin_url: string | null;
   imported_at: string | null;
+  raw_prospect?: Record<string, unknown> & {
+    research_assessment?: CompanyResearchAssessment | null;
+  };
 }
 
 export interface Campaign {

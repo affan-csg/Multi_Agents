@@ -19,6 +19,7 @@ import pytest
 from csg import discover
 from csg.config import load_config
 from csg.discovery import DiscoveryError
+from csg.models import Company
 from csg.outreach_client import OutreachClientError
 
 
@@ -40,6 +41,17 @@ def test_outreach_api_base_none_when_unset(monkeypatch):
     monkeypatch.delenv("OUTREACH_API_BASE", raising=False)
     # icp.yaml has no outreach.api_base key committed -- unset env means None.
     assert cfg.outreach_api_base is None
+
+
+def test_cached_legacy_company_missing_identity_facts_is_researched_again():
+    company = Company(
+        domain="legacy.example", employee_count={
+            "value": 100, "source": "old search", "url": "https://legacy.example/about",
+            "fetched_at": "2026-10-01T12:00:00Z", "method": "estimated", "confidence": "medium",
+        },
+    )
+
+    assert discover._needs_identity_enrichment(company) is True
 
 
 # --- _auto_qualify_and_contact selection logic -------------------------------

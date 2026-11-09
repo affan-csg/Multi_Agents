@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from . import contacts as contacts_mod, db, discover as discover_mod, qualify as qualify_mod
 from . import export_excel, export_pdf
@@ -33,6 +33,7 @@ from .ats import normalize_domain
 from .config import load_config, update_icp_basics
 from .discovery import DiscoveryError
 from .models import Prospect
+from .research_assessment import ResearchAssessmentInput, build_assessment
 
 _MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
@@ -157,6 +158,19 @@ class SaveRequest(BaseModel):
 
 class RenameRunRequest(BaseModel):
     label: str
+
+
+class ResearchAssessmentCreateRequest(ResearchAssessmentInput):
+    source_run_id: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_separate_hiring_fields(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            for row in value.get("hiring_model_assessments") or []:
+                if isinstance(row, dict) and "regional_hiring" not in row:
+                    raise ValueError("regional_hiring is required; location evidence is not staffing openness")
+        return value
 
 
 # ----------------------------------------------------------------------------
@@ -373,6 +387,12 @@ def list_runs() -> list[dict[str, Any]]:
         runs = conn.select("runs", order="started_at.desc", limit=50)
         for r in runs:
             r["stalled_count"] = len(db.stalled_companies(conn, r["run_id"]))
+            failed = db.get_failed_qualifications(conn, r["run_id"])
+            r["qualification_failure_count"] = len(failed)
+            r["qualification_failure_reasons"] = {
+                reason: sum(1 for row in failed if row.get("error_reason") == reason)
+                for reason in sorted({row.get("error_reason") or "other" for row in failed})
+            }
         return runs
     finally:
         conn.close()
@@ -515,7 +535,14 @@ def run_companies(
                 filtered.append(r)
             rows = filtered
 
-        return rows
+        assessments = db.latest_research_assessment_summaries(conn, [row["domain"] for row in rows])
+        return [
+            {
+                **row,
+                "research_assessment": assessments.get(row["domain"]),
+            }
+            for row in rows
+        ]
     finally:
         conn.close()
 
@@ -535,10 +562,11 @@ def company_detail(run_id: str, domain: str) -> dict[str, Any]:
         else:
             effective_run_id = run_id
         scores = [r for r in db.get_scores(conn, effective_run_id) if r["domain"] == domain] if effective_run_id else []
-        postings = db.get_postings(conn, domain)
+        postings = db.get_validated_postings(conn, domain, run_id=effective_run_id)
         qual = db.get_qualification(conn, domain, effective_run_id) if effective_run_id else None
         qual_attempt = db.get_qualification_attempt(conn, domain, effective_run_id) if effective_run_id else None
         people = db.get_contacts(conn, domain)
+        research_assessment = db.latest_research_assessment(conn, domain)
         return {
             "company": company.model_dump(),
             "score": scores[0] if scores else None,
@@ -552,11 +580,44 @@ def company_detail(run_id: str, domain: str) -> dict[str, Any]:
             # tried and hit a real error.
             "qualification_attempt": qual_attempt,
             "contacts": people,
+            "research_assessment": research_assessment.model_dump(mode="json") if research_assessment else None,
             # Single source of truth with the JSONL export (see
             # export.to_jsonl / Prospect.compute_outreach_flags): email is
             # required for outreach readiness, LinkedIn is a bonus signal.
             **Prospect.compute_outreach_flags(people),
         }
+    finally:
+        conn.close()
+
+
+@app.get("/companies/{domain}/research-assessment")
+def get_company_research_assessment(domain: str) -> dict[str, Any]:
+    conn = db.connect()
+    try:
+        if db.get_company(conn, domain) is None:
+            raise HTTPException(404, f"{domain} not found")
+        assessment = db.latest_research_assessment(conn, domain)
+        return {"assessment": assessment.model_dump(mode="json") if assessment else None}
+    finally:
+        conn.close()
+
+
+@app.post("/companies/{domain}/research-assessments")
+def create_company_research_assessment(
+    domain: str, req: ResearchAssessmentCreateRequest,
+) -> dict[str, Any]:
+    conn = db.connect()
+    try:
+        if db.get_company(conn, domain) is None:
+            raise HTTPException(404, f"{domain} not found")
+        payload = ResearchAssessmentInput.model_validate(req.model_dump(exclude={"source_run_id"}))
+        assessment = build_assessment(
+            domain, payload,
+            assessment_version=db.next_research_assessment_version(conn, domain),
+            source_run_id=req.source_run_id,
+        )
+        db.save_research_assessment(conn, assessment)
+        return assessment.model_dump(mode="json")
     finally:
         conn.close()
 

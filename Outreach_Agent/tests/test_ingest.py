@@ -37,6 +37,28 @@ def test_top_n_selected_by_score_descending(conn):
     assert excluded == []
 
 
+def test_assessment_data_does_not_change_campaign_selection(conn):
+    cfg = load_config()
+    assessment = {
+        "readiness_status": "unverified_pipeline",
+        "category_assessments": [{"category": "startup", "membership": "unknown"}],
+        "hiring_model_assessments": [{
+            "model": "offshore", "openness": "unknown", "evidence_status": "unavailable",
+        }],
+    }
+    for domain, score in [("high.com", 95), ("mid.com", 75), ("low.com", 60)]:
+        db.upsert_prospect(conn, ImportedProspect(
+            research_domain=domain, research_run_id="run1", tier="A", score=score,
+            contact_email=f"contact@{domain}", raw_prospect={"research_assessment": assessment},
+        ))
+
+    campaign, _ = ingest.create_campaign_from_prospects(conn, cfg, limit=2, tiers=["A"])
+
+    assert {item.research_domain for item in db.list_items(conn, campaign_id=campaign.campaign_id)} == {
+        "high.com", "mid.com",
+    }
+
+
 def test_limit_never_padded_with_contact_less_prospects(conn):
     """With N=3 and 5 qualified A/B companies where only 2 have a contact,
     the campaign must select exactly those 2 contactable ones -- never pad
@@ -227,6 +249,117 @@ def test_to_imported_prospect_uses_best_contact_not_first():
     prospect = ingest._to_imported_prospect(detail, "run1")
     assert prospect.contact_email == "exec@acme.com"
     assert prospect.contact_name == "Exec Person"
+
+
+def test_to_imported_prospect_preserves_research_assessment_verbatim():
+    assessment = {
+        "assessment_id": "assessment-7",
+        "assessment_version": 7,
+        "schema_version": 1,
+        "assessed_at": "2026-11-05T12:00:00Z",
+        "readiness_status": "contact_enrichment_pending",
+        "category_assessments": [
+            {"category": "startup", "membership": "match", "evidence_status": "inferred",
+             "evidence_ids": ["stage-source", "size-source"]},
+            {"category": "smb", "membership": "conflicted", "evidence_status": "verified",
+             "evidence_ids": ["size-source-a", "size-source-b"]},
+            {"category": "system_integrator", "membership": "unknown",
+             "evidence_status": "unavailable", "evidence_ids": []},
+        ],
+        "hiring_model_assessments": [
+            {"model": "onshore", "openness": "open", "evidence_status": "verified",
+             "confidence": "high", "evidence_ids": ["us-role"]},
+            {"model": "nearshore", "openness": "unknown", "evidence_status": "unavailable",
+             "confidence": None, "evidence_ids": []},
+            {"model": "offshore", "openness": "open", "evidence_status": "inferred",
+             "confidence": "medium", "evidence_ids": ["india-role"]},
+        ],
+        "evidence": [
+            {"evidence_id": "india-role", "criterion": "role_link", "claim": {"country": "India"},
+             "evidence_status": "verified", "confidence": "high",
+             "source_url": "https://example.com/careers/india"},
+        ],
+    }
+    detail = {
+        "company": {"domain": "acme.com", "name": "Acme", "hiring_signal": "confirmed"},
+        "score": {"tier": "A", "score": 82.5},
+        "postings": [{"delivery_fit": "LATAM", "title": "Software Engineer"}],
+        "research_assessment": assessment,
+        "contacts": [{"email": "jane@acme.com"}],
+    }
+
+    prospect = ingest._to_imported_prospect(detail, "run1")
+
+    assert prospect.raw_prospect["research_assessment"] == assessment
+    assert prospect.raw_prospect["score"] == detail["score"]
+    assert prospect.raw_prospect["postings"][0]["delivery_fit"] == "LATAM"
+    assert prospect.raw_prospect["research_assessment"]["hiring_model_assessments"][2]["evidence_status"] == "inferred"
+
+
+def test_to_imported_prospect_accepts_legacy_detail_without_assessment():
+    detail = {
+        "company": {"domain": "legacy.com", "name": "Legacy Co"},
+        "score": {"tier": "B", "score": 64},
+        "postings": [], "contacts": [{"email": "contact@legacy.com"}],
+    }
+
+    prospect = ingest._to_imported_prospect(detail, "run1")
+
+    assert prospect.research_domain == "legacy.com"
+    assert "research_assessment" not in prospect.raw_prospect
+
+
+def test_import_prospects_caches_research_assessment_detail_verbatim(conn, monkeypatch):
+    assessment = {
+        "assessment_id": "assessment-e2e",
+        "assessment_version": 4,
+        "readiness_status": "contact_enrichment_pending",
+        "category_assessments": [
+            {"category": "startup", "membership": "match", "evidence_status": "verified",
+             "evidence_ids": ["size", "stage"]},
+            {"category": "smb", "membership": "match", "evidence_status": "verified",
+             "evidence_ids": ["size"]},
+        ],
+        "hiring_model_assessments": [{
+            "model": "offshore", "openness": "open", "evidence_status": "inferred",
+            "confidence": "low", "evidence_ids": ["india-role"],
+        }],
+        "evidence": [{
+            "evidence_id": "india-role", "criterion": "role_link", "claim": {"country": "India"},
+            "evidence_status": "verified", "confidence": "high",
+            "source_url": "https://example.com/jobs/in",
+        }],
+    }
+    detail = {
+        "company": {"domain": "e2e.example", "name": "E2E Example", "hiring_signal": "confirmed"},
+        "score": {"tier": "A", "score": 81},
+        "qualification": {"pain_summary": "Research summary"},
+        "postings": [{"title": "Engineer", "delivery_fit": "US"}],
+        "research_assessment": assessment,
+        "contacts": [{"email": "leader@e2e.example"}],
+        "outreach_ready": True,
+    }
+
+    class FakeResearchClient:
+        def __init__(self, _cfg):
+            pass
+
+        def qualified_prospects(self, *_args, **_kwargs):
+            return [detail], []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ingest, "ResearchClient", FakeResearchClient)
+
+    imported, excluded = ingest.import_prospects(conn, load_config(), "run-e2e")
+
+    cached = db.get_prospect(conn, "e2e.example")
+    assert excluded == []
+    assert len(imported) == 1
+    assert cached.raw_prospect["research_assessment"] == assessment
+    assert cached.raw_prospect["postings"][0]["delivery_fit"] == "US"
+    assert cached.raw_prospect["research_assessment"]["hiring_model_assessments"][0]["evidence_status"] == "inferred"
 
 
 def test_to_imported_prospect_carries_hiring_signal():

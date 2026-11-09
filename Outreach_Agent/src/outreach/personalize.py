@@ -47,7 +47,7 @@ from typing import Any, Optional
 import httpx
 
 from .config import PROJECT_ROOT, Config
-from .gemini_keys import GeminiKeyPool, is_daily_quota_exhausted
+from .gemini_keys import GEMINI_MODEL, GeminiKeyPool, is_daily_quota_exhausted, make_gemini_client
 from .models import ImportedProspect
 
 _PROMPT_PATH = PROJECT_ROOT / "prompts" / "outreach_email.md"
@@ -274,9 +274,8 @@ def _render_revise_prompt(
 
 
 def _call_gemini(prompt: str) -> Optional[str]:
-    from google import genai
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    resp = client.models.generate_content(model="gemini-3.6-flash", contents=prompt)
+    client = make_gemini_client(os.environ["GEMINI_API_KEY"])
+    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     return resp.text
 
 
@@ -291,14 +290,12 @@ def _call_gemini_with_key_pool(prompt: str) -> Optional[str]:
     Returns None only if every configured key's quota is exhausted; raises
     (rather than silently returning None) for the first non-quota failure,
     same contract as _call_gemini."""
-    from google import genai
-
     pool = GeminiKeyPool.from_env()
     last_quota_exc: Optional[Exception] = None
     for attempt in pool.attempts():
         try:
-            client = genai.Client(api_key=attempt.key)
-            resp = client.models.generate_content(model="gemini-3.6-flash", contents=prompt)
+            client = make_gemini_client(attempt.key)
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             return resp.text
         except Exception as exc:
             if not is_daily_quota_exhausted(exc):
@@ -327,10 +324,9 @@ def _call_gemini_with_search(prompt: str) -> Optional[str]:
     Research Agent's discovery/web_search.py uses for grounded company
     lookup. Lets the model look the company up instead of answering from
     training data alone."""
-    from google import genai
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = make_gemini_client(os.environ["GEMINI_API_KEY"])
     resp = client.models.generate_content(
-        model="gemini-3.6-flash", contents=prompt,
+        model=GEMINI_MODEL, contents=prompt,
         config={"tools": [{"google_search": {}}]},
     )
     return resp.text

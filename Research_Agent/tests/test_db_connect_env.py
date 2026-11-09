@@ -22,6 +22,22 @@ def test_connect_uses_research_scoped_supabase_vars(monkeypatch):
     assert conn.base.startswith("https://research.supabase.co")
 
 
+def test_connect_new_supabase_secret_keys_do_not_use_bearer_authorization(monkeypatch):
+    monkeypatch.setenv("RESEARCH_SUPABASE_URL", "https://research.supabase.co")
+    monkeypatch.setenv("RESEARCH_SUPABASE_SERVICE_KEY", "sb_secret_test_key")
+    conn = db.connect()
+    assert conn._client.headers["apikey"] == "sb_secret_test_key"
+    assert "Authorization" not in conn._client.headers
+
+
+def test_connect_legacy_jwt_keys_still_use_bearer_authorization(monkeypatch):
+    monkeypatch.setenv("RESEARCH_SUPABASE_URL", "https://research.supabase.co")
+    monkeypatch.setenv("RESEARCH_SUPABASE_SERVICE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test.sig")
+    conn = db.connect()
+    assert conn._client.headers["apikey"] == "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test.sig"
+    assert conn._client.headers["Authorization"] == "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test.sig"
+
+
 def test_connect_rejects_unscoped_supabase_vars(monkeypatch):
     monkeypatch.setenv("SUPABASE_URL", "https://unscoped.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_KEY", "unscoped-key")

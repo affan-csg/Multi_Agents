@@ -116,7 +116,7 @@ def _company_detail(conn: SupabaseConn, run_id: str, domain: str) -> Optional[di
     else:
         effective_run_id = run_id
     scores = [r for r in db.get_scores(conn, effective_run_id) if r["domain"] == domain] if effective_run_id else []
-    postings = db.get_postings(conn, domain)
+    postings = db.get_validated_postings(conn, domain, run_id=run_id)
     qual = db.get_qualification(conn, domain, effective_run_id) if effective_run_id else None
     people = db.get_contacts(conn, domain)
     return {

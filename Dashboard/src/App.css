@@ -1620,6 +1620,215 @@ textarea:disabled {
   color: var(--text-dim);
 }
 
+.assessment-filter-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+
+.assessment-filter-controls label {
+  display: grid;
+  gap: 5px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.assessment-filter-controls select {
+  min-width: 0;
+  padding: 7px 9px;
+  font-size: 12.5px;
+}
+
+.research-assessment {
+  margin-bottom: 24px;
+}
+
+.research-assessment-heading,
+.assessment-item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.assessment-version,
+.assessment-muted {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.assessment-version {
+  white-space: nowrap;
+}
+
+.assessment-block {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.assessment-block h4,
+.assessment-block h5 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.assessment-block h5 {
+  margin-top: 16px;
+  font-size: 12px;
+}
+
+.assessment-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.assessment-item,
+.assessment-evidence {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.assessment-item p,
+.assessment-evidence p {
+  margin: 7px 0 0;
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.assessment-item-head {
+  align-items: center;
+  font-size: 12.5px;
+}
+
+.assessment-item-head h4 {
+  margin: 0;
+}
+
+.assessment-state {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  background: var(--surface-hover);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.state-match,
+.state-open,
+.state-fully_researched,
+.state-verified {
+  color: var(--success);
+}
+
+.state-no_match,
+.state-not_open,
+.state-rejected,
+.state-unavailable {
+  color: var(--danger);
+}
+
+.state-unknown,
+.state-unverified_pipeline,
+.state-not_assessed {
+  color: var(--text-faint);
+}
+
+.state-conflicted,
+.state-mixed,
+.state-inferred,
+.state-contact_enrichment_pending {
+  color: var(--warning);
+}
+
+.assessment-evidence-links,
+.assessment-criteria {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.assessment-evidence-list {
+  display: grid;
+  gap: 8px;
+}
+
+.assessment-evidence {
+  display: grid;
+  gap: 5px;
+}
+
+.assessment-evidence a {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.assessment-evidence small {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.assessment-criteria {
+  list-style: none;
+  padding: 0;
+}
+
+.assessment-criteria li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 14px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.assessment-criteria strong {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.assessment-criteria .criterion-met {
+  color: #000;
+  font-weight: 700;
+}
+
+.assessment-criteria small {
+  grid-column: 1 / -1;
+  color: var(--text-faint);
+}
+
+.assessment-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 175px;
+}
+
+.assessment-summary .assessment-state {
+  font-size: 10px;
+}
+
+@media (max-width: 640px) {
+  .research-assessment-heading {
+    flex-direction: column;
+  }
+
+  .assessment-version {
+    white-space: normal;
+  }
+}
+
 .chip-row {
   display: flex;
   flex-wrap: wrap;

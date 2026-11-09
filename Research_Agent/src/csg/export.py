@@ -123,7 +123,7 @@ def to_jsonl(conn: SupabaseConn, run_id: str, path: Path | None = None,
 
     with open(path, "w", encoding="utf-8") as fh:
         for r in rows:
-            postings = db.get_postings(conn, r["domain"])[:include_reqs]
+            postings = db.get_validated_postings(conn, r["domain"], run_id=run_id)[:include_reqs]
             qual = qualifications.get(r["domain"])
             people = contacts_by_domain.get(r["domain"], [])
             p = Prospect(

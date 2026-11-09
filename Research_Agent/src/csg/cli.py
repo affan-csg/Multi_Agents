@@ -372,7 +372,7 @@ def show(domain: str, run_id: Optional[str] = typer.Option(None, "--run", "-r"))
                        str(p.get("confidence") or "-"), p.get("verification") or "-")
         console.print(ct)
 
-    postings = db.get_postings(conn, domain)
+    postings = db.get_validated_postings(conn, domain, run_id=effective_run_id)
     if postings:
         cfg = load_config()
         now = db.utcnow()

@@ -549,12 +549,13 @@ export function Settings({
                     <th>Region</th>
                     <th>Started</th>
                     <th>Finished</th>
+                    <th>Qualification</th>
                     <th />
                   </tr>
                 </thead>
                 <tbody>
                   {runsLoading ? (
-                    <TableRowsSkeleton columns={5} rows={3} />
+                    <TableRowsSkeleton columns={6} rows={3} />
                   ) : (
                     runsList.map((r) => (
                       <tr key={r.run_id}>
@@ -562,6 +563,14 @@ export function Settings({
                         <td className="cell-muted">{r.profile || "—"}</td>
                         <td className="cell-muted">{formatDate(r.started_at)}</td>
                         <td className="cell-muted">{r.finished_at ? formatDate(r.finished_at) : "in progress"}</td>
+                        <td className="cell-muted">
+                          {r.qualification_failure_count ? `${r.qualification_failure_count} failed` : "—"}
+                          {r.qualification_failure_reasons && Object.keys(r.qualification_failure_reasons).length > 0 && (
+                            <span title={Object.entries(r.qualification_failure_reasons).map(([reason, count]) => `${reason}: ${count}`).join(", ")}>
+                              {` · ${Object.keys(r.qualification_failure_reasons).join(", ")}`}
+                            </span>
+                          )}
+                        </td>
                         <td style={{ textAlign: "right" }}>
                           <div className="menu-wrap" onClick={(e) => e.stopPropagation()}>
                             <button

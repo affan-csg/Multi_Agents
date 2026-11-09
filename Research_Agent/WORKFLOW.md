@@ -418,10 +418,9 @@ Two ways to trigger it:
   the UI / `POST /runs/{run_id}/qualify`, with its own `--tier`/`--force`
   controls, independent of what a given run's automatic cap covered.
 
-Backend is chosen by whichever API key is set (Gemini tried first — it has a
-free tier):
-- `GEMINI_API_KEY` → Gemini (`gemini-3.6-flash`), serialized to 1 concurrent
-  request (its free tier rate-limits aggressively).
+Backend is chosen by whichever API key is set (Gemini tried first):
+- `GEMINI_API_KEY` → Gemini (`gemini-3.8-flash`) through Google Cloud Agent
+   Platform Express Mode, serialized to 1 concurrent request.
 - `ANTHROPIC_API_KEY` → Claude (`claude-opus-5`), up to 4 concurrent.
 
 Retries transient failures (rate limits, 5xx) up to 4 times with backoff. The

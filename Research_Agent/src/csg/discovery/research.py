@@ -22,10 +22,10 @@ import httpx
 
 from .gemini_keys import GeminiKeyPool, is_connection_error, is_daily_quota_exhausted, make_ipv4_httpx_clients
 from .groq_tavily import GroqTavilyProvider, _GROQ_URL, _GROQ_MODEL, _TAVILY_URL
-from ..models import Company
+from ..models import Company, ProvenanceValue, provenance_value
 from ..usage_tracker import track
 
-_GEMINI_MODEL = "gemini-3.6-flash"
+_GEMINI_MODEL = "gemini-3.8-flash"
 
 # A connection error (dropped TLS handshake, connect timeout, ...) can be a
 # one-off blip even with IPv4 pinning -- worth one quick retry on the same
@@ -66,13 +66,25 @@ _PROMPT_TEMPLATE = """You are a business research analyst. For the company with 
 
 Research this company and return ONLY a valid JSON object with these fields:
 {{
+    "official_website": "https://company.example or null",
+        "official_website_source_url": "URL supporting the official website or null",
+    "headquarters": {{"city": "...", "state": "...", "country": "..."}} or null,
+        "headquarters_source_url": "URL supporting headquarters or null",
+    "company_type": "Startup, SMB, System Integrator, Public Company, Private Company, or another explicit type | null",
+        "company_type_source_url": "URL supporting company_type or null",
   "employee_count": <number or null>,
+    "employee_count_source_url": "URL supporting employee_count or null",
   "revenue": "<string like '$50M' or '$1.2B' or null>",
+    "revenue_source_url": "URL supporting revenue or null",
   "funding": "<string like '$100M Series C' or null>",
+    "funding_source_url": "URL supporting funding or null",
   "industry": "<string like 'Software / Marketing Automation' or null>",
   "description": "<1-2 sentence description of what the company does>",
   "hq_location": "<city, state or null>",
-  "founded_year": <number or null>
+    "founded_year": <number or null>,
+    "classification_evidence": [
+        {{"category": "startup|smb|system_integrator", "supports": true, "fact": "short exact fact", "why": "why this supports or contradicts the category", "source_name": "source title", "source_url": "exact supporting URL", "confidence": "high|medium|low", "evidence_type": "direct|inferred"}}
+    ]
 }}
 
 Important rules:
@@ -80,47 +92,118 @@ Important rules:
 - Use null for any field you cannot determine with reasonable confidence.
 - For revenue, if the company is private and revenue is not public, return null.
 - Employee count should be the approximate current number.
+- Identify headquarters from the company's official About/Contact page, LinkedIn,
+    Crunchbase, or another reputable company profile. Never infer headquarters from
+    job-posting locations.
+- Do not call a company a startup merely because it raised funding, and do not
+    classify it from estimated employee count alone. Use explicit company identity
+    language from a reliable source when available.
 - Be specific about industry - include sub-category (e.g., "Software / DevOps" not just "Technology").
+- Source URLs must be exact URLs from the provided search results; use null when no result supports a field.
+- Run targeted research for each category: founding date/funding stage and explicit startup language for startup; reliable employee-count/company-size facts for SMB; and explicit evidence that the company provides systems integration, technology implementation, IT consulting, or integration services to clients for system integrator.
+- Return classification_evidence only when the extracted fact supports or reasonably contradicts that category. Never use a generic company URL as evidence and never infer SMB from an unsupported estimate.
 """
 
 
-def _apply_firmographics(company: Company, data: dict[str, Any], source: str) -> None:
+def _apply_firmographics(
+    company: Company, data: dict[str, Any], source: str, allowed_source_urls: set[str] | None = None,
+) -> None:
     """Write parsed firmographic JSON fields onto `company`, with provenance."""
     now = _utc_now_iso()
+    allowed_source_urls = allowed_source_urls or set()
+
+    def fact_source_url(field: str) -> str | None:
+        candidate = data.get(f"{field}_source_url")
+        return candidate if isinstance(candidate, str) and candidate in allowed_source_urls else None
+
+    def save_fact(field: str, value: Any, source_field: str, *, method: str = "reported",
+                  confidence: str = "high") -> None:
+        source_url = fact_source_url(source_field)
+        if value is not None and source_url:
+            setattr(company, field, ProvenanceValue(
+                value=value, source=source, url=source_url,
+                fetched_at=now, method=method, confidence=confidence,
+            ))
+
+    official_website = data.get("official_website")
+    if isinstance(official_website, str) and official_website.startswith(("http://", "https://")):
+        parsed = httpx.URL(official_website)
+        domain = company.domain.lower().removeprefix("www.")
+        host = (parsed.host or "").lower().removeprefix("www.")
+        if host == domain or host.endswith(f".{domain}"):
+            save_fact("website", official_website, "official_website")
+
+    headquarters = data.get("headquarters")
+    if isinstance(headquarters, dict) and any(headquarters.get(key) for key in ("city", "state", "country")):
+        save_fact("headquarters", {
+            key: str(headquarters[key]).strip()
+            for key in ("city", "state", "country") if headquarters.get(key)
+        }, "headquarters")
+
+    company_type = data.get("company_type")
+    if isinstance(company_type, str) and company_type.strip():
+        normalized_type = company_type.strip().lower().replace(" ", "_")
+        if normalized_type not in {"startup", "smb", "system_integrator"}:
+            normalized_type = company_type.strip()
+        save_fact("company_type", normalized_type, "company_type")
+
+    classification_evidence = data.get("classification_evidence")
+    if isinstance(classification_evidence, list):
+        validated: list[dict[str, Any]] = []
+        for item in classification_evidence:
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category") or "").strip().lower()
+            source_url = item.get("source_url")
+            fact = str(item.get("fact") or "").strip()
+            why = str(item.get("why") or "").strip()
+            if category not in {"startup", "smb", "system_integrator"} or not isinstance(source_url, str):
+                continue
+            if source_url not in allowed_source_urls or not fact or not why:
+                continue
+            if not isinstance(item.get("supports"), bool):
+                continue
+            evidence_type = str(item.get("evidence_type") or "").lower()
+            if evidence_type not in {"direct", "inferred"}:
+                continue
+            confidence = str(item.get("confidence") or "medium").lower()
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "medium"
+            validated.append({
+                "category": category, "supports": item["supports"], "fact": fact,
+                "why": why, "source_name": str(item.get("source_name") or source_url),
+                "source_url": source_url, "confidence": confidence,
+                "evidence_type": evidence_type, "retrieved_at": now,
+            })
+        company.classification_evidence = validated
 
     # --- Employee Count ---
     emp = data.get("employee_count")
     if emp is not None:
         parsed_emp = _parse_number(str(emp))
         if parsed_emp and parsed_emp > 0:
-            company.employee_count = {
-                "value": parsed_emp,
-                "source": source,
-                "fetched_at": now,
-                "method": "estimated",
-                "confidence": "medium",
-            }
+                company.employee_count = ProvenanceValue(
+                    value=parsed_emp, source=source,
+                    url=fact_source_url("employee_count"), fetched_at=now,
+                    method="estimated", confidence="medium",
+                )
 
     # --- Revenue ---
     rev = _parse_revenue(data.get("revenue") or "")
     if rev:
-        company.revenue = {
-            "value": rev,
-            "source": source,
-            "fetched_at": now,
-            "method": "estimated",
-            "confidence": "medium" if "$" in rev else "low",
-        }
+            company.revenue = ProvenanceValue(
+                value=rev, source=source, url=fact_source_url("revenue"),
+                fetched_at=now, method="estimated",
+                confidence="medium" if "$" in rev else "low",
+            )
 
     # --- Funding ---
     funding = data.get("funding")
     if funding and str(funding).lower() not in ("null", "none", "n/a", "unknown"):
-        company.funding = {
-            "value": str(funding),
-            "source": source,
-            "fetched_at": now,
-            "confidence": "medium",
-        }
+            company.funding = ProvenanceValue(
+                value=str(funding), source=source, url=fact_source_url("funding"),
+                fetched_at=now, confidence="medium",
+            )
 
     # --- Industry ---
     industry = data.get("industry")
@@ -132,17 +215,15 @@ def _apply_firmographics(company: Company, data: dict[str, Any], source: str) ->
     if desc and str(desc).lower() not in ("null", "none"):
         company.description = str(desc)
 
-    # --- HQ Location ---
-    hq = data.get("hq_location")
-    if hq and str(hq).lower() not in ("null", "none"):
-        # Try to extract state
-        state_match = re.search(r',\s*([A-Z]{2})$', str(hq))
-        if state_match:
-            company.hq_state = state_match.group(1)
+    # Keep the legacy display field populated from the researched HQ envelope.
+    if company.headquarters:
+        hq = company.headquarters.get("value") if isinstance(company.headquarters, dict) else company.headquarters.value
+        if isinstance(hq, dict) and hq.get("state"):
+            company.hq_state = str(hq["state"])
 
     print(f"  [OK] Enriched {company.domain}: "
-          f"emp={company.employee_count.get('value') if isinstance(company.employee_count, dict) else '?'}, "
-          f"rev={company.revenue.get('value') if isinstance(company.revenue, dict) else '?'}, "
+            f"emp={provenance_value(company.employee_count) or '?'}, "
+            f"rev={provenance_value(company.revenue) or '?'}, "
           f"industry={company.industry or '?'}")
 
 
@@ -188,35 +269,51 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
         return "quota_exhausted"
 
     name = company.name or company.domain.split(".")[0]
-    query = f"{name} ({company.domain}) company employee count revenue funding industry"
+    targeted_queries = [
+        f"{name} company size number of employees",
+        f"{name} company type startup or established company",
+        f"{name} company profile founded funding employees",
+        f"{name} system integrator services",
+    ]
 
     try:
         sync_client, _ = make_ipv4_httpx_clients()
         with sync_client as client:
-            with track("tavily", "tavily_search", domain=company.domain) as u:
-                for attempt in range(_TAVILY_RATE_LIMIT_RETRIES + 1):
-                    r = client.post(_TAVILY_URL, json={
-                        "api_key": tavily_key,
-                        "query": query,
-                        "max_results": 8,
-                        "search_depth": "basic",
-                    }, timeout=20.0)
-                    if r.status_code == 429 and attempt < _TAVILY_RATE_LIMIT_RETRIES:
-                        u.retry_count += 1
-                        wait = GroqTavilyProvider._parse_retry_after(r) or _TAVILY_RATE_LIMIT_DEFAULT_WAIT
-                        print(f"  [WARN] Tavily rate limited for {company.domain}, waiting "
-                              f"{wait:.0f}s ({attempt + 1}/{_TAVILY_RATE_LIMIT_RETRIES})")
-                        _time.sleep(wait)
-                        continue
-                    if r.status_code == 429:
-                        u.mark_failure(status_code=429, error_kind="rate_limited")
-                    r.raise_for_status()
-                    u.status_code = r.status_code
-                    break
-            results = r.json().get("results", [])
+            results: list[dict[str, Any]] = []
+            for query in targeted_queries:
+                with track("tavily", "tavily_search", domain=company.domain) as u:
+                    for attempt in range(_TAVILY_RATE_LIMIT_RETRIES + 1):
+                        r = client.post(_TAVILY_URL, json={
+                            "api_key": tavily_key,
+                            "query": query,
+                            "max_results": 4,
+                            "search_depth": "basic",
+                        }, timeout=20.0)
+                        if r.status_code in {429, 500, 502, 503, 504} and attempt < _TAVILY_RATE_LIMIT_RETRIES:
+                            u.retry_count += 1
+                            wait = GroqTavilyProvider._retry_delay(r, attempt)
+                            print(f"  [WARN] Tavily rate limited for {company.domain}, waiting "
+                                  f"{wait:.0f}s ({attempt + 1}/{_TAVILY_RATE_LIMIT_RETRIES})")
+                            _time.sleep(wait)
+                            continue
+                        if r.status_code in {429, 500, 502, 503, 504}:
+                            u.mark_failure(status_code=r.status_code, error_kind="rate_limited" if r.status_code == 429 else "other")
+                        r.raise_for_status()
+                        u.status_code = r.status_code
+                        break
+                results.extend({**res, "targeted_query": query} for res in r.json().get("results", []))
+            unique_results: list[dict[str, Any]] = []
+            seen_urls: set[str] = set()
+            for result in results:
+                url = str(result.get("url") or "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    unique_results.append(result)
+            results = unique_results
+            allowed_source_urls = seen_urls
 
             context = "\n\n".join(
-                f"[{res.get('title', '')}]({res.get('url', '')})\n{res.get('content', '')[:2000]}"
+                f"[Query: {res.get('targeted_query', '')}] [{res.get('title', '')}]({res.get('url', '')})\n{res.get('content', '')[:800]}"
                 for res in results
             )
             instruction = _PROMPT_TEMPLATE.format(domain=company.domain, name=name) + (
@@ -235,15 +332,15 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
                         "messages": [{"role": "user", "content": instruction}],
                         "temperature": 0.1,
                     }, timeout=30.0)
-                    if gr.status_code == 429 and attempt < GroqTavilyProvider._RATE_LIMIT_RETRIES:
+                    if gr.status_code in {429, 500, 502, 503, 504} and attempt < GroqTavilyProvider._RATE_LIMIT_RETRIES:
                         u.retry_count += 1
-                        wait = GroqTavilyProvider._parse_retry_after(gr) or GroqTavilyProvider._RATE_LIMIT_DEFAULT_WAIT
+                        wait = GroqTavilyProvider._retry_delay(gr, attempt)
                         print(f"  [WARN] Groq rate limited for {company.domain}, waiting "
                               f"{wait:.0f}s ({attempt + 1}/{GroqTavilyProvider._RATE_LIMIT_RETRIES})")
                         _time.sleep(wait)
                         continue
-                    if gr.status_code == 429:
-                        u.mark_failure(status_code=429, error_kind="rate_limited")
+                    if gr.status_code in {429, 500, 502, 503, 504}:
+                        u.mark_failure(status_code=gr.status_code, error_kind="rate_limited" if gr.status_code == 429 else "other")
                     gr.raise_for_status()
                     u.status_code = gr.status_code
                     body = gr.json()
@@ -258,7 +355,9 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
                     break
 
         data = _extract_json_object(raw_text)
-        _apply_firmographics(company, data, source="groq_tavily_search")
+        _apply_firmographics(
+            company, data, source="groq_tavily_search", allowed_source_urls=allowed_source_urls,
+        )
         return None
 
     except json.JSONDecodeError as e:
@@ -365,7 +464,18 @@ async def enrich_company_firmographics(company: Company) -> Optional[str]:
             return await _enrich_via_groq_tavily(company)
 
         data = _extract_json_object(response.text)
-        _apply_firmographics(company, data, source="gemini_grounded_search")
+        grounding_urls: set[str] = set()
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            metadata = getattr(candidate, "grounding_metadata", None)
+            for chunk in getattr(metadata, "grounding_chunks", None) or []:
+                web = getattr(chunk, "web", None)
+                uri = getattr(web, "uri", None)
+                if uri:
+                    grounding_urls.add(uri)
+        _apply_firmographics(
+            company, data, source="gemini_grounded_search", allowed_source_urls=grounding_urls,
+        )
         return None
 
     except json.JSONDecodeError as e:

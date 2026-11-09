@@ -34,7 +34,10 @@ def _fake_response(text: str) -> SimpleNamespace:
 
 
 _FIRMOGRAPHICS_JSON = (
-    '{"employee_count": 500, "revenue": "$50M", "funding": null, '
+    '{"official_website": "https://acme.com", "official_website_source_url": "https://acme.com", '
+    '"headquarters": {"city": "Austin", "state": "TX", "country": "United States"}, '
+    '"headquarters_source_url": "https://acme.com", "company_type": "smb", '
+    '"company_type_source_url": "https://acme.com", "employee_count": 500, "revenue": "$50M", "funding": null, '
     '"industry": "Software", "description": "A company.", '
     '"hq_location": "Austin, TX", "founded_year": 2015}'
 )
@@ -78,7 +81,7 @@ def test_non_quota_gemini_failure_falls_back_to_tavily_groq(gemini_keys, monkeyp
     Gemini call must still try the fallback, not go straight to
     request_error."""
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             pass
 
         class models:
@@ -93,8 +96,8 @@ def test_non_quota_gemini_failure_falls_back_to_tavily_groq(gemini_keys, monkeyp
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
     assert reason is None  # fallback succeeded -> enrichment overall succeeded
-    assert company.employee_count["value"] == 500
-    assert company.employee_count["source"] == "groq_tavily_search"
+    assert company.employee_count.value == 500
+    assert company.employee_count.source == "groq_tavily_search"
 
 
 def test_quota_exhausted_still_falls_back_to_tavily_groq(gemini_keys, monkeypatch):
@@ -106,7 +109,7 @@ def test_quota_exhausted_still_falls_back_to_tavily_groq(gemini_keys, monkeypatc
             return "RESOURCE_EXHAUSTED: quota exceeded"
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             pass
 
         class models:
@@ -121,13 +124,14 @@ def test_quota_exhausted_still_falls_back_to_tavily_groq(gemini_keys, monkeypatc
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
     assert reason is None
-    assert company.employee_count["value"] == 500
+    assert company.employee_count.value == 500
+    assert company.employee_count.value == 500
 
 
 def test_gemini_success_never_touches_fallback(gemini_keys, monkeypatch):
     """A normal, successful Gemini call must not go anywhere near Tavily/Groq."""
     class FakeClient:
-        def __init__(self, api_key, http_options=None):
+        def __init__(self, api_key, http_options=None, **kwargs):
             pass
 
         class models:
@@ -151,8 +155,118 @@ def test_gemini_success_never_touches_fallback(gemini_keys, monkeypatch):
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
     assert reason is None
-    assert company.employee_count["value"] == 500
-    assert company.employee_count["source"] == "gemini_grounded_search"
+
+
+def test_firmographic_source_urls_must_match_returned_sources():
+    company = _company()
+    research._apply_firmographics(
+        company,
+        {
+            "employee_count": 500,
+            "employee_count_source_url": "https://acme.com/about",
+            "revenue": "$50M",
+            "revenue_source_url": "https://fabricated.example/revenue",
+            "funding": None,
+        },
+        source="test_search",
+        allowed_source_urls={"https://acme.com/about"},
+    )
+
+    assert company.employee_count.url == "https://acme.com/about"
+    assert company.employee_count.fetched_at is not None
+    assert company.revenue.url is None
+
+
+def test_identity_facts_require_returned_sources_and_validate_official_domain():
+    company = _company()
+    research._apply_firmographics(
+        company,
+        {
+            "official_website": "https://fabricated.example",
+            "official_website_source_url": "https://acme.com/about",
+            "headquarters": {"city": "Austin", "state": "TX", "country": "United States"},
+            "headquarters_source_url": "https://acme.com/about",
+            "company_type": "system_integrator",
+            "company_type_source_url": "https://acme.com/about",
+        },
+        source="test_search",
+        allowed_source_urls={"https://acme.com/about"},
+    )
+
+    assert company.website is None
+    assert company.headquarters.value["city"] == "Austin"
+    assert company.headquarters.url == "https://acme.com/about"
+    assert company.company_type.value == "system_integrator"
+
+
+def test_identity_facts_stay_unavailable_when_search_has_no_supporting_sources():
+    company = _company()
+    research._apply_firmographics(
+        company,
+        {"official_website": None, "headquarters": None, "company_type": None},
+        source="test_search",
+        allowed_source_urls=set(),
+    )
+
+    assert company.website is None
+    assert company.headquarters is None
+    assert company.company_type is None
+
+
+def test_real_sailpoint_result_preserves_public_company_type_and_provenance():
+    company = Company(domain="sailpoint.com", name="SailPoint")
+    research._apply_firmographics(
+        company,
+        {
+            "official_website": "https://www.sailpoint.com",
+            "official_website_source_url": "https://www.globaldata.com/company-profile/sailpoint-technologies-inc",
+            "headquarters": {"city": "Austin", "state": "Texas", "country": "United States"},
+            "headquarters_source_url": "https://www.globaldata.com/company-profile/sailpoint-technologies-inc",
+            "company_type": "Public Company",
+            "company_type_source_url": "https://tavily.com/knowledge/company/dMCtx7o7Rxbq",
+        },
+        source="groq_tavily_search",
+        allowed_source_urls={
+            "https://www.globaldata.com/company-profile/sailpoint-technologies-inc",
+            "https://tavily.com/knowledge/company/dMCtx7o7Rxbq",
+        },
+    )
+
+    assert company.website.value == "https://www.sailpoint.com"
+    assert company.headquarters.value["city"] == "Austin"
+    assert company.company_type.value == "Public Company"
+
+
+def test_gemini_grounding_url_is_saved_with_fact_provenance(gemini_keys, monkeypatch):
+    source_url = "https://acme.com/about"
+    response = SimpleNamespace(
+        text=(
+            '{"employee_count": 500, "employee_count_source_url": "' + source_url + '", '
+            '"revenue": null, "funding": null, "industry": "Software", '
+            '"description": "A company.", "hq_location": null, "founded_year": null}'
+        ),
+        candidates=[SimpleNamespace(grounding_metadata=SimpleNamespace(
+            grounding_chunks=[SimpleNamespace(web=SimpleNamespace(uri=source_url))],
+        ))],
+    )
+
+    class FakeClient:
+        def __init__(self, api_key, http_options=None, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**kwargs):
+                return response
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+
+    company = _company()
+    reason = asyncio.run(research.enrich_company_firmographics(company))
+
+    assert reason is None
+    assert company.employee_count.url == source_url
+    assert company.employee_count.fetched_at
 
 
 def test_transient_connection_error_retries_same_key_before_fallback(gemini_keys, monkeypatch):
@@ -162,7 +276,7 @@ def test_transient_connection_error_retries_same_key_before_fallback(gemini_keys
     calls = {"n": 0}
 
     class FakeClient:
-        def __init__(self, api_key, http_options=None):
+        def __init__(self, api_key, http_options=None, **kwargs):
             pass
 
         class models:
@@ -186,14 +300,14 @@ def test_transient_connection_error_retries_same_key_before_fallback(gemini_keys
 
     assert reason is None
     assert calls["n"] == 2
-    assert company.employee_count["source"] == "gemini_grounded_search"
+    assert company.employee_count.source == "gemini_grounded_search"
 
 
 def test_non_quota_failure_then_fallback_also_fails_reports_request_error(gemini_keys, monkeypatch):
     """If both Gemini and the fallback fail, the company is still reported as
     a genuine failure -- just after both real attempts, not silently."""
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             pass
 
         class models:
@@ -225,7 +339,7 @@ def test_fallback_rate_limit_exhausted_reports_rate_limited_not_request_error(ge
     monkeypatch.setattr("csg.discovery.research._time.sleep", lambda *_: None)
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             pass
 
         class models:
@@ -252,7 +366,7 @@ def test_fallback_connection_error_reports_connection_error_not_request_error(ge
     distinction (IPv6/TLS routing issue vs. an ordinary API error) the
     IPv4-pinning fix earlier in this file exists to make diagnosable."""
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             pass
 
         class models:
@@ -286,7 +400,7 @@ def test_no_gemini_key_goes_straight_to_fallback(monkeypatch):
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
     assert reason is None
-    assert company.employee_count["source"] == "groq_tavily_search"
+    assert company.employee_count.source == "groq_tavily_search"
 
 
 def test_no_gemini_and_no_fallback_keys_reports_quota_exhausted(monkeypatch):
@@ -317,7 +431,7 @@ def test_tavily_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
     calls = {"tavily": 0}
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             pass
 
         class models:
@@ -343,8 +457,10 @@ def test_tavily_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
     assert reason is None
-    assert calls["tavily"] == 2
-    assert company.employee_count["source"] == "groq_tavily_search"
+    # One retry for the first targeted search plus the remaining three
+    # category-specific searches.
+    assert calls["tavily"] == 5
+    assert company.employee_count.source == "groq_tavily_search"
 
 
 def test_groq_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
@@ -355,7 +471,7 @@ def test_groq_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
     calls = {"groq": 0}
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             pass
 
         class models:
@@ -382,4 +498,4 @@ def test_groq_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
 
     assert reason is None
     assert calls["groq"] == 2
-    assert company.employee_count["source"] == "groq_tavily_search"
+    assert company.employee_count.source == "groq_tavily_search"

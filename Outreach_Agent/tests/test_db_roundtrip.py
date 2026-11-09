@@ -32,6 +32,87 @@ def test_prospect_without_contact_has_contact_false(conn):
     assert got.has_contact is False
 
 
+def test_prospect_assessment_snapshot_survives_round_trip(conn):
+    assessment = {
+        "assessment_id": "assessment-9",
+        "assessment_version": 9,
+        "assessed_at": "2026-11-05T12:00:00Z",
+        "readiness_status": "contact_enrichment_pending",
+        "category_assessments": [{
+            "category": "smb", "membership": "conflicted", "evidence_status": "verified",
+            "evidence_ids": ["employee-source-a", "employee-source-b"],
+        }],
+        "hiring_model_assessments": [{
+            "model": "offshore", "openness": "open", "evidence_status": "inferred",
+            "confidence": "medium", "evidence_ids": ["india-role"],
+        }],
+        "evidence": [{
+            "evidence_id": "india-role", "criterion": "role_link", "claim": {"country": "India"},
+            "evidence_status": "verified", "confidence": "high",
+            "source_url": "https://example.com/careers/india",
+        }],
+    }
+    db.upsert_prospect(conn, ImportedProspect(
+        research_domain="assessed.com", research_run_id="run1",
+        raw_prospect={"research_assessment": assessment},
+    ))
+
+    got = db.get_prospect(conn, "assessed.com")
+
+    assert got.raw_prospect["research_assessment"] == assessment
+    assert got.raw_prospect["research_assessment"]["category_assessments"][0]["membership"] == "conflicted"
+    assert got.raw_prospect["research_assessment"]["hiring_model_assessments"][0]["evidence_status"] == "inferred"
+    assert got.raw_prospect["research_assessment"]["evidence"][0]["evidence_id"] == "india-role"
+
+
+def test_legacy_reimport_preserves_assessment_but_refreshes_other_snapshot_data(conn):
+    assessment = {"assessment_id": "assessment-1", "assessment_version": 1,
+                  "readiness_status": "unverified_pipeline"}
+    db.upsert_prospect(conn, ImportedProspect(
+        research_domain="refresh.com", research_run_id="run1", name="Old Name",
+        raw_prospect={"company": {"domain": "refresh.com", "name": "Old Name"},
+                      "research_assessment": assessment},
+    ))
+
+    db.upsert_prospect(conn, ImportedProspect(
+        research_domain="refresh.com", research_run_id="run2", name="Updated Name",
+        raw_prospect={"company": {"domain": "refresh.com", "name": "Updated Name"}},
+    ))
+
+    got = db.get_prospect(conn, "refresh.com")
+    assert got.name == "Updated Name"
+    assert got.raw_prospect["company"]["name"] == "Updated Name"
+    assert got.raw_prospect["research_assessment"] == assessment
+    assert got.research_run_ids == ["run1", "run2"]
+
+
+def test_reimport_with_updated_assessment_replaces_previous_assessment(conn):
+    previous = {"assessment_version": 1, "readiness_status": "unverified_pipeline"}
+    updated = {"assessment_version": 2, "readiness_status": "fully_researched"}
+    db.upsert_prospect(conn, ImportedProspect(
+        research_domain="updated-assessment.com", raw_prospect={"research_assessment": previous},
+    ))
+
+    db.upsert_prospect(conn, ImportedProspect(
+        research_domain="updated-assessment.com", raw_prospect={"research_assessment": updated},
+    ))
+
+    got = db.get_prospect(conn, "updated-assessment.com")
+    assert got.raw_prospect["research_assessment"] == updated
+
+
+def test_explicit_null_assessment_remains_authoritative(conn):
+    db.upsert_prospect(conn, ImportedProspect(
+        research_domain="null-assessment.com", raw_prospect={"research_assessment": {"assessment_id": "old"}},
+    ))
+    db.upsert_prospect(conn, ImportedProspect(
+        research_domain="null-assessment.com", raw_prospect={"research_assessment": None},
+    ))
+
+    got = db.get_prospect(conn, "null-assessment.com")
+    assert got.raw_prospect["research_assessment"] is None
+
+
 def test_campaign_and_item_round_trip(conn):
     db.create_campaign(conn, Campaign(campaign_id="c1", name="Q4 push", channel="email"))
     campaign = db.get_campaign(conn, "c1")

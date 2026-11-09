@@ -55,7 +55,9 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -64,6 +66,7 @@ from .ats._common import strip_html
 from .discovery.groq_tavily import GroqTavilyProvider, _TAVILY_URL
 from .http import Fetcher
 from .models import Company, JobPosting
+from .posting_validation import is_current_validated_posting
 from .usage_tracker import classify_error, track
 
 # Tavily's free tier is per-minute metered, same shape of transient failure
@@ -120,6 +123,54 @@ _NON_JOB_SLUGS = re.compile(
     r"^(careers?|jobs?|openings?|positions?|open-positions|current-openings|all-jobs|view-jobs)/?$", re.I,
 )
 _JSONLD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.I | re.S)
+_VALIDATION_KEY = "_csg_validation"
+
+
+def _normalized_name(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _company_name_matches(candidate: str | None, company: Company) -> bool:
+    candidate_name = _normalized_name(candidate)
+    owners = {_normalized_name(company.name), _normalized_name(company.domain.split(".")[0])}
+    return bool(candidate_name and candidate_name in owners)
+
+
+def _same_company_host(url: str | None, domain: str) -> bool:
+    host = (urlparse(url or "").hostname or "").lower().removeprefix("www.")
+    company_host = domain.lower().removeprefix("www.")
+    return bool(host and (host == company_host or host.endswith(f".{company_host}")))
+
+
+def _mark_validation(
+    posting: JobPosting, *, ownership: str, current: str, source_url: str | None, reason: str,
+    active_source: str | None = None,
+) -> JobPosting:
+    posting.raw = {
+        **posting.raw,
+        _VALIDATION_KEY: {
+            "ownership": ownership,
+            "current": current,
+            "source_url": source_url,
+            "active_source": active_source,
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+        },
+    }
+    return posting
+
+
+def is_scoring_eligible(posting: JobPosting) -> bool:
+    return is_current_validated_posting(posting)
+
+
+def _deduplicate_postings(postings: list[JobPosting]) -> list[JobPosting]:
+    unique: dict[tuple[str, str], JobPosting] = {}
+    for posting in postings:
+        canonical_url = (posting.url or "").split("?", 1)[0].rstrip("/").lower()
+        key = ("url", canonical_url) if canonical_url else (posting.source, posting.external_id)
+        unique.setdefault(key, posting)
+    return list(unique.values())
 
 
 def _extract_jsonld_jobs(body: str) -> list[dict]:
@@ -141,9 +192,13 @@ def _extract_jsonld_jobs(body: str) -> list[dict]:
     return jobs
 
 
-def _jsonld_to_posting(domain: str, item: dict, url: str) -> Optional[JobPosting]:
+def _jsonld_to_posting(company: Company, item: dict, url: str) -> Optional[JobPosting]:
     title = item.get("title")
     if not title:
+        return None
+    organization = item.get("hiringOrganization")
+    organization_name = organization.get("name") if isinstance(organization, dict) else None
+    if organization_name and not _company_name_matches(str(organization_name), company):
         return None
     loc = None
     jl = item.get("jobLocation")
@@ -165,7 +220,7 @@ def _jsonld_to_posting(domain: str, item: dict, url: str) -> Optional[JobPosting
         external_id = f"jsonld:{abs(hash((title, url)))}"
 
     return JobPosting(
-        domain=domain, ats_provider=None, source="careers_page",
+        domain=company.domain, ats_provider=None, source="careers_page",
         external_id=str(external_id), title=str(title),
         location=loc, department=item.get("hiringOrganization", {}).get("name")
         if isinstance(item.get("hiringOrganization"), dict) else None,
@@ -203,13 +258,14 @@ def _link_to_posting(domain: str, url: str) -> JobPosting:
 
 
 async def _scrape_careers_page_jobs(
-    fetcher: Fetcher, domain: str, careers_url: Optional[str]
+    fetcher: Fetcher, company: Company, careers_url: Optional[str]
 ) -> tuple[list[JobPosting], Optional[str]]:
     """Look for job postings directly on the company's careers page(s) when
     no ATS board was found there. Returns (postings, error) -- error is set
     only on an actual fetch/parse problem, never for "page had no jobs"
     (that is just an empty list, a valid outcome, not a failure).
     """
+    domain = company.domain
     urls = [careers_url] if careers_url else [f"https://{domain}{p}" for p in ats.CAREERS_PATHS[:4]]
     postings: list[JobPosting] = []
     seen_ids: set[str] = set()
@@ -225,15 +281,29 @@ async def _scrape_careers_page_jobs(
         fetched_any = True
 
         for item in _extract_jsonld_jobs(body):
-            p = _jsonld_to_posting(domain, item, url)
+            p = _jsonld_to_posting(company, item, url)
             if p and p.external_id not in seen_ids:
+                if not _same_company_host(p.url, domain) and not _company_name_matches(
+                    (item.get("hiringOrganization") or {}).get("name")
+                    if isinstance(item.get("hiringOrganization"), dict) else None,
+                    company,
+                ):
+                    continue
+                _mark_validation(p, ownership="verified", current="verified", source_url=url,
+                                 reason="listed by the company careers page with a matching employer",
+                                 active_source="live_careers_listing")
                 seen_ids.add(p.external_id)
                 postings.append(p)
 
         if not postings:
             for link in _extract_job_links(url, body):
+                if not _same_company_host(link, domain):
+                    continue
                 p = _link_to_posting(domain, link)
                 if p.external_id not in seen_ids:
+                    _mark_validation(p, ownership="verified", current="verified", source_url=url,
+                                     reason="same-company job link found on the live careers page",
+                                     active_source="live_careers_listing")
                     seen_ids.add(p.external_id)
                     postings.append(p)
 
@@ -331,12 +401,16 @@ async def _search_jobs_external(domain: str, name: Optional[str]) -> tuple[list[
         # weak-but-real signal, not noise.
         if not re.search(r"\b(hiring|job|career|opening|position|apply)\b", title, re.I):
             continue
-        postings.append(JobPosting(
+        posting = JobPosting(
             domain=domain, ats_provider=None, source="web_search",
             external_id=f"search:{abs(hash(url or title))}",
             title=title[:200], url=url or None,
             description=strip_html(r.get("content"), limit=1000),
-        ))
+        )
+        ownership = "verified" if _same_company_host(url, domain) else "inferred"
+        _mark_validation(posting, ownership=ownership, current="inferred", source_url=url or None,
+                         reason="web-search result; active status has not been confirmed")
+        postings.append(posting)
     return postings, None
 
 
@@ -349,8 +423,7 @@ async def discover_jobs(
 ) -> JobDiscoveryResult:
     """Run the full ATS -> careers_page -> web_search -> UNKNOWN chain.
 
-    `ats_result` is whatever `ats.detect()` already returned for this company
-    (or the cached provider/token from a prior run) -- this function does not
+    `ats_result` is whatever `ats.detect()` has freshly verified for this company -- this function does not
     re-run detection, it decides what to do once detection has already
     succeeded or come up empty, and fetches ATS postings itself when a
     provider was resolved.
@@ -368,6 +441,10 @@ async def discover_jobs(
         else:
             for p in postings:
                 p.source = "ats"
+                _mark_validation(p, ownership="verified", current="verified", source_url=p.url,
+                                 reason=f"freshly verified {provider} board matched company identity",
+                                 active_source="live_ats_board")
+            postings = _deduplicate_postings(postings)
             print(f"[jobs_discovery] {domain}: ATS detected ({provider}) -> {len(postings)} jobs found")
             return JobDiscoveryResult(
                 postings=postings, method="ats", source=provider, hiring_signal="confirmed",
@@ -381,11 +458,12 @@ async def discover_jobs(
 
     # --- 2. careers-page scrape ---
     try:
-        postings, err = await _scrape_careers_page_jobs(fetcher, domain, careers_url_for_scrape)
+        postings, err = await _scrape_careers_page_jobs(fetcher, company, careers_url_for_scrape)
     except Exception as exc:
         postings, err = [], f"careers page scrape crashed ({classify_error(exc)}): {exc}"
 
     if postings:
+        postings = _deduplicate_postings(postings)
         print(f"[jobs_discovery] {domain}: No ATS detected -> Careers page -> {len(postings)} jobs found")
         return JobDiscoveryResult(
             postings=postings, method="careers_page", source="careers page scrape",
@@ -410,10 +488,11 @@ async def discover_jobs(
         postings, err = [], f"external search crashed ({classify_error(exc)}): {exc}"
 
     if postings:
+        postings = _deduplicate_postings(postings)
         print(f"[jobs_discovery] {domain}: No ATS -> Careers page empty -> Web search -> {len(postings)} jobs found")
         return JobDiscoveryResult(
             postings=postings, method="web_search", source="tavily search",
-            hiring_signal="confirmed",
+            hiring_signal="unknown",
             ats_provider=(ats_result[0] if ats_result else None),
             ats_token=(ats_result[1] if ats_result else None),
             ats_detected_by=(ats_result[2] if ats_result else None),

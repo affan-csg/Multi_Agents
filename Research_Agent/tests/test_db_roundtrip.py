@@ -98,6 +98,13 @@ def test_every_company_field_is_persisted(conn):
     """Guards the whole class of bug, not just today's four fields."""
     db.upsert_company(conn, Company(
         domain="acme.com", name="Acme", region="GA", industry="Software",
+        website={"value": "https://acme.com", "source": "search", "url": "https://acme.com/about",
+                  "fetched_at": "2026-11-05T12:00:00Z", "method": "reported", "confidence": "high"},
+        headquarters={"value": {"city": "Atlanta", "state": "GA", "country": "United States"},
+                      "source": "search", "url": "https://acme.com/about",
+                      "fetched_at": "2026-11-05T12:00:00Z", "method": "reported", "confidence": "high"},
+        company_type={"value": "smb", "source": "search", "url": "https://acme.com/about",
+                      "fetched_at": "2026-11-05T12:00:00Z", "method": "reported", "confidence": "high"},
         hq_state="GA", description="d", employee_count=400, revenue="$25M",
         funding="$40M", ats_provider="greenhouse", ats_token="acme",
         ats_detected_by="careers_page", careers_url="https://acme.com/careers",
@@ -150,6 +157,31 @@ def test_posting_classification_survives_the_round_trip(conn):
     assert len(got) == 1
     assert got[0].practice_area == "ai_ml"
     assert got[0].delivery_fit == "LATAM"
+
+
+def test_posting_validation_survives_round_trip_and_scopes_current_run(conn):
+    db.upsert_company(conn, Company(domain="acme.com"))
+    db.upsert_postings(conn, [
+        JobPosting(
+            domain="acme.com", ats_provider="lever", external_id="verified",
+            title="Engineer", url="https://jobs.lever.co/acme/verified",
+            raw={"_csg_validation": {"ownership": "verified", "current": "verified",
+                                      "active_source": "live_ats_board", "run_id": "run-2"}},
+        ),
+        JobPosting(
+            domain="acme.com", ats_provider="lever", external_id="stale",
+            title="Old Engineer", url="https://jobs.lever.co/acme/stale",
+            raw={"_csg_validation": {"ownership": "verified", "current": "verified",
+                                      "active_source": "live_ats_board", "run_id": "run-1"}},
+        ),
+        JobPosting(
+            domain="acme.com", ats_provider="lever", external_id="mismatch",
+            title="Other Employer", url="https://jobs.lever.co/other/mismatch",
+        ),
+    ])
+
+    assert {row.external_id for row in db.get_validated_postings(conn, "acme.com", "run-2")} == {"verified"}
+    assert {row.external_id for row in db.get_validated_postings(conn, "acme.com")} == {"verified", "stale"}
 
 
 # --- structural audit ----------------------------------------------------

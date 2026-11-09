@@ -26,6 +26,8 @@ from dotenv import load_dotenv
 
 from .config import PROJECT_ROOT
 from .models import Company, JobPosting, ScoreResult
+from .posting_validation import is_current_validated_posting
+from .research_assessment import CompanyResearchAssessment
 
 load_dotenv(PROJECT_ROOT / ".env")  # config.py also does this; safe/idempotent, and this
                                      # module must not depend on import order to see .env
@@ -53,6 +55,23 @@ class SupabaseError(RuntimeError):
     pass
 
 
+def _supabase_headers(api_key: str) -> dict[str, str]:
+    """Supabase's new secret/publishable keys are not JWTs.
+
+    Legacy `service_role` / `anon` keys are bearer-token JWTs, but the modern
+    `sb_secret_...` / `sb_publishable_...` keys must only be sent on the
+    `apikey` header. Sending them as `Authorization: Bearer` causes the 401s
+    now seen against newer projects.
+    """
+    headers: dict[str, str] = {
+        "apikey": api_key,
+        "Content-Type": "application/json",
+    }
+    if not api_key.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 class SupabaseConn:
     """Thin PostgREST client. One instance per `connect()` call; safe to
     reuse across the lifetime of a CLI command the way the old
@@ -62,11 +81,7 @@ class SupabaseConn:
         self.base = url.rstrip("/") + "/rest/v1"
         self._client = httpx.Client(
             base_url=self.base,
-            headers={
-                "apikey": service_key,
-                "Authorization": f"Bearer {service_key}",
-                "Content-Type": "application/json",
-            },
+            headers=_supabase_headers(service_key),
             timeout=30.0,
         )
 
@@ -192,7 +207,7 @@ def delete_run(conn: SupabaseConn, run_id: str) -> int:
 # --- companies ---------------------------------------------------------------
 
 _COALESCE_FIELDS = (
-    "name", "employee_count", "revenue", "funding", "description", "region",
+    "name", "website", "headquarters", "company_type", "employee_count", "revenue", "funding", "classification_evidence", "description", "region",
     "industry", "hq_state",
     "ats_provider", "ats_token", "ats_detected_by", "careers_url",
     "job_discovery_method", "job_source", "hiring_signal", "job_discovery_notes",
@@ -200,7 +215,8 @@ _COALESCE_FIELDS = (
 
 # Researched facts stored as JSONB provenance envelopes (value + source +
 # confidence), not bare scalars -- see models.ProvenanceValue.
-_PROVENANCE_FIELDS = ("employee_count", "revenue", "funding")
+_PROVENANCE_FIELDS = ("website", "headquarters", "company_type", "employee_count", "revenue", "funding")
+_PENDING_CLASSIFICATION_EVIDENCE: dict[str, list[dict[str, Any]]] = {}
 
 
 def upsert_company(conn: SupabaseConn, c: Company) -> None:
@@ -234,7 +250,17 @@ def upsert_company(conn: SupabaseConn, c: Company) -> None:
             value = prior_value
         row[field] = value
 
-    conn.upsert("companies", [row], on_conflict="domain")
+    _PENDING_CLASSIFICATION_EVIDENCE[c.domain] = c.classification_evidence
+    try:
+        conn.upsert("companies", [row], on_conflict="domain")
+    except SupabaseError as exc:
+        # Older Supabase projects may not have migration 007 yet. Preserve
+        # the company row and let the versioned assessment store authoritative
+        # category evidence until that additive column is applied.
+        if "classification_evidence" not in str(exc):
+            raise
+        row.pop("classification_evidence", None)
+        conn.upsert("companies", [row], on_conflict="domain")
 
 
 def claim_company(conn: SupabaseConn, c: Company) -> bool:
@@ -266,8 +292,12 @@ def all_companies(conn: SupabaseConn) -> list[Company]:
 
 def _row_to_company(row: dict[str, Any]) -> Company:
     return Company(
-        domain=row["domain"], name=row.get("name"), employee_count=row.get("employee_count"),
+        domain=row["domain"], name=row.get("name"), website=row.get("website"),
+        headquarters=row.get("headquarters"), company_type=row.get("company_type"),
+        employee_count=row.get("employee_count"),
         revenue=row.get("revenue"), funding=row.get("funding"),
+        classification_evidence=(row.get("classification_evidence")
+                     or _PENDING_CLASSIFICATION_EVIDENCE.get(row["domain"], [])),
         description=row.get("description"), region=row.get("region"),
         industry=row.get("industry"), hq_state=row.get("hq_state"),
         ats_provider=row.get("ats_provider"), ats_token=row.get("ats_token"),
@@ -388,6 +418,7 @@ def _row_to_posting(r: dict[str, Any]) -> JobPosting:
         employment_type=r.get("employment_type"), url=r.get("url"),
         posted_at=_parse(r.get("posted_at")), first_seen=_parse(r.get("first_seen")),
         description=r.get("description") or "",
+        raw=r.get("raw_json") or r.get("raw") or {},
         delivery_fit=r.get("delivery_fit"), practice_area=r.get("practice_area"),
     )
 
@@ -395,6 +426,42 @@ def _row_to_posting(r: dict[str, Any]) -> JobPosting:
 def get_postings(conn: SupabaseConn, domain: str) -> list[JobPosting]:
     rows = conn.select("job_postings", domain=f"eq.{domain}")
     return [_row_to_posting(r) for r in rows]
+
+
+def is_validated_current_posting(posting: JobPosting) -> bool:
+    return is_current_validated_posting(posting)
+
+
+def get_owned_postings(conn: SupabaseConn, domain: str, run_id: str | None = None) -> list[JobPosting]:
+    """Evidence may include owned but inferred/stale postings; scoring may not."""
+    postings = [
+        posting for posting in get_postings(conn, domain)
+        if (posting.raw.get("_csg_validation") or {}).get("ownership") == "verified"
+    ]
+    if run_id is not None:
+        postings = [
+            posting for posting in postings
+            if (posting.raw.get("_csg_validation") or {}).get("run_id") == run_id
+        ]
+    return postings
+
+
+def get_validated_postings(
+    conn: SupabaseConn, domain: str, run_id: str | None = None,
+) -> list[JobPosting]:
+    """Current app-facing roles only; legacy rows remain stored for history."""
+    postings = [posting for posting in get_postings(conn, domain) if is_validated_current_posting(posting)]
+    if run_id is not None:
+        postings = [
+            posting for posting in postings
+            if (posting.raw.get("_csg_validation") or {}).get("run_id") == run_id
+        ]
+    unique: dict[tuple[str, str], JobPosting] = {}
+    for posting in postings:
+        canonical_url = (posting.url or "").split("?", 1)[0].rstrip("/").lower()
+        key = ("url", canonical_url) if canonical_url else (posting.source, posting.external_id)
+        unique.setdefault(key, posting)
+    return list(unique.values())
 
 
 def postings_by_domain(conn: SupabaseConn, domains: list[str]) -> dict[str, list[JobPosting]]:
@@ -405,7 +472,9 @@ def postings_by_domain(conn: SupabaseConn, domains: list[str]) -> dict[str, list
     rows = conn.select("job_postings", domain=f"in.({','.join(domains)})")
     out: dict[str, list[JobPosting]] = {}
     for r in rows:
-        out.setdefault(r["domain"], []).append(_row_to_posting(r))
+        posting = _row_to_posting(r)
+        if is_validated_current_posting(posting):
+            out.setdefault(r["domain"], []).append(posting)
     return out
 
 
@@ -620,7 +689,32 @@ def save_contacts(conn: SupabaseConn, domain: str, contacts: list[dict[str, Any]
 
 
 def get_contacts(conn: SupabaseConn, domain: str) -> list[dict[str, Any]]:
-    return conn.select("contacts", domain=f"eq.{domain}", order="confidence.desc")
+    rows = conn.select("contacts", domain=f"eq.{domain}")
+    return sorted(rows, key=_contact_priority, reverse=True)
+
+
+def _contact_priority(contact: dict[str, Any]) -> tuple[int, int, float]:
+    """Prioritize plausible staffing buyers; never discard lower-ranked results."""
+    title = str(contact.get("position") or "").lower()
+    department = str(contact.get("department") or "").lower()
+    relevant_role = any(term in title for term in (
+        "talent", "recruit", "people", "human resources", "hr", "procurement",
+        "sourcing", "staffing", "workforce", "chief executive", "ceo", "founder",
+        "chief operating", "coo", "chief human resources", "chro",
+    ))
+    relevant_department = any(term in department for term in ("hr", "human resources", "people", "talent", "procurement"))
+    seniority = str(contact.get("seniority") or "").lower()
+    seniority_rank = 2 if seniority == "executive" else 1 if seniority == "senior" else 0
+    verification_rank = {"valid": 3, "accept_all": 2, "unverified": 1}.get(
+        str(contact.get("verification") or "").lower(), 0,
+    )
+    confidence = contact.get("confidence")
+    confidence_rank = float(confidence) if isinstance(confidence, (int, float)) else 0.0
+    return (
+        int(relevant_role) * 2 + int(relevant_department),
+        seniority_rank * 4 + verification_rank,
+        confidence_rank,
+    )
 
 
 def has_contacts(conn: SupabaseConn, domain: str) -> bool:
@@ -656,6 +750,80 @@ def all_contacts(conn: SupabaseConn) -> list[dict[str, Any]]:
         c = companies.get(r["domain"], {})
         out.append({**r, "company_name": c.get("name"), "industry": c.get("industry")})
     return out
+
+
+# --- company research assessments ------------------------------------------
+
+def next_research_assessment_version(conn: SupabaseConn, domain: str) -> int:
+    rows = conn.select(
+        "company_research_assessments", domain=f"eq.{domain}",
+        select="assessment_version", order="assessment_version.desc", limit=1,
+    )
+    return int(rows[0]["assessment_version"]) + 1 if rows else 1
+
+
+def save_research_assessment(conn: SupabaseConn, assessment: CompanyResearchAssessment) -> None:
+    """Persist a versioned assessment and its evidence without changing core company fields."""
+    row = assessment.model_dump(mode="json")
+    evidence = row.pop("evidence")
+    conn.upsert("company_research_assessments", [row], on_conflict="assessment_id")
+    evidence_rows = [{
+        **record,
+        "assessment_id": assessment.assessment_id,
+        "domain": assessment.domain,
+    } for record in evidence]
+    conn.upsert("company_evidence", evidence_rows, on_conflict="assessment_id,evidence_id")
+
+
+def get_research_assessment(
+    conn: SupabaseConn, assessment_id: str,
+) -> Optional[CompanyResearchAssessment]:
+    rows = conn.select("company_research_assessments", assessment_id=f"eq.{assessment_id}", limit=1)
+    if not rows:
+        return None
+    row = rows[0]
+    evidence = conn.select(
+        "company_evidence", assessment_id=f"eq.{assessment_id}", order="retrieved_at.asc",
+    )
+    for record in evidence:
+        record.pop("domain", None)
+        record.pop("assessment_id", None)
+    return CompanyResearchAssessment.model_validate({**row, "evidence": evidence})
+
+
+def latest_research_assessment(
+    conn: SupabaseConn, domain: str,
+) -> Optional[CompanyResearchAssessment]:
+    rows = conn.select(
+        "company_research_assessments", domain=f"eq.{domain}",
+        order="assessment_version.desc", limit=1,
+    )
+    return get_research_assessment(conn, rows[0]["assessment_id"]) if rows else None
+
+
+def latest_research_assessment_summaries(
+    conn: SupabaseConn, domains: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Fetch only the latest assessment fields used by company-list filters."""
+    unique_domains = list(dict.fromkeys(domains))
+    if not unique_domains:
+        return {}
+
+    rows = conn.select(
+        "company_research_assessments",
+        domain=f"in.({','.join(unique_domains)})",
+        select=(
+            "assessment_id,domain,assessment_version,schema_version,source_run_id,"
+            "readiness_status,assessed_at,category_assessments,hiring_model_assessments"
+        ),
+    )
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        domain = row["domain"]
+        current = latest.get(domain)
+        if current is None or int(row["assessment_version"]) > int(current["assessment_version"]):
+            latest[domain] = row
+    return latest
 
 
 # --- suppression ---------------------------------------------------------

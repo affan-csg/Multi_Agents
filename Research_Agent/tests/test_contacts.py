@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from csg import contacts
+from csg.db import _contact_priority
 from csg.contacts import _parse_emails
 
 
@@ -51,6 +52,27 @@ def test_linkedin_is_optional_and_carried_through_when_present():
     by_email = {c["email"]: c for c in out}
     assert by_email["a@acme.com"]["linkedin_url"] == "https://linkedin.com/in/a"
     assert by_email["b@acme.com"]["linkedin_url"] is None
+
+
+def test_contact_priority_prefers_senior_talent_buyers_without_dropping_others():
+    talent_buyer = {
+        "position": "VP of Talent Acquisition", "department": "HR",
+        "seniority": "senior", "verification": "unverified", "confidence": 45,
+    }
+    unrelated_exec = {
+        "position": "Chief Financial Officer", "department": "Finance",
+        "seniority": "executive", "verification": "valid", "confidence": 99,
+    }
+
+    assert _contact_priority(talent_buyer) > _contact_priority(unrelated_exec)
+    assert _parse_emails({"data": {"emails": [
+        {"value": "talent@acme.com", "position": talent_buyer["position"],
+         "department": talent_buyer["department"], "seniority": talent_buyer["seniority"],
+         "confidence": talent_buyer["confidence"], "verification": {"status": "unverified"}},
+        {"value": "cfo@acme.com", "position": unrelated_exec["position"],
+         "department": unrelated_exec["department"], "seniority": unrelated_exec["seniority"],
+         "confidence": unrelated_exec["confidence"], "verification": {"status": "valid"}},
+    ]}})
 
 
 def test_non_dict_entries_are_skipped_not_crashed_on():

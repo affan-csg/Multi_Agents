@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import os
+import email.utils
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -54,17 +56,25 @@ class GroqTavilyProvider(DiscoveryProvider):
         if not self.tavily_key:
             raise DiscoveryError("TAVILY_API_KEY is not set -- required for groq_tavily_search discovery.")
         with track("tavily", "discovery_search") as u:
-            r = client.post(_TAVILY_URL, json={
-                "api_key": self.tavily_key,
-                "query": query,
-                "max_results": max_results,
-                "search_depth": "basic",
-            }, timeout=20.0)
-            if r.status_code == 429:
-                u.mark_failure(status_code=429, error_kind="rate_limited")
-            r.raise_for_status()
-            u.status_code = r.status_code
-            return r.json().get("results", [])
+            for attempt in range(self._RATE_LIMIT_RETRIES + 1):
+                r = client.post(_TAVILY_URL, json={
+                    "api_key": self.tavily_key,
+                    "query": query,
+                    "max_results": max_results,
+                    "search_depth": "basic",
+                }, timeout=20.0)
+                if r.status_code in {429, 500, 502, 503, 504} and attempt < self._RATE_LIMIT_RETRIES:
+                    u.retry_count += 1
+                    wait = self._retry_delay(r, attempt)
+                    print(f"  [GroqTavilyProvider] Tavily {r.status_code}, waiting {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                if r.status_code in {429, 500, 502, 503, 504}:
+                    u.mark_failure(status_code=r.status_code, error_kind="rate_limited" if r.status_code == 429 else "other")
+                r.raise_for_status()
+                u.status_code = r.status_code
+                return r.json().get("results", [])
+            raise DiscoveryError("Tavily retry budget exhausted")
 
     def _groq_parse(self, client: httpx.Client, prompt: str, search_results: list[dict]) -> str:
         if not self.groq_key:
@@ -94,15 +104,15 @@ class GroqTavilyProvider(DiscoveryProvider):
                     "temperature": 0.3,
                 }, timeout=30.0)
 
-                if r.status_code == 429 and attempt < self._RATE_LIMIT_RETRIES:
+                if r.status_code in {429, 500, 502, 503, 504} and attempt < self._RATE_LIMIT_RETRIES:
                     u.retry_count += 1
-                    wait = self._parse_retry_after(r) or self._RATE_LIMIT_DEFAULT_WAIT
-                    print(f"  [GroqTavilyProvider] rate limited, waiting {wait:.0f}s ({attempt + 1}/{self._RATE_LIMIT_RETRIES})")
+                    wait = self._retry_delay(r, attempt)
+                    print(f"  [GroqTavilyProvider] Groq {r.status_code}, waiting {wait:.1f}s")
                     time.sleep(wait)
                     continue
 
-                if r.status_code == 429:
-                    u.mark_failure(status_code=429, error_kind="rate_limited")
+                if r.status_code in {429, 500, 502, 503, 504}:
+                    u.mark_failure(status_code=r.status_code, error_kind="rate_limited" if r.status_code == 429 else "other")
                 r.raise_for_status()
                 u.status_code = r.status_code
                 body = r.json()
@@ -119,12 +129,28 @@ class GroqTavilyProvider(DiscoveryProvider):
 
     @staticmethod
     def _parse_retry_after(r: httpx.Response) -> float | None:
+        header = r.headers.get("Retry-After")
+        if header:
+            try:
+                return max(0.0, float(header))
+            except ValueError:
+                try:
+                    return max(0.0, email.utils.parsedate_to_datetime(header).timestamp() - time.time())
+                except (TypeError, ValueError, OverflowError):
+                    pass
         try:
             detail = r.json().get("error", {}).get("message", "")
         except Exception:
             return None
         m = re.search(r"try again in ([\d.]+)s", detail)
         return float(m.group(1)) if m else None
+
+    @classmethod
+    def _retry_delay(cls, response: httpx.Response, attempt: int) -> float:
+        exponential = cls._RATE_LIMIT_DEFAULT_WAIT * (2 ** attempt)
+        advertised = cls._parse_retry_after(response)
+        base = advertised if advertised is not None else exponential
+        return base + random.uniform(0.0, base * 0.25)
 
     async def discover(self, region: str, limit: int = 100) -> List[CompanyCandidate]:
         cfg = self.cfg

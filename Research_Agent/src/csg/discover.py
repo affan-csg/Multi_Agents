@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from . import contacts as contacts_mod, db, export, pipeline, qualify as qualify_mod
@@ -43,7 +43,7 @@ from .usage_tracker import classify_error
 # Enrichment is one LLM round trip per company; run a bounded number at once so
 # a 100-company region does not take 100 sequential calls. Kept modest to stay
 # well inside provider rate limits.
-ENRICH_CONCURRENCY = 5
+ENRICH_CONCURRENCY = 2
 
 ProgressFn = Callable[[str, int, int, str], None]
 """stage, done, total, detail"""
@@ -129,11 +129,37 @@ class DiscoveryStats:
 
 
 def _needs_enrichment(existing: Optional[Company]) -> bool:
-    """Skip companies we already researched -- enrichment costs an LLM call and
-    firmographics do not change run to run."""
+    """Retry incomplete provenance after a cooldown; complete citations stay cached."""
     if existing is None:
         return True
-    return existing.employee_count is None and existing.revenue is None
+    facts = [existing.employee_count, existing.revenue, existing.funding]
+    if not any(facts):
+        return True
+    incomplete = any(fact is not None and not fact.url for fact in facts)
+    if not incomplete:
+        return False
+    fetched = [fact.fetched_at for fact in facts if fact is not None and fact.fetched_at is not None]
+    if not fetched:
+        return True
+    newest = max(value if value.tzinfo else value.replace(tzinfo=timezone.utc) for value in fetched)
+    return datetime.now(timezone.utc) - newest >= timedelta(days=30)
+
+
+def _needs_identity_enrichment(existing: Optional[Company]) -> bool:
+    """Retry the basic identity search for legacy rows missing any identity fact."""
+    if existing is None:
+        return True
+    if all(fact is not None for fact in (
+        existing.website, existing.headquarters, existing.company_type,
+    )):
+        return False
+    facts = [existing.employee_count, existing.revenue, existing.funding,
+             existing.website, existing.headquarters, existing.company_type]
+    fetched = [fact.fetched_at for fact in facts if fact is not None and fact.fetched_at is not None]
+    if not fetched:
+        return True
+    newest = max(value if value.tzinfo else value.replace(tzinfo=timezone.utc) for value in fetched)
+    return datetime.now(timezone.utc) - newest >= timedelta(days=30)
 
 
 async def _enrich_all(
@@ -154,11 +180,15 @@ async def _enrich_all(
             industry=c.industry or (existing.industry if existing else None),
             status="discovered",
         )
-        if existing is not None and not _needs_enrichment(existing):
+        if existing is not None and not (_needs_enrichment(existing) or _needs_identity_enrichment(existing)):
             # Carry forward what we already know instead of paying for it again.
             company.employee_count = existing.employee_count
             company.revenue = existing.revenue
             company.funding = existing.funding
+            company.website = existing.website
+            company.headquarters = existing.headquarters
+            company.company_type = existing.company_type
+            company.classification_evidence = existing.classification_evidence
             company.description = existing.description
             skipped += 1
         else:
@@ -427,7 +457,7 @@ async def resume_stalled(
         stats.discovered = len(companies)
 
         # --- re-enrich only the stalled ones (skips if already researched) ---
-        todo = [c for c in companies if _needs_enrichment(c)]
+        todo = [c for c in companies if _needs_enrichment(c) or _needs_identity_enrichment(c)]
         sem = asyncio.Semaphore(ENRICH_CONCURRENCY)
         done = 0
         failures: dict[str, int] = {}

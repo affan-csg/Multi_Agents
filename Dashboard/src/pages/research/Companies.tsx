@@ -9,6 +9,17 @@ import {
 } from "@tanstack/react-table";
 import type { CompanyFilter, ScoredCompany } from "../../agents/research";
 import { AtsBadge, Avatar, EmptyState, Icon, ScorePill, StatCard, TableRowsSkeleton, relativeTime } from "../../components/ui";
+import {
+  AssessmentSummary,
+} from "../../components/ResearchAssessment";
+import {
+  AssessmentFilterControls,
+} from "../../components/ResearchAssessmentFilters";
+import {
+  EMPTY_ASSESSMENT_FILTERS,
+  matchesAssessmentFilters,
+  type AssessmentFilters,
+} from "../../components/assessmentFilterLogic";
 
 const columnHelper = createColumnHelper<ScoredCompany>();
 
@@ -84,6 +95,11 @@ const columns = [
     header: "Tier",
     cell: (info) => <span className={`tier-badge tier-${info.getValue()}`}>{info.getValue()}</span>,
   }),
+  columnHelper.display({
+    id: "assessment",
+    header: "Targeting",
+    cell: (info) => <AssessmentSummary assessment={info.row.original.research_assessment} />,
+  }),
   columnHelper.accessor("scored_at", {
     header: "Scored",
     cell: (info) => <span className="cell-muted">{relativeTime(info.getValue())}</span>,
@@ -140,9 +156,14 @@ export function Companies({
 }: Props) {
   const [sorting, setSorting] = useState<SortingState>([{ id: "score", desc: true }]);
   const [showFilters, setShowFilters] = useState(false);
+  const [assessmentFilters, setAssessmentFilters] = useState<AssessmentFilters>(EMPTY_ASSESSMENT_FILTERS);
+  const filteredRows = useMemo(
+    () => rows.filter((row) => matchesAssessmentFilters(row.research_assessment, assessmentFilters)),
+    [rows, assessmentFilters],
+  );
 
   const table = useReactTable({
-    data: rows,
+    data: filteredRows,
     columns,
     state: { sorting },
     onSortingChange: setSorting,
@@ -250,13 +271,14 @@ export function Companies({
               />
             </div>
           </div>
+          <AssessmentFilterControls filters={assessmentFilters} onChange={setAssessmentFilters} />
         </div>
       )}
 
       <div className="table-card">
         {!hasRun ? (
           <EmptyState icon="play" message="No completed run yet — start a research run to see companies." />
-        ) : !loading && rows.length === 0 ? (
+        ) : !loading && filteredRows.length === 0 ? (
           <EmptyState icon="search" message="No companies match these filters." />
         ) : (
           <div className="table-scroll">

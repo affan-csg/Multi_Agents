@@ -8,7 +8,7 @@ recommended_angle. It never re-scores or overrides a tier.
 Two backends, selected at runtime by whichever key is present in the
 environment. Gemini is currently tried first (see _select_backend) since it
 has a free tier and the Anthropic account on file has no credit balance:
-  - Gemini (gemini-3.6-flash)   -- has a free tier
+    - Gemini (gemini-3.8-flash)   -- Google Cloud Agent Platform Express Mode
   - Anthropic (Claude Opus 5)   -- paid, no free tier
 
 Costs real tokens/quota either way -- callers should scope runs to qualifying
@@ -20,7 +20,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import email.utils
+import inspect
+import random
 import sys
+import time
 from typing import Any, Optional, Protocol
 
 from pydantic import BaseModel
@@ -32,7 +36,7 @@ from .usage_tracker import classify_error, track
 
 PROMPT_PATH = PROJECT_ROOT / "prompts" / "qualify.md"
 ANTHROPIC_MODEL = "claude-opus-5"
-GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 MAX_CONCURRENCY = 4
 # Gemini's free tier is rate-limited per-minute (as low as 5 req/min depending
 # on model/account) -- run qualification serially against it so parallel
@@ -94,7 +98,7 @@ class _Backend(Protocol):
     model: str
     max_concurrency: int
 
-    async def complete(self, prompt: str) -> _Qualification: ...
+    async def complete(self, prompt: str, *, run_id: str | None = None, domain: str | None = None) -> _Qualification: ...
     async def close(self) -> None: ...
     def is_retryable(self, exc: Exception) -> bool: ...
 
@@ -107,13 +111,14 @@ class _AnthropicBackend:
         self._anthropic = anthropic
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
 
-    async def complete(self, prompt: str) -> _Qualification:
-        response = await self._client.messages.parse(
-            model=self.model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-            output_format=_Qualification,
-        )
+    async def complete(self, prompt: str, *, run_id: str | None = None, domain: str | None = None) -> _Qualification:
+        with track("anthropic", "qualify", run_id=run_id, domain=domain):
+            response = await self._client.messages.parse(
+                model=self.model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+                output_format=_Qualification,
+            )
         return response.parsed_output
 
     async def close(self) -> None:
@@ -148,7 +153,7 @@ class _GeminiBackend:
             self._pool = GeminiKeyPool(keys=[api_key])
         self._last_daily_exhausted = False
 
-    async def complete(self, prompt: str) -> _Qualification:
+    async def complete(self, prompt: str, *, run_id: str | None = None, domain: str | None = None) -> _Qualification:
         from google.genai import types
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -160,7 +165,7 @@ class _GeminiBackend:
         for attempt in self._pool.attempts():
             client = self._make_client(attempt.key)
             try:
-                with track("gemini", "qualify") as u:
+                with track("gemini", "qualify", run_id=run_id, domain=domain) as u:
                     response = await asyncio.to_thread(
                         client.models.generate_content,
                         model=self.model, contents=prompt, config=config,
@@ -268,7 +273,24 @@ def backend_name() -> str:
 # entry point
 # --------------------------------------------------------------------------
 
-async def _complete_with_retry(backend: _Backend, prompt: str) -> _Qualification:
+def _retry_after(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    value = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            return max(0.0, email.utils.parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+async def _complete_with_retry(
+    backend: _Backend, prompt: str, *, run_id: str | None = None, domain: str | None = None,
+) -> _Qualification:
     """Retry on rate-limit (429) and transient server (5xx) errors with backoff.
     Free-tier Gemini in particular enforces a low per-minute request cap and
     occasionally returns 503 under load -- both are expected transient
@@ -277,13 +299,22 @@ async def _complete_with_retry(backend: _Backend, prompt: str) -> _Qualification
     last_exc: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
         try:
+            parameters = inspect.signature(backend.complete).parameters
+            if "run_id" in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                return await backend.complete(prompt, run_id=run_id, domain=domain)
             return await backend.complete(prompt)
         except Exception as exc:
             last_exc = exc
             if not backend.is_retryable(exc) or attempt == MAX_RETRIES - 1:
                 raise
-            delay = BASE_RETRY_DELAY * (attempt + 1)
-            print(f"[qualify] {type(exc).__name__}, retrying in {delay:.0f}s "
+            exponential = BASE_RETRY_DELAY * (2 ** attempt)
+            advertised = _retry_after(exc)
+            base = advertised if advertised is not None else exponential
+            delay = base + random.uniform(0.0, base * 0.25)
+            print(f"[qualify] {type(exc).__name__}, retrying in {delay:.1f}s "
                   f"(attempt {attempt + 1}/{MAX_RETRIES})", file=sys.stderr)
             await asyncio.sleep(delay)
     assert last_exc is not None
@@ -365,7 +396,7 @@ async def qualify_run(
     async def worker(row: dict[str, Any]) -> None:
         nonlocal done
         async with sem:
-            postings = db.get_postings(conn, row["domain"])[:limit_reqs]
+            postings = db.get_validated_postings(conn, row["domain"], run_id=run_id)[:limit_reqs]
             postings_ctx = [
                 {
                     "title": p.title,
@@ -379,7 +410,9 @@ async def qualify_run(
             ]
             try:
                 prompt = _render_prompt(row, postings_ctx)
-                qual = await _complete_with_retry(backend, prompt)
+                qual = await _complete_with_retry(
+                    backend, prompt, run_id=run_id, domain=row["domain"],
+                )
                 db.save_qualification(
                     conn, run_id, row["domain"],
                     pain_summary=qual.pain_summary,

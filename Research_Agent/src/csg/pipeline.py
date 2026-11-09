@@ -51,6 +51,7 @@ from .db import SupabaseConn
 from .http import Fetcher
 from .jobs_discovery import discover_jobs
 from .models import Company, ScoreResult
+from .research_assessment_generation import refresh_company_assessment_safely
 from .scoring import evaluate
 
 
@@ -81,14 +82,10 @@ async def _process_one(
     fetcher: Fetcher, conn: SupabaseConn, cfg: Config, company: Company,
     stats: Stats, now: datetime, run_id: str, force: bool,
 ) -> None:
-    existing = db.get_company(conn, company.domain)
-
     # --- stage 1: detect ATS (unchanged -- cheap, cached, highest precision) ---
-    ats_result: Optional[tuple] = None
-    if existing and existing.ats_provider and not force:
-        ats_result = (existing.ats_provider, existing.ats_token, existing.ats_detected_by, existing.careers_url)
-    else:
-        ats_result = await ats.detect(fetcher, company.domain, company.name)
+    # Stored tokens are hints only: the source page and owner token are
+    # revalidated on every run before any board postings are admitted.
+    ats_result: Optional[tuple] = await ats.detect(fetcher, company.domain, company.name)
 
     if not ats_result:
         stats.no_ats += 1
@@ -122,8 +119,13 @@ async def _process_one(
             keys = cfg.classify(p.title)
             p.practice_area = keys[0] if keys else None
             p.delivery_fit = delivery.classify(p.title, p.description, p.location or "")
+            validation = p.raw.get("_csg_validation") or {}
+            if validation:
+                validation["run_id"] = run_id
+                p.raw["_csg_validation"] = validation
         db.upsert_postings(conn, postings)
         stats.reqs_fetched += len(postings)
+    scoring_postings = [p for p in postings if db.is_validated_current_posting(p)]
 
     if job_result.hiring_signal == "unknown":
         company.status = "no_ats" if not ats_result else "no_reqs"
@@ -134,13 +136,16 @@ async def _process_one(
         company.status = "ats_found"
 
     db.upsert_company(conn, company)
+    if ats_result is None:
+        conn.update("companies", {
+            "ats_provider": None, "ats_token": None, "ats_detected_by": None,
+        }, domain=f"eq.{company.domain}")
     conn.commit()
 
+    refresh_company_assessment_safely(conn, company.domain, run_id)
     # Re-read so first_seen (our own age fallback) is populated.
-    stored = db.get_postings(conn, company.domain)
-
     # --- stages 3+4: filter and score ---
-    result: ScoreResult = evaluate(cfg, company, stored, now)
+    result: ScoreResult = evaluate(cfg, company, scoring_postings, now)
     db.save_score(conn, run_id, result)
 
     if result.disqualified:

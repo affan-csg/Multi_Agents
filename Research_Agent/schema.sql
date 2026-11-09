@@ -38,9 +38,13 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS companies (
     domain          TEXT PRIMARY KEY,
     name            TEXT,
+    website         JSONB,
+    headquarters    JSONB,
+    company_type    JSONB,
     employee_count  JSONB,         -- provenance envelope (see above)
     revenue         JSONB,         -- provenance envelope (see above)
     funding         JSONB,         -- provenance envelope (see above)
+    classification_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
     description     TEXT,
     region          TEXT,          -- discovery region, e.g. 'GA', 'East Coast'
     industry        TEXT,
@@ -181,6 +185,7 @@ CREATE TABLE IF NOT EXISTS contacts (
 -- Firmographics researched by the enrichment step.
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS revenue     JSONB;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS funding     JSONB;
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS classification_evidence JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS region      TEXT;
 
@@ -210,6 +215,65 @@ BEGIN
             END;
     END IF;
 END $$;
+
+-- ---------------------------------------------------------------------------
+-- Company-level ICP targeting and evidence (identical to migration 006).
+-- Kept separate from job_postings.delivery_fit: these records describe
+-- company segments, company hiring-model openness, and research readiness.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS company_research_assessments (
+    assessment_id              TEXT PRIMARY KEY,
+    domain                     TEXT NOT NULL REFERENCES companies(domain) ON DELETE CASCADE,
+    assessment_version         INTEGER NOT NULL CHECK (assessment_version > 0),
+    schema_version             INTEGER NOT NULL DEFAULT 1,
+    source_run_id              TEXT,
+    readiness_status           TEXT NOT NULL CHECK (readiness_status IN (
+                                   'unverified_pipeline', 'contact_enrichment_pending',
+                                   'fully_researched', 'rejected')),
+    prospecting_disposition    TEXT NOT NULL CHECK (prospecting_disposition IN (
+                                   'eligible', 'needs_review', 'excluded_existing_client', 'rejected')),
+    rejection_reason           TEXT,
+    category_assessments       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    hiring_model_assessments   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    criteria_assessments       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    decision_makers            JSONB NOT NULL DEFAULT '[]'::jsonb,
+    assessed_at                TIMESTAMPTZ NOT NULL,
+    UNIQUE (domain, assessment_version)
+);
+
+CREATE TABLE IF NOT EXISTS company_evidence (
+    evidence_id          TEXT NOT NULL,
+    assessment_id        TEXT NOT NULL REFERENCES company_research_assessments(assessment_id) ON DELETE CASCADE,
+    domain               TEXT NOT NULL REFERENCES companies(domain) ON DELETE CASCADE,
+    criterion            TEXT NOT NULL,
+    subject              TEXT,
+    claim                JSONB NOT NULL DEFAULT '{}'::jsonb,
+    evidence_status      TEXT NOT NULL CHECK (evidence_status IN ('verified', 'inferred', 'unavailable')),
+    confidence           TEXT NOT NULL CHECK (confidence IN ('high', 'medium', 'low')),
+    source_name          TEXT,
+    source_type          TEXT CHECK (source_type IS NULL OR source_type IN (
+                            'official_company', 'official_job_board', 'linkedin', 'third_party', 'aggregator', 'other')),
+    source_url           TEXT,
+    source_published_at  TIMESTAMPTZ,
+    retrieved_at         TIMESTAMPTZ,
+    excerpt              TEXT,
+    conflict_group       TEXT,
+    unavailable_reason   TEXT,
+    CHECK (
+        (evidence_status = 'unavailable' AND unavailable_reason IS NOT NULL)
+        OR
+        (evidence_status <> 'unavailable' AND source_name IS NOT NULL
+         AND source_type IS NOT NULL AND source_url IS NOT NULL)
+    ),
+    PRIMARY KEY (assessment_id, evidence_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_assessments_domain_version
+    ON company_research_assessments(domain, assessment_version DESC);
+CREATE INDEX IF NOT EXISTS idx_company_evidence_assessment
+    ON company_evidence(assessment_id);
+CREATE INDEX IF NOT EXISTS idx_company_evidence_domain_criterion
+    ON company_evidence(domain, criterion);
 
 -- Indexes last, after every column they reference is guaranteed to exist.
 CREATE INDEX IF NOT EXISTS idx_companies_region ON companies(region);
