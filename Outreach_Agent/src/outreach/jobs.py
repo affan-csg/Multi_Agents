@@ -10,7 +10,7 @@ from typing import Any, Optional
 from .db import SupabaseConn, utcnow
 
 TABLE = "agent_jobs"
-LEASE_SECONDS = 120
+LEASE_SECONDS = 600
 
 
 def _iso(value: Optional[datetime]) -> Optional[str]:
@@ -55,6 +55,16 @@ def get(conn: SupabaseConn, job_id: str) -> Optional[dict[str, Any]]:
     return rows[0] if rows else None
 
 
+def recoverable(conn: SupabaseConn, limit: int = 50) -> list[dict[str, Any]]:
+    now = utcnow()
+    pending = conn.select(TABLE, status="eq.pending", order="created_at.asc", limit=limit)
+    stale = conn.select(
+        TABLE, status="eq.running", lease_until=f"lt.{_iso(now)}",
+        order="lease_until.asc", limit=limit,
+    )
+    return [*pending, *stale]
+
+
 def claim(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
     now = utcnow()
     payload = {
@@ -80,10 +90,13 @@ def claim(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
 
 
 def update(conn: SupabaseConn, job_id: str, **fields: Any) -> None:
-    fields["updated_at"] = _iso(utcnow())
+    now = utcnow()
+    fields["updated_at"] = _iso(now)
     if fields.get("status") in ("done", "error"):
-        fields["finished_at"] = _iso(utcnow())
+        fields["finished_at"] = _iso(now)
         fields["lease_until"] = None
+    elif fields.get("status") == "running":
+        fields["lease_until"] = _iso(now + timedelta(seconds=LEASE_SECONDS))
     conn.update(TABLE, fields, job_id=f"eq.{job_id}")
 
 

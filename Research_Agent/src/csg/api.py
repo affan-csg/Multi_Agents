@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -37,6 +38,8 @@ from .models import Prospect
 from .research_assessment import ResearchAssessmentInput, build_assessment
 
 _MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_RECOVERY_INTERVAL_SECONDS = 15
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -48,7 +51,15 @@ async def _lifespan(_: FastAPI):
     # progress events back to it safely from any thread.
     global _MAIN_LOOP
     _MAIN_LOOP = asyncio.get_running_loop()
-    yield
+    recovery_task = asyncio.create_task(_recover_jobs_forever())
+    try:
+        yield
+    finally:
+        recovery_task.cancel()
+        try:
+            await recovery_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="CSG Research Agent API", lifespan=_lifespan)
@@ -107,6 +118,59 @@ class Job:
 
 
 _JOBS: dict[str, Job] = {}
+
+
+async def _recover_jobs_forever() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(_recover_jobs_once)
+        except Exception:
+            logger.exception("Research durable job recovery scan failed")
+        await asyncio.sleep(_RECOVERY_INTERVAL_SECONDS)
+
+
+def _recover_jobs_once() -> None:
+    conn = db.connect()
+    try:
+        rows = jobs.recoverable(conn)
+    finally:
+        conn.close()
+
+    for row in rows:
+        job_id = row["job_id"]
+        job = _JOBS.get(job_id)
+        if job is None:
+            job = Job(
+                job_id=job_id, kind=row["kind"], run_id=row.get("run_id"),
+                status=row.get("status", "pending"), done=row.get("done", 0),
+                total=row.get("total", 0), current_domain=row.get("current_domain"),
+                result=row.get("result"), error=row.get("error"), loop=_MAIN_LOOP,
+            )
+            _JOBS[job_id] = job
+        if job.status in ("done", "error"):
+            continue
+
+        payload = row.get("request_payload") or {}
+        if row["kind"] == "discover" and payload.get("domains"):
+            _MAIN_LOOP.run_in_executor(
+                None, _run_resume_job, job, row.get("run_id") or payload["run_id"], payload["domains"],
+            )
+        elif row["kind"] == "discover":
+            _MAIN_LOOP.run_in_executor(None, _run_discover_job, job, DiscoverRequest.model_validate(payload))
+        elif row["kind"] == "qualify" and "tiers" in payload:
+            _MAIN_LOOP.run_in_executor(
+                None, _run_qualify_job, job, row["run_id"], QualifyRequest.model_validate(payload),
+            )
+        elif row["kind"] == "qualify":
+            _MAIN_LOOP.run_in_executor(None, _run_qualify_retry_job, job, row["run_id"])
+        elif row["kind"] == "contacts":
+            _MAIN_LOOP.run_in_executor(
+                None, _run_contacts_job, job, row["run_id"], ContactsRequest.model_validate(payload),
+            )
+        else:
+            job.status = "error"
+            job.error = f"Unsupported recovered Research job kind: {row['kind']}"
+            job.publish()
 
 
 def _new_job(kind: str, run_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,

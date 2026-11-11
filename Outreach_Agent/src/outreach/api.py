@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -36,13 +37,23 @@ from .optimization.routes import router as optimization_router
 from .research_client import ResearchClient, ResearchClientError
 
 _MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_RECOVERY_INTERVAL_SECONDS = 15
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     global _MAIN_LOOP
     _MAIN_LOOP = asyncio.get_running_loop()
-    yield
+    recovery_task = asyncio.create_task(_recover_jobs_forever())
+    try:
+        yield
+    finally:
+        recovery_task.cancel()
+        try:
+            await recovery_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="CSG Outreach Agent API", lifespan=_lifespan)
@@ -133,6 +144,50 @@ class Job:
 
 
 _JOBS: dict[str, Job] = {}
+
+
+async def _recover_jobs_forever() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(_recover_jobs_once)
+        except Exception:
+            logger.exception("Outreach durable job recovery scan failed")
+        await asyncio.sleep(_RECOVERY_INTERVAL_SECONDS)
+
+
+def _recover_jobs_once() -> None:
+    conn = db.connect()
+    try:
+        rows = jobs.recoverable(conn)
+    finally:
+        conn.close()
+
+    for row in rows:
+        job_id = row["job_id"]
+        job = _JOBS.get(job_id)
+        if job is None:
+            job = Job(
+                job_id=job_id, kind=row["kind"], campaign_id=row.get("campaign_id"),
+                status=row.get("status", "pending"), done=row.get("done", 0),
+                total=row.get("total", 0), current_domain=row.get("current_domain"),
+                result=row.get("result"), error=row.get("error"), loop=_MAIN_LOOP,
+            )
+            _JOBS[job_id] = job
+        if job.status in ("done", "error"):
+            continue
+        if row["kind"] == "send" and row.get("status") == "running":
+            job.status = "error"
+            job.error = "Worker lease expired; send outcome needs manual reconciliation to avoid duplicate email."
+            job.publish()
+        elif row["kind"] == "import":
+            _MAIN_LOOP.run_in_executor(None, _run_import_job, job, ImportRequest.model_validate(row.get("request_payload") or {}))
+        elif row["kind"] == "send":
+            campaign_id = row.get("campaign_id") or (row.get("request_payload") or {}).get("campaign_id")
+            _MAIN_LOOP.run_in_executor(None, _run_send_job, job, campaign_id)
+        else:
+            job.status = "error"
+            job.error = f"Unsupported recovered Outreach job kind: {row['kind']}"
+            job.publish()
 
 
 def _new_job(kind: str, campaign_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,
