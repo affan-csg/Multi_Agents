@@ -29,13 +29,13 @@ import os
 import re
 from typing import Optional
 
-from ..config import PROJECT_ROOT, Config
+from ..config import Config, asset_path
 from ..gemini_keys import GEMINI_MODEL, make_gemini_client
 from ..models import ReplyIntent
 from .inbox import InboundEmail
 from .quoting import strip_quoted
 
-_PROMPT_PATH = PROJECT_ROOT / "prompts" / "classify_reply.md"
+_PROMPT_PATH = asset_path("prompts", "classify_reply.md")
 
 # Headers that mark automated mail. RFC 3834 (Auto-Submitted) and the
 # de-facto Microsoft/Exchange conventions. Their mere presence is decisive --

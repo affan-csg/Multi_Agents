@@ -72,6 +72,29 @@ def test_research_routes_reachable_under_prefix(client):
     assert resp.status_code == 200
 
 
+def test_healthz_reports_configuration_without_auth(monkeypatch):
+    monkeypatch.setenv("RESEARCH_SUPABASE_URL", "https://research.example")
+    monkeypatch.setenv("RESEARCH_SUPABASE_SERVICE_KEY", "research-key")
+    monkeypatch.setenv("OUTREACH_SUPABASE_URL", "https://outreach.example")
+    monkeypatch.setenv("OUTREACH_SUPABASE_SERVICE_KEY", "outreach-key")
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    response = TestClient(server_app.app).get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "missing": []}
+
+
+def test_healthz_fails_readiness_when_configuration_is_missing(monkeypatch):
+    for name in (
+        "RESEARCH_SUPABASE_URL", "RESEARCH_SUPABASE_SERVICE_KEY",
+        "OUTREACH_SUPABASE_URL", "OUTREACH_SUPABASE_SERVICE_KEY",
+        "DASHBOARD_PASSWORD",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    response = TestClient(server_app.app).get("/healthz")
+    assert response.status_code == 503
+    assert "RESEARCH_SUPABASE_SERVICE_KEY" in response.json()["missing"]
+
+
 def test_outreach_routes_reachable_under_prefix(client):
     resp = client.get("/outreach/calendly/status")
     assert resp.status_code == 200
@@ -123,6 +146,21 @@ def test_both_sub_app_lifespans_run(client):
     assert research_api._MAIN_LOOP is outreach_api._MAIN_LOOP
 
 
+def test_enabled_scheduler_validates_outreach_config_before_starting(client, monkeypatch):
+    """A broken deployment asset must fail startup, not loop forever in the
+    background while the API appears healthy."""
+    monkeypatch.setenv("AUTO_SYNC_ENABLED", "true")
+    monkeypatch.setattr(server_app.automation_runner, "scheduler_enabled", lambda: True)
+    import outreach.config as outreach_config
+    monkeypatch.setattr(outreach_config, "load_config", lambda: (_ for _ in ()).throw(
+        FileNotFoundError("outreach.yaml")
+    ))
+
+    with pytest.raises(FileNotFoundError, match="outreach.yaml"):
+        with TestClient(server_app.app):
+            pass
+
+
 # ---------------------------------------------------------------------------
 # WebSockets survive mounting
 # ---------------------------------------------------------------------------
@@ -172,6 +210,13 @@ def test_cors_preflight_allows_vercel_origin(client, prefix):
     allowed_headers = resp.headers.get("access-control-allow-headers", "").lower()
     assert "authorization" in allowed_headers
     assert "content-type" in allowed_headers
+
+
+def test_cors_accepts_configured_production_origin(client, monkeypatch):
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://multi-agents-beta.vercel.app,https://app.example.com")
+    assert server_app._configured_cors_origins() == [
+        "https://multi-agents-beta.vercel.app", "https://app.example.com",
+    ]
 
 
 def test_cors_keeps_authentication_on_cross_origin_requests(client):

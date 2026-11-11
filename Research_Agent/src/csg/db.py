@@ -129,6 +129,13 @@ class SupabaseConn:
     def update(self, table: str, data: dict[str, Any], **filters: Any) -> None:
         self._check(self._client.patch(f"/{table}", params=filters, json=data))
 
+    def update_returning(self, table: str, data: dict[str, Any], **filters: Any) -> list[dict[str, Any]]:
+        r = self._check(self._client.patch(
+            f"/{table}", params=filters,
+            headers={"Prefer": "return=representation"}, json=data,
+        ))
+        return r.json() if r.content else []
+
     def delete(self, table: str, **filters: Any) -> None:
         self._check(self._client.delete(f"/{table}", params=filters))
 

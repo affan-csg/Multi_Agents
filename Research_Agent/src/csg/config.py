@@ -18,7 +18,52 @@ import yaml
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "config" / "icp.yaml"
+PACKAGE_ROOT = Path(__file__).resolve().parent
+
+
+def _runtime_root() -> Path:
+    configured = os.environ.get("CSG_RUNTIME_DIR")
+    if configured:
+        return Path(configured)
+    if (PROJECT_ROOT / "config" / "icp.yaml").is_file():
+        return PROJECT_ROOT / "data"
+    return Path("/tmp") / "csg"
+
+
+RUNTIME_ROOT = _runtime_root()
+
+
+def asset_path(*parts: str) -> Path:
+    """Resolve read-only config assets in source and installed wheels."""
+    source_path = PROJECT_ROOT.joinpath(*parts)
+    if source_path.is_file():
+        return source_path
+    package_path = PACKAGE_ROOT.joinpath(*parts)
+    if package_path.is_file():
+        return package_path
+    raise FileNotFoundError(f"Research asset not found: {'/'.join(parts)}")
+
+
+DEFAULT_CONFIG = asset_path("config", "icp.yaml")
+
+
+def _effective_config_path() -> Path:
+    source_config = PROJECT_ROOT / "config" / "icp.yaml"
+    if source_config.is_file():
+        return source_config
+    runtime_config = RUNTIME_ROOT / "icp.yaml"
+    return runtime_config if runtime_config.is_file() else DEFAULT_CONFIG
+
+
+def _editable_config_path() -> Path:
+    current = _effective_config_path()
+    if current != DEFAULT_CONFIG:
+        return current
+    target = RUNTIME_ROOT / "icp.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.write_bytes(DEFAULT_CONFIG.read_bytes())
+    return target
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -235,7 +280,7 @@ def update_icp_basics(fields: dict[str, Any], path: str | Path | None = None) ->
     if unknown:
         raise ValueError(f"Unknown or non-editable icp.yaml field(s): {', '.join(sorted(unknown))}")
 
-    p = Path(path) if path else DEFAULT_CONFIG
+    p = Path(path) if path else _editable_config_path()
     current = load_config(path=p)
 
     coerced: dict[str, int] = {}
@@ -277,7 +322,7 @@ def update_icp_basics(fields: dict[str, Any], path: str | Path | None = None) ->
 
 
 def load_config(path: str | Path | None = None) -> Config:
-    p = Path(path) if path else DEFAULT_CONFIG
+    p = Path(path) if path else _effective_config_path()
     raw = yaml.safe_load(p.read_text(encoding="utf-8"))
 
     total = sum(raw["weights"].values())

@@ -17,9 +17,9 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import PROJECT_ROOT
+from .config import RUNTIME_ROOT
 
-CACHE_DIR = PROJECT_ROOT / "data" / "cache"
+CACHE_DIR = RUNTIME_ROOT / "cache"
 
 
 class Fetcher:

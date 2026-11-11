@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -28,6 +28,7 @@ from .calendly import db as calendly_db
 from .calendly.routes import router as calendly_router
 from .config import load_config
 from .conversation.routes import router as conversation_router
+from . import jobs
 from .analytics import router as analytics_router
 from .learning.routes import router as learning_router
 from .models import STAGE_ORDER
@@ -90,7 +91,8 @@ app.include_router(automation_router)
 
 
 # ----------------------------------------------------------------------------
-# in-process job tracking
+# Local subscribers are only a delivery optimization; the authoritative
+# snapshot is in Supabase so status survives restarts and instance changes.
 # ----------------------------------------------------------------------------
 
 @dataclass
@@ -115,6 +117,15 @@ class Job:
         }
 
     def publish(self) -> None:
+        conn = db.connect()
+        try:
+            jobs.update(
+                conn, self.job_id, status=self.status, campaign_id=self.campaign_id,
+                done=self.done, total=self.total, current_domain=self.current_domain,
+                result=self.result, error=self.error,
+            )
+        finally:
+            conn.close()
         snap = self.snapshot()
         for q in list(self.subscribers):
             if self.loop is not None:
@@ -124,8 +135,17 @@ class Job:
 _JOBS: dict[str, Job] = {}
 
 
-def _new_job(kind: str, campaign_id: Optional[str] = None) -> Job:
-    job = Job(job_id=str(uuid.uuid4()), kind=kind, campaign_id=campaign_id, loop=_MAIN_LOOP)
+def _new_job(kind: str, campaign_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,
+             idempotency_key: Optional[str] = None) -> Job:
+    conn = db.connect()
+    try:
+        row = jobs.create(conn, kind=kind, payload=payload or {}, campaign_id=campaign_id,
+                          idempotency_key=idempotency_key)
+    finally:
+        conn.close()
+    job = Job(job_id=row["job_id"], kind=kind, campaign_id=row.get("campaign_id") or campaign_id,
+              status=row.get("status", "pending"), loop=_MAIN_LOOP)
+    job.start_allowed = row.get("_created", True)
     _JOBS[job.job_id] = job
     return job
 
@@ -171,6 +191,8 @@ class RenameRequest(BaseModel):
 def _run_import_job(job: Job, req: ImportRequest) -> None:
     conn = db.connect()
     try:
+        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+            return
         cfg = load_config()
         job.status = "running"
         job.publish()
@@ -199,6 +221,8 @@ def _run_import_job(job: Job, req: ImportRequest) -> None:
 def _run_send_job(job: Job, campaign_id: str) -> None:
     conn = db.connect()
     try:
+        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+            return
         cfg = load_config()
         job.status = "running"
         job.publish()
@@ -253,9 +277,10 @@ def delete_research_run(run_id: str) -> dict[str, Any]:
 
 
 @app.post("/import")
-def start_import(req: ImportRequest) -> dict[str, Any]:
-    job = _new_job(kind="import")
-    _MAIN_LOOP.run_in_executor(None, _run_import_job, job, req)
+def start_import(req: ImportRequest, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    job = _new_job(kind="import", payload=req.model_dump(), idempotency_key=idempotency_key)
+    if job.start_allowed:
+        _MAIN_LOOP.run_in_executor(None, _run_import_job, job, req)
     return {"job_id": job.job_id}
 
 
@@ -727,7 +752,7 @@ def campaign_items(campaign_id: str) -> list[dict[str, Any]]:
 
 
 @app.post("/campaigns/{campaign_id}/send")
-def start_send(campaign_id: str) -> dict[str, Any]:
+def start_send(campaign_id: str, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     conn = db.connect()
     try:
         pending = [i for i in db.list_items(conn, campaign_id=campaign_id) if i.stage == "pending"]
@@ -736,9 +761,11 @@ def start_send(campaign_id: str) -> dict[str, Any]:
     finally:
         conn.close()
 
-    job = _new_job(kind="send", campaign_id=campaign_id)
+    job = _new_job(kind="send", campaign_id=campaign_id, payload={"campaign_id": campaign_id},
+                   idempotency_key=idempotency_key)
     job.total = len(pending)
-    _MAIN_LOOP.run_in_executor(None, _run_send_job, job, campaign_id)
+    if job.start_allowed:
+        _MAIN_LOOP.run_in_executor(None, _run_send_job, job, campaign_id)
     return {"job_id": job.job_id, "items": len(pending)}
 
 
@@ -1069,9 +1096,19 @@ def set_item_stage(item_id: str, req: SetStageRequest) -> dict[str, str]:
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict[str, Any]:
     job = _JOBS.get(job_id)
-    if not job:
+    if job:
+        return job.snapshot()
+    conn = db.connect()
+    try:
+        row = jobs.get(conn, job_id)
+    finally:
+        conn.close()
+    if not row:
         raise HTTPException(404, "job not found")
-    return job.snapshot()
+    return {"job_id": row["job_id"], "kind": row["kind"], "campaign_id": row.get("campaign_id"),
+            "status": row["status"], "done": row.get("done", 0), "total": row.get("total", 0),
+            "current_domain": row.get("current_domain"), "result": row.get("result"),
+            "error": row.get("error")}
 
 
 @app.websocket("/jobs/{job_id}/ws")
@@ -1079,8 +1116,20 @@ async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
     await websocket.accept()
     job = _JOBS.get(job_id)
     if not job:
-        await websocket.close(code=4404)
-        return
+        conn = db.connect()
+        try:
+            row = jobs.get(conn, job_id)
+        finally:
+            conn.close()
+        if not row:
+            await websocket.close(code=4404)
+            return
+        while True:
+            snap = job_status(job_id)
+            await websocket.send_text(json.dumps(snap))
+            if snap["status"] in ("done", "error"):
+                return
+            await asyncio.sleep(1)
 
     queue: asyncio.Queue = asyncio.Queue()
     job.subscribers.append(queue)

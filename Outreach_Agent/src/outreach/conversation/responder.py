@@ -27,7 +27,7 @@ from typing import Optional
 
 from .. import db, personalize
 from ..channels import SendError, send as send_via_channel, sender_identity
-from ..config import PROJECT_ROOT, Config
+from ..config import Config, asset_path
 from ..db import SupabaseConn, utcnow
 from ..models import (
     ConversationMessage,
@@ -38,9 +38,9 @@ from ..models import (
 )
 from .quoting import strip_quoted
 
-_REPLY_PROMPT_PATH = PROJECT_ROOT / "prompts" / "conversation_reply.md"
-_FOLLOWUP_PROMPT_PATH = PROJECT_ROOT / "prompts" / "conversation_followup.md"
-_REVISE_PROMPT_PATH = PROJECT_ROOT / "prompts" / "conversation_reply_revise.md"
+_REPLY_PROMPT_PATH = asset_path("prompts", "conversation_reply.md")
+_FOLLOWUP_PROMPT_PATH = asset_path("prompts", "conversation_followup.md")
+_REVISE_PROMPT_PATH = asset_path("prompts", "conversation_reply_revise.md")
 
 # Intents worth answering at all. A rejection gets no automated reply -- the
 # respectful response to "not interested" is silence, and an auto-reply to it

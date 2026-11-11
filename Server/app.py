@@ -175,8 +175,14 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
         if automation_runner.scheduler_enabled():
             import asyncio
 
+            # Validate the packaged Outreach assets before starting the task.
+            # A missing deployment asset must fail startup visibly, rather than
+            # producing an endless stream of background iteration errors.
+            from outreach.config import load_config
+
+            scheduler_config = load_config()
             stop = asyncio.Event()
-            scheduler = asyncio.create_task(automation_loop.run_forever(stop))
+            scheduler = asyncio.create_task(automation_loop.run_forever(stop, config=scheduler_config))
         try:
             yield
         finally:
@@ -199,6 +205,8 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
 # with no DASHBOARD_PASSWORD configured every protected route returns 503.
 _AUTH_PUBLIC_PATHS = {
     "/auth/login",
+    "/healthz",
+    "/outreach/automation/trigger",
     # Third-party webhook (Calendly can't send our token).
     "/calendly/webhook",
     "/outreach/calendly/webhook",
@@ -211,6 +219,16 @@ def _dashboard_password() -> str:
 
 def _auth_token(password: str) -> str:
     return hmac.new(password.encode(), b"csg-dashboard-session", hashlib.sha256).hexdigest()
+
+
+def _configured_cors_origins() -> list[str]:
+    return [
+        origin.strip()
+        for origin in os.environ.get(
+            "CORS_ALLOWED_ORIGINS", "https://multi-agents-beta.vercel.app"
+        ).split(",")
+        if origin.strip()
+    ]
 
 
 class DashboardAuthMiddleware:
@@ -271,7 +289,7 @@ app = FastAPI(title="CSG Agents API", lifespan=_lifespan)
 app.add_middleware(DashboardAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://multi-agents-beta.vercel.app"],
+    allow_origins=_configured_cors_origins(),
     allow_origin_regex=r"http://(localhost|127\.0\.0\.1):5\d{3}",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
@@ -302,3 +320,19 @@ def dashboard_login(body: _LoginBody):
     if not hmac.compare_digest(body.password.encode(), password.encode()):
         return JSONResponse({"detail": "Incorrect password"}, status_code=401)
     return {"token": _auth_token(password)}
+
+
+@app.get("/healthz")
+def healthz() -> JSONResponse:
+    """Unauthenticated process/readiness probe without exposing secrets."""
+    required = (
+        "RESEARCH_SUPABASE_URL", "RESEARCH_SUPABASE_SERVICE_KEY",
+        "OUTREACH_SUPABASE_URL", "OUTREACH_SUPABASE_SERVICE_KEY",
+        "DASHBOARD_PASSWORD",
+    )
+    missing = [name for name in required if not os.environ.get(name)]
+    status = 200 if not missing else 503
+    return JSONResponse(
+        {"status": "ok" if not missing else "misconfigured", "missing": missing},
+        status_code=status,
+    )

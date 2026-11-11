@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CSG_RUNTIME_DIR=/tmp/csg
 
 WORKDIR /app
 
@@ -12,6 +13,7 @@ COPY Server ./Server
 
 RUN pip install --no-cache-dir ./Research_Agent ./Outreach_Agent ./Server \
     && useradd --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /tmp/csg \
     && chown -R appuser:appuser /app
 
 USER appuser

@@ -30,11 +30,11 @@ from typing import Any, Optional, Protocol
 from pydantic import BaseModel
 
 from . import db
-from .config import PROJECT_ROOT
+from .config import asset_path
 from .db import SupabaseConn
 from .usage_tracker import classify_error, track
 
-PROMPT_PATH = PROJECT_ROOT / "prompts" / "qualify.md"
+PROMPT_PATH = asset_path("prompts", "qualify.md")
 ANTHROPIC_MODEL = "claude-opus-5"
 GEMINI_MODEL = "gemini-3.8-flash"
 MAX_CONCURRENCY = 4

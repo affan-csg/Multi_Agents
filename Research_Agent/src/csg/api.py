@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, model_validator
 
@@ -32,6 +32,7 @@ from . import export_excel, export_pdf
 from .ats import normalize_domain
 from .config import load_config, update_icp_basics
 from .discovery import DiscoveryError
+from . import jobs
 from .models import Prospect
 from .research_assessment import ResearchAssessmentInput, build_assessment
 
@@ -63,7 +64,8 @@ app.add_middleware(
 
 
 # ----------------------------------------------------------------------------
-# in-process job tracking (progress only -- results live in Supabase)
+# Local subscribers are only a delivery optimization; the authoritative
+# snapshot is in Supabase so status survives restarts and instance changes.
 # ----------------------------------------------------------------------------
 
 @dataclass
@@ -79,6 +81,7 @@ class Job:
     error: Optional[str] = None
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     loop: Optional[asyncio.AbstractEventLoop] = None
+    persist: bool = True
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -88,6 +91,15 @@ class Job:
         }
 
     def publish(self) -> None:
+        conn = db.connect()
+        try:
+            jobs.update(
+                conn, self.job_id, status=self.status, run_id=self.run_id,
+                done=self.done, total=self.total, current_domain=self.current_domain,
+                result=self.result, error=self.error,
+            )
+        finally:
+            conn.close()
         snap = self.snapshot()
         for q in list(self.subscribers):
             if self.loop is not None:
@@ -97,13 +109,22 @@ class Job:
 _JOBS: dict[str, Job] = {}
 
 
-def _new_job(kind: str, run_id: Optional[str] = None) -> Job:
+def _new_job(kind: str, run_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,
+             idempotency_key: Optional[str] = None) -> Job:
+    conn = db.connect()
+    try:
+        row = jobs.create(conn, kind=kind, payload=payload or {}, run_id=run_id,
+                          idempotency_key=idempotency_key)
+    finally:
+        conn.close()
     # loop is the captured main event loop (see _capture_main_loop), not
     # whatever thread this function happens to run on -- sync `def` route
     # handlers run in an anyio worker thread with no event loop of their own,
     # and capturing the loop only when a WebSocket connects would silently
     # drop any progress event published before the frontend opens one.
-    job = Job(job_id=str(uuid.uuid4()), kind=kind, run_id=run_id, loop=_MAIN_LOOP)
+    job = Job(job_id=row["job_id"], kind=kind, run_id=row.get("run_id") or run_id,
+              status=row.get("status", "pending"), loop=_MAIN_LOOP)
+    job.start_allowed = row.get("_created", True)
     _JOBS[job.job_id] = job
     return job
 
@@ -181,6 +202,8 @@ def _run_discover_job(job: Job, req: DiscoverRequest) -> None:
     """Autonomous discovery: region in, ranked prospects out."""
     conn = db.connect()
     try:
+        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+            return
         cfg = load_config()
         job.status = "running"
         job.total = req.limit
@@ -218,6 +241,8 @@ def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
     re-enrichment + re-scoring for these domains under the same run_id."""
     conn = db.connect()
     try:
+        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+            return
         cfg = load_config()
         job.status = "running"
         job.total = len(domains)
@@ -250,6 +275,8 @@ def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
 def _run_qualify_job(job: Job, run_id: str, req: QualifyRequest) -> None:
     conn = db.connect()
     try:
+        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+            return
         job.status = "running"
         job.publish()
 
@@ -279,6 +306,8 @@ def _run_qualify_job(job: Job, run_id: str, req: QualifyRequest) -> None:
 def _run_qualify_retry_job(job: Job, run_id: str) -> None:
     conn = db.connect()
     try:
+        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+            return
         job.status = "running"
         job.publish()
 
@@ -305,6 +334,8 @@ def _run_qualify_retry_job(job: Job, run_id: str) -> None:
 def _run_contacts_job(job: Job, run_id: str, req: ContactsRequest) -> None:
     conn = db.connect()
     try:
+        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+            return
         job.status = "running"
         job.publish()
 
@@ -368,11 +399,12 @@ def list_regions() -> dict[str, Any]:
 
 
 @app.post("/discover")
-def start_discover(req: DiscoverRequest) -> dict[str, Any]:
+def start_discover(req: DiscoverRequest, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     """Start an autonomous discovery run. Region is the only input."""
     cfg = load_config()
-    job = _new_job(kind="discover")
-    _MAIN_LOOP.run_in_executor(None, _run_discover_job, job, req)
+    job = _new_job(kind="discover", payload=req.model_dump(), idempotency_key=idempotency_key)
+    if job.start_allowed:
+        _MAIN_LOOP.run_in_executor(None, _run_discover_job, job, req)
     return {"job_id": job.job_id, "region": cfg.resolve_region(req.region)}
 
 
@@ -412,7 +444,7 @@ def rename_run(run_id: str, req: RenameRunRequest) -> dict[str, str]:
 
 
 @app.post("/runs/{run_id}/resume")
-def resume_run(run_id: str) -> dict[str, Any]:
+def resume_run(run_id: str, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     """Continue a stalled run -- one where every provider (Gemini, and the
     Tavily+Groq fallback) was exhausted for some companies, leaving them
     scored at 0 with no ATS board and no firmographics. Only meaningful for a
@@ -433,8 +465,10 @@ def resume_run(run_id: str) -> dict[str, Any]:
     finally:
         conn.close()
 
-    job = _new_job(kind="discover", run_id=run_id)
-    _MAIN_LOOP.run_in_executor(None, _run_resume_job, job, run_id, stalled)
+    job = _new_job(kind="discover", run_id=run_id, payload={"run_id": run_id, "domains": stalled},
+                   idempotency_key=idempotency_key)
+    if job.start_allowed:
+        _MAIN_LOOP.run_in_executor(None, _run_resume_job, job, run_id, stalled)
     return {"job_id": job.job_id, "run_id": run_id, "stalled_count": len(stalled)}
 
 
@@ -1093,7 +1127,7 @@ def run_analytics(run_id: str) -> dict[str, Any]:
 # ----------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/qualify")
-def start_qualify(run_id: str, req: QualifyRequest) -> dict[str, Any]:
+def start_qualify(run_id: str, req: QualifyRequest, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     conn = db.connect()
     try:
         pending = qualify_mod.pending_rows(conn, run_id, req.tiers, force=req.force, domains=req.domains)
@@ -1105,9 +1139,10 @@ def start_qualify(run_id: str, req: QualifyRequest) -> dict[str, Any]:
     finally:
         conn.close()
 
-    job = _new_job(kind="qualify", run_id=run_id)
+    job = _new_job(kind="qualify", run_id=run_id, payload=req.model_dump(), idempotency_key=idempotency_key)
     job.total = len(pending)
-    _MAIN_LOOP.run_in_executor(None, _run_qualify_job, job, run_id, req)
+    if job.start_allowed:
+        _MAIN_LOOP.run_in_executor(None, _run_qualify_job, job, run_id, req)
     return {"job_id": job.job_id, "provider": provider, "companies": len(pending)}
 
 
@@ -1125,7 +1160,7 @@ def list_failed_qualifications(run_id: str) -> list[dict[str, Any]]:
 
 
 @app.post("/runs/{run_id}/qualify/retry-failed")
-def start_qualify_retry(run_id: str) -> dict[str, Any]:
+def start_qualify_retry(run_id: str, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     conn = db.connect()
     try:
         pending = qualify_mod.failed_rows(conn, run_id)
@@ -1137,14 +1172,16 @@ def start_qualify_retry(run_id: str) -> dict[str, Any]:
     finally:
         conn.close()
 
-    job = _new_job(kind="qualify", run_id=run_id)
+    job = _new_job(kind="qualify", run_id=run_id, payload={"run_id": run_id},
+                   idempotency_key=idempotency_key)
     job.total = len(pending)
-    _MAIN_LOOP.run_in_executor(None, _run_qualify_retry_job, job, run_id)
+    if job.start_allowed:
+        _MAIN_LOOP.run_in_executor(None, _run_qualify_retry_job, job, run_id)
     return {"job_id": job.job_id, "provider": provider, "companies": len(pending)}
 
 
 @app.post("/runs/{run_id}/contacts")
-def start_contacts(run_id: str, req: ContactsRequest) -> dict[str, Any]:
+def start_contacts(run_id: str, req: ContactsRequest, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     conn = db.connect()
     try:
         rows = [r for r in db.get_scores(conn, run_id) if r["tier"] in req.tiers]
@@ -1155,9 +1192,10 @@ def start_contacts(run_id: str, req: ContactsRequest) -> dict[str, Any]:
     finally:
         conn.close()
 
-    job = _new_job(kind="contacts", run_id=run_id)
+    job = _new_job(kind="contacts", run_id=run_id, payload=req.model_dump(), idempotency_key=idempotency_key)
     job.total = len(pending)
-    _MAIN_LOOP.run_in_executor(None, _run_contacts_job, job, run_id, req)
+    if job.start_allowed:
+        _MAIN_LOOP.run_in_executor(None, _run_contacts_job, job, run_id, req)
     return {"job_id": job.job_id, "companies": len(pending)}
 
 
@@ -1185,9 +1223,19 @@ def list_contacts(run_id: str) -> list[dict[str, Any]]:
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict[str, Any]:
     job = _JOBS.get(job_id)
-    if not job:
+    if job:
+        return job.snapshot()
+    conn = db.connect()
+    try:
+        row = jobs.get(conn, job_id)
+    finally:
+        conn.close()
+    if not row:
         raise HTTPException(404, "job not found")
-    return job.snapshot()
+    return {"job_id": row["job_id"], "kind": row["kind"], "run_id": row.get("run_id"),
+            "status": row["status"], "done": row.get("done", 0), "total": row.get("total", 0),
+            "current_domain": row.get("current_domain"), "result": row.get("result"),
+            "error": row.get("error")}
 
 
 @app.websocket("/jobs/{job_id}/ws")
@@ -1195,8 +1243,20 @@ async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
     await websocket.accept()
     job = _JOBS.get(job_id)
     if not job:
-        await websocket.close(code=4404)
-        return
+        conn = db.connect()
+        try:
+            row = jobs.get(conn, job_id)
+        finally:
+            conn.close()
+        if not row:
+            await websocket.close(code=4404)
+            return
+        while True:
+            snap = job_status(job_id)
+            await websocket.send_text(json.dumps(snap))
+            if snap["status"] in ("done", "error"):
+                return
+            await asyncio.sleep(1)
 
     queue: asyncio.Queue = asyncio.Queue()
     job.subscribers.append(queue)

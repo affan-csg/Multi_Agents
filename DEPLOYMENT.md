@@ -55,7 +55,7 @@ SENDER2_SMTP_PASSWORD=...
 ```
 
 ### Server (combine both agents)
-When running both agents under one process, configure these in the hosting environment (Render, Railway, etc.):
+When running both agents under one process, configure these in the hosting environment:
 ```
 RESEARCH_SUPABASE_URL=https://xxx.supabase.co
 RESEARCH_SUPABASE_SERVICE_KEY=eyJ...
@@ -65,9 +65,11 @@ CSG_API_BASE=https://your-api.example.com  # Optional: advertise to itself
 DASHBOARD_PASSWORD=...  # Required: Dashboard login; unset = protected routes return 503
 AUTO_SYNC_ENABLED=false  # Optional: true enables background inbox/Calendly polling + follow-ups
 AUTO_SYNC_INTERVAL_MINUTES=30  # Optional: only seeds the first interval (5-1440); the Dashboard setting wins afterwards
+AUTOMATION_TRIGGER_TOKEN=...  # Secret Manager value for Cloud Scheduler
+CORS_ALLOWED_ORIGINS=https://multi-agents-beta.vercel.app  # Comma-separated production origins
 ```
 
-Any other variable from the two agents' `.env` files (LLM, SMTP/IMAP, Calendly, Hunter) must also be present in the process environment on a host with no `.env` files. When `.env` files do exist, `Server/app.py` reads them itself; real environment variables always take precedence.
+Any other variable from the two agents' `.env` files (LLM, SMTP/IMAP, Calendly, Hunter) must also be present in the process environment on a host with no `.env` files. When `.env` files do exist, `Server/app.py` reads them itself; real environment variables always take precedence. On Cloud Run, store these values in Secret Manager and grant the runtime service account access to the required secret versions. The container uses `CSG_RUNTIME_DIR=/tmp/csg` for its writable cache, export, and mutable-config runtime files.
 
 **Do not** use the legacy `SUPABASE_URL` or `SUPABASE_SERVICE_KEY` names — each agent expects its own.
 
@@ -84,7 +86,7 @@ The Dashboard uses `VITE_API_URL` to append `/research` and `/outreach` automati
 
 Deploy one service that runs both agents behind one port using the Server composition layer:
 
-The repo's [Dockerfile](Dockerfile) (Python 3.12-slim) copies `Research_Agent`, `Outreach_Agent` and `Server`, runs `pip install -e` on all three, and starts:
+The repo's [Dockerfile](Dockerfile) (Python 3.12-slim) copies `Research_Agent`, `Outreach_Agent` and `Server`, installs all three as regular distributions including their YAML and prompt assets, and starts:
 
 ```
 export CSG_API_BASE="http://127.0.0.1:${PORT:-8000}"
@@ -109,7 +111,11 @@ The platform's `PORT` (Railway injects it) is honored, and `CSG_API_BASE` is der
 - `POST /auth/login` — exchange `DASHBOARD_PASSWORD` for a token (all other routes require `Authorization: Bearer <token>`, or `?token=` for WebSockets and download links; the Calendly webhooks are exempt)
 - `/docs` — OpenAPI UI (`/research/docs` and `/outreach/docs` per agent)
 
-**CORS**: `Server/app.py` allows the origin `https://multi-agents-beta.vercel.app` plus local `http://localhost|127.0.0.1:5xxx` dev origins. When you host the Dashboard on a different domain, add that origin to `allow_origins` in `Server/app.py` (a code change) or browser requests will be blocked.
+**CORS**: `Server/app.py` allows the origin `https://multi-agents-beta.vercel.app` plus local `http://localhost|127.0.0.1:5xxx` dev origins. Set `CORS_ALLOWED_ORIGINS` to a comma-separated list when using another production Dashboard domain. Do not use `*` with credentials.
+
+**Health check**: use `GET /healthz`. It is unauthenticated and reports only whether required backend environment variables are present; it never returns secret values. Configure Cloud Run startup/readiness probes against this route.
+
+**Cloud Scheduler**: keep `AUTO_SYNC_ENABLED=false` on Cloud Run and create an authenticated `POST /outreach/automation/trigger` job at the desired interval. Send `X-Automation-Token` from Secret Manager. This wakes a scaled-to-zero service; the database lease in `automation_state` prevents overlapping cycles. `AUTO_SYNC_ENABLED=true` remains suitable for Railway/local single-instance deployments.
 
 **Calendly webhook**: register `https://<backend>/outreach/calendly/webhook` (or the root alias `/calendly/webhook`) and set `CALENDLY_WEBHOOK_SIGNING_KEY`; the signature is verified and unsigned calls are rejected. See [Outreach_Agent/README.md](Outreach_Agent/README.md#calendly-integration).
 
@@ -160,7 +166,7 @@ Each agent uses its own Supabase project. For each project:
    - Research Agent: [Research_Agent/schema.sql](Research_Agent/schema.sql)
    - Outreach Agent: [Outreach_Agent/schema.sql](Outreach_Agent/schema.sql)
 3. Copy the project's URL and service-role key (Settings → API) to your `.env`.
-4. Apply any pending migrations in `migrations/NNN_*.sql` if this is an existing project (or re-run `schema.sql`, which is idempotent). For Research, `005_company_dedup.sql` (the `run_company_matches` table behind global de-duplication) is required on projects created before it. For Outreach, `schema.sql` already includes everything through `014_sender_email.sql` (011-013 were folded in), including `followup_attempts` and `automation_state`; on an existing project only `014_sender_email.sql` may be pending. Run `014b_backfill_sender_email.sql` only after confirming every past send came from the default `OUTREACH_FROM_EMAIL` account.
+4. Apply every migration newer than the existing project's recorded state. Research currently has migrations `001` through `007` (including both `006` files); Outreach has `001` through `010`, `014`, and `015`. Apply `014b_backfill_sender_email.sql` only after confirming every past send used the default `OUTREACH_FROM_EMAIL` account. Do not run migrations blindly against production; review them in the Supabase SQL editor first. The complete `schema.sql` files are idempotent and include the current assessment, evidence, Calendly, follow-up, learning, optimization, and automation tables.
 
 ## Monitoring & logs
 
@@ -169,17 +175,18 @@ Each agent uses its own Supabase project. For each project:
 
 ### Key endpoints for health checks
 
+- `GET /healthz` — unauthenticated Cloud Run process/configuration probe
 - `GET /research/docs` — Research Agent OpenAPI (if reachable, agent is up)
 - `GET /outreach/docs` — Outreach Agent OpenAPI (if reachable, agent is up)
 - `GET /outreach/automation/status` — scheduler state and last cycle result (requires auth)
 
-Neither agent exposes a dedicated `/health` route. Every route except `/auth/login` and the Calendly webhooks needs the dashboard token (the `/docs` pages included), so an unauthenticated probe gets 401/503 — which still proves the process is up.
+Every route except `/auth/login`, `/healthz`, the Cloud Scheduler trigger, and the Calendly webhooks needs the dashboard token.
 
 ## Scaling considerations
 
 - **Research discovery** (`csg discover`) can be long-running and memory-intensive; consider async job processing if runs grow large.
 - **Outreach personalization** is per-item and LLM-dependent; plan for API rate limits on Gemini/Anthropic/Groq.
-- **Conversation Agent** polling is background when `AUTO_SYNC_ENABLED=true` (a DB lease in `automation_state` stops multiple replicas double-running a cycle); otherwise manual (Dashboard button / CLI).
+- **Conversation Agent, inbox, Calendly, and follow-up polling** use the Cloud Scheduler trigger on Cloud Run because scaled-to-zero instances do not run in-process timers. The database lease in `automation_state` stops multiple replicas double-running a cycle. `AUTO_SYNC_ENABLED=true` remains for Railway/local single-instance deployments; otherwise polling is manual.
 - **Learning & Optimization** recomputation is synchronous per-request; at high volumes, move to event-driven or frontend caching.
 - **Analytics** uses paginated fetch to work around Supabase's 1000-row cap; high-volume instances may benefit from a dedicated aggregate store.
 

@@ -26,5 +26,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/outreach"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"config/outreach.yaml" = "outreach/config/outreach.yaml"
+"prompts" = "outreach/prompts"
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -46,14 +46,14 @@ from typing import Any, Optional
 
 import httpx
 
-from .config import PROJECT_ROOT, Config
+from .config import Config, asset_path
 from .gemini_keys import GEMINI_MODEL, GeminiKeyPool, is_daily_quota_exhausted, make_gemini_client
 from .models import ImportedProspect
 
-_PROMPT_PATH = PROJECT_ROOT / "prompts" / "outreach_email.md"
-_RESEARCH_PROMPT_PATH = PROJECT_ROOT / "prompts" / "outreach_email_from_research.md"
-_WEB_SEARCH_PROMPT_PATH = PROJECT_ROOT / "prompts" / "outreach_email_web_search.md"
-_REVISE_PROMPT_PATH = PROJECT_ROOT / "prompts" / "outreach_email_revise.md"
+_PROMPT_PATH = asset_path("prompts", "outreach_email.md")
+_RESEARCH_PROMPT_PATH = asset_path("prompts", "outreach_email_from_research.md")
+_WEB_SEARCH_PROMPT_PATH = asset_path("prompts", "outreach_email_web_search.md")
+_REVISE_PROMPT_PATH = asset_path("prompts", "outreach_email_revise.md")
 
 _BODY_UNAVAILABLE = "BODY_UNAVAILABLE"
 

@@ -17,7 +17,21 @@ from dotenv import load_dotenv
 import os
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "config" / "outreach.yaml"
+PACKAGE_ROOT = Path(__file__).resolve().parent
+
+
+def asset_path(*parts: str) -> Path:
+    """Resolve read-only config/prompt assets in source and installed wheels."""
+    source_path = PROJECT_ROOT.joinpath(*parts)
+    if source_path.is_file():
+        return source_path
+    package_path = PACKAGE_ROOT.joinpath(*parts)
+    if package_path.is_file():
+        return package_path
+    raise FileNotFoundError(f"Outreach asset not found: {'/'.join(parts)}")
+
+
+DEFAULT_CONFIG = asset_path("config", "outreach.yaml")
 
 load_dotenv(PROJECT_ROOT / ".env")
 

@@ -5,9 +5,11 @@ under /outreach, so these are /outreach/automation/*."""
 from __future__ import annotations
 
 from datetime import timedelta
+import hmac
+import os
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from .. import db
@@ -89,3 +91,14 @@ def automation_run() -> dict[str, Any]:
         return {"result": result.as_dict(), "status": status_payload(conn)}
     finally:
         conn.close()
+
+
+@router.post("/automation/trigger")
+def automation_trigger(
+    automation_token: Optional[str] = Header(default=None, alias="X-Automation-Token"),
+) -> dict[str, Any]:
+    """Cloud Scheduler entry point; it wakes a scaled-to-zero service."""
+    expected = os.environ.get("AUTOMATION_TRIGGER_TOKEN", "")
+    if not expected or not automation_token or not hmac.compare_digest(automation_token, expected):
+        raise HTTPException(401, "Unauthorized")
+    return automation_run()

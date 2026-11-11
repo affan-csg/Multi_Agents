@@ -52,6 +52,19 @@ def test_run_updates_status_with_last_and_next_sync(client, conn):
     assert st["running"] is False
 
 
+def test_cloud_scheduler_trigger_requires_token(client, monkeypatch):
+    monkeypatch.setenv("AUTOMATION_TRIGGER_TOKEN", "scheduler-secret")
+    assert client.post("/automation/trigger").status_code == 401
+    assert client.post(
+        "/automation/trigger", headers={"X-Automation-Token": "wrong"}
+    ).status_code == 401
+    response = client.post(
+        "/automation/trigger", headers={"X-Automation-Token": "scheduler-secret"}
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["status"] == "ok"
+
+
 def test_interval_can_be_changed_and_is_validated(client):
     assert client.patch("/automation/settings", json={"interval_minutes": 15}).json()["interval_minutes"] == 15
     assert client.patch("/automation/settings", json={"interval_minutes": 1}).status_code == 400

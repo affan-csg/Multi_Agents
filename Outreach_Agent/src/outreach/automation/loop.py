@@ -27,20 +27,20 @@ logger = logging.getLogger("outreach.automation")
 CHECK_EVERY_SECONDS = 60
 
 
-def _run_if_due() -> Optional[runner.CycleResult]:
+def _run_if_due(config=None) -> Optional[runner.CycleResult]:
     """Blocking: runs in the executor, never on the event loop."""
     conn = db.connect()
     try:
         state = runner.ensure_state(conn)
         if not state.enabled or not runner.is_due(state, utcnow()):
             return None
-        return runner.run_cycle(conn, load_config())
+        return runner.run_cycle(conn, config or load_config())
     finally:
         conn.close()
 
 
 async def run_forever(
-    stop: asyncio.Event, *, check_every: float = CHECK_EVERY_SECONDS,
+    stop: asyncio.Event, *, check_every: float = CHECK_EVERY_SECONDS, config=None,
 ) -> None:
     lock = asyncio.Lock()
     loop = asyncio.get_running_loop()
@@ -49,7 +49,7 @@ async def run_forever(
         try:
             if not lock.locked():
                 async with lock:
-                    await loop.run_in_executor(None, _run_if_due)
+                    await loop.run_in_executor(None, _run_if_due, config)
         except Exception:  # the scheduler itself must never die
             logger.exception("automation scheduler iteration failed")
         try:
