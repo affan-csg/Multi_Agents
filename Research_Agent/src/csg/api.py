@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -39,6 +40,7 @@ from .research_assessment import ResearchAssessmentInput, build_assessment
 
 _MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 _RECOVERY_INTERVAL_SECONDS = 15
+_JOB_HEARTBEAT_INTERVAL_SECONDS = min(60, jobs.LEASE_SECONDS // 3)
 logger = logging.getLogger(__name__)
 
 
@@ -93,31 +95,74 @@ class Job:
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     loop: Optional[asyncio.AbstractEventLoop] = None
     persist: bool = True
+    worker_id: Optional[str] = None
+    _state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
-        return {
-            "job_id": self.job_id, "kind": self.kind, "run_id": self.run_id,
-            "status": self.status, "done": self.done, "total": self.total,
-            "current_domain": self.current_domain, "result": self.result, "error": self.error,
-        }
+        with self._state_lock:
+            return {
+                "job_id": self.job_id, "kind": self.kind, "run_id": self.run_id,
+                "status": self.status, "done": self.done, "total": self.total,
+                "current_domain": self.current_domain, "result": self.result, "error": self.error,
+            }
 
-    def publish(self) -> None:
-        conn = db.connect()
-        try:
-            jobs.update(
-                conn, self.job_id, status=self.status, run_id=self.run_id,
-                done=self.done, total=self.total, current_domain=self.current_domain,
-                result=self.result, error=self.error,
-            )
-        finally:
-            conn.close()
-        snap = self.snapshot()
-        for q in list(self.subscribers):
+    def set_worker_id(self, worker_id: str) -> None:
+        with self._state_lock:
+            self.worker_id = worker_id
+
+    def publish(self, worker_id: str, **updates: Any) -> bool:
+        with self._state_lock:
+            if self.worker_id != worker_id:
+                return False
+            payload = self.snapshot()
+            payload.update(updates)
+            conn = db.connect()
+            try:
+                persisted = jobs.update(
+                    conn, self.job_id, worker_id,
+                    status=payload["status"], run_id=payload["run_id"],
+                    done=payload["done"], total=payload["total"],
+                    current_domain=payload["current_domain"],
+                    result=payload["result"], error=payload["error"],
+                )
+            finally:
+                conn.close()
+            if not persisted:
+                return False
+            for name, value in updates.items():
+                setattr(self, name, value)
+            snap = self.snapshot()
+            subscribers = list(self.subscribers)
+        for q in subscribers:
             if self.loop is not None:
                 self.loop.call_soon_threadsafe(q.put_nowait, snap)
+        return True
 
 
 _JOBS: dict[str, Job] = {}
+
+
+def _start_job_heartbeat(job: Job, worker_id: str) -> tuple[threading.Event, threading.Thread]:
+    stop = threading.Event()
+
+    def pulse() -> None:
+        while not stop.wait(_JOB_HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                job.publish(worker_id)
+            except Exception:
+                logger.exception("Research job heartbeat failed for %s", job.job_id)
+
+    thread = threading.Thread(target=pulse, name=f"research-job-{job.job_id}", daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def _stop_job_heartbeat(heartbeat: Optional[tuple[threading.Event, threading.Thread]]) -> None:
+    if heartbeat is None:
+        return
+    stop, thread = heartbeat
+    stop.set()
+    thread.join()
 
 
 async def _recover_jobs_forever() -> None:
@@ -168,9 +213,18 @@ def _recover_jobs_once() -> None:
                 None, _run_contacts_job, job, row["run_id"], ContactsRequest.model_validate(payload),
             )
         else:
-            job.status = "error"
-            job.error = f"Unsupported recovered Research job kind: {row['kind']}"
-            job.publish()
+            worker_id = jobs.worker_id()
+            conn = db.connect()
+            try:
+                claimed = jobs.claim(conn, job_id, worker_id)
+            finally:
+                conn.close()
+            if claimed:
+                job.set_worker_id(worker_id)
+                job.publish(
+                    worker_id, status="error",
+                    error=f"Unsupported recovered Research job kind: {row['kind']}",
+                )
 
 
 def _new_job(kind: str, run_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,
@@ -265,37 +319,37 @@ class ResearchAssessmentCreateRequest(ResearchAssessmentInput):
 def _run_discover_job(job: Job, req: DiscoverRequest) -> None:
     """Autonomous discovery: region in, ranked prospects out."""
     conn = db.connect()
+    heartbeat = None
+    worker_id = ""
     try:
-        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+        worker_id = jobs.worker_id()
+        if not jobs.claim(conn, job.job_id, worker_id):
             return
+        job.set_worker_id(worker_id)
+        heartbeat = _start_job_heartbeat(job, worker_id)
         cfg = load_config()
-        job.status = "running"
-        job.total = req.limit
-        job.publish()
+        job.publish(worker_id, status="running", total=req.limit)
 
         def progress(stage: str, done: int, total: int, detail: str) -> None:
-            job.done, job.total = done, total or req.limit
-            job.current_domain = f"{stage}: {detail}"
-            job.publish()
+            job.publish(
+                worker_id, done=done, total=total or req.limit,
+                current_domain=f"{stage}: {detail}",
+            )
 
         stats = asyncio.run(discover_mod.run_discovery(
             cfg, region=req.region, limit=req.limit, conn=conn,
             label=req.label, use_cache=req.use_cache, on_progress=progress,
             auto_qualify_top=req.auto_qualify_top,
         ))
-        job.run_id = stats.run_id
-        job.status = "done"
-        job.result = stats.as_dict()
-        job.publish()
+        job.publish(worker_id, run_id=stats.run_id, status="done", result=stats.as_dict())
+    except asyncio.CancelledError:
+        job.publish(worker_id, status="error", error="Research job was cancelled and can be retried.")
     except DiscoveryError as exc:
-        job.status = "error"
-        job.error = str(exc)
-        job.publish()
+        job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
-        job.status = "error"
-        job.error = f"{type(exc).__name__}: {exc}"
-        job.publish()
+        job.publish(worker_id, status="error", error=f"{type(exc).__name__}: {exc}")
     finally:
+        _stop_job_heartbeat(heartbeat)
         conn.close()
 
 
@@ -304,128 +358,113 @@ def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
     stalled (see db.stalled_companies) -- does not re-run discovery, just
     re-enrichment + re-scoring for these domains under the same run_id."""
     conn = db.connect()
+    heartbeat = None
+    worker_id = ""
     try:
-        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+        worker_id = jobs.worker_id()
+        if not jobs.claim(conn, job.job_id, worker_id):
             return
+        job.set_worker_id(worker_id)
+        heartbeat = _start_job_heartbeat(job, worker_id)
         cfg = load_config()
-        job.status = "running"
-        job.total = len(domains)
-        job.publish()
+        job.publish(worker_id, status="running", total=len(domains))
 
         def progress(stage: str, done: int, total: int, detail: str) -> None:
-            job.done, job.total = done, total or len(domains)
-            job.current_domain = f"{stage}: {detail}"
-            job.publish()
+            job.publish(
+                worker_id, done=done, total=total or len(domains),
+                current_domain=f"{stage}: {detail}",
+            )
 
         stats = asyncio.run(discover_mod.resume_stalled(
             cfg, run_id, domains, conn=conn, on_progress=progress,
         ))
-        job.run_id = stats.run_id
-        job.status = "done"
-        job.result = stats.as_dict()
-        job.publish()
+        job.publish(worker_id, run_id=stats.run_id, status="done", result=stats.as_dict())
+    except asyncio.CancelledError:
+        job.publish(worker_id, status="error", error="Research job was cancelled and can be retried.")
     except DiscoveryError as exc:
-        job.status = "error"
-        job.error = str(exc)
-        job.publish()
+        job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
-        job.status = "error"
-        job.error = f"{type(exc).__name__}: {exc}"
-        job.publish()
+        job.publish(worker_id, status="error", error=f"{type(exc).__name__}: {exc}")
     finally:
+        _stop_job_heartbeat(heartbeat)
         conn.close()
 
 
 def _run_qualify_job(job: Job, run_id: str, req: QualifyRequest) -> None:
     conn = db.connect()
+    worker_id = ""
     try:
-        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+        worker_id = jobs.worker_id()
+        if not jobs.claim(conn, job.job_id, worker_id):
             return
-        job.status = "running"
-        job.publish()
+        job.set_worker_id(worker_id)
+        job.publish(worker_id, status="running")
 
         def progress(done: int, total: int, domain: str) -> None:
-            job.done, job.total, job.current_domain = done, total, domain
-            job.publish()
+            job.publish(worker_id, done=done, total=total, current_domain=domain)
 
         stats = asyncio.run(qualify_mod.qualify_run(
             conn, run_id, tiers=req.tiers, limit_reqs=req.limit_reqs,
             force=req.force, on_progress=progress, domains=req.domains,
         ))
-        job.status = "done"
-        job.result = stats
-        job.publish()
+        job.publish(worker_id, status="done", result=stats)
     except qualify_mod.QualificationError as exc:
-        job.status = "error"
-        job.error = str(exc)
-        job.publish()
+        job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
-        job.status = "error"
-        job.error = f"{type(exc).__name__}: {exc}"
-        job.publish()
+        job.publish(worker_id, status="error", error=f"{type(exc).__name__}: {exc}")
     finally:
         conn.close()
 
 
 def _run_qualify_retry_job(job: Job, run_id: str) -> None:
     conn = db.connect()
+    worker_id = ""
     try:
-        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+        worker_id = jobs.worker_id()
+        if not jobs.claim(conn, job.job_id, worker_id):
             return
-        job.status = "running"
-        job.publish()
+        job.set_worker_id(worker_id)
+        job.publish(worker_id, status="running")
 
         def progress(done: int, total: int, domain: str) -> None:
-            job.done, job.total, job.current_domain = done, total, domain
-            job.publish()
+            job.publish(worker_id, done=done, total=total, current_domain=domain)
 
         stats = asyncio.run(qualify_mod.retry_failed_run(conn, run_id, on_progress=progress))
-        job.status = "done"
-        job.result = stats
-        job.publish()
+        job.publish(worker_id, status="done", result=stats)
     except qualify_mod.QualificationError as exc:
-        job.status = "error"
-        job.error = str(exc)
-        job.publish()
+        job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
-        job.status = "error"
-        job.error = f"{type(exc).__name__}: {exc}"
-        job.publish()
+        job.publish(worker_id, status="error", error=f"{type(exc).__name__}: {exc}")
     finally:
         conn.close()
 
 
 def _run_contacts_job(job: Job, run_id: str, req: ContactsRequest) -> None:
     conn = db.connect()
+    worker_id = ""
     try:
-        if not jobs.claim(conn, job.job_id, jobs.worker_id()):
+        worker_id = jobs.worker_id()
+        if not jobs.claim(conn, job.job_id, worker_id):
             return
-        job.status = "running"
-        job.publish()
+        job.set_worker_id(worker_id)
+        job.publish(worker_id, status="running")
 
         rows = [r for r in db.get_scores(conn, run_id) if r["tier"] in req.tiers]
         domains = [r["domain"] for r in rows]
         pending = domains if req.force else [d for d in domains if not db.has_contacts(conn, d)]
-        job.total = len(pending)
+        job.publish(worker_id, total=len(pending))
 
         def progress(done: int, total: int, domain: str) -> None:
-            job.done, job.total, job.current_domain = done, total, domain
-            job.publish()
+            job.publish(worker_id, done=done, total=total, current_domain=domain)
 
         stats = asyncio.run(contacts_mod.discover_run(
             conn, pending, limit_per_domain=req.limit_per_domain, force=req.force, on_progress=progress,
         ))
-        job.status = "done"
-        job.result = stats
-        job.publish()
+        job.publish(worker_id, status="done", result=stats)
     except contacts_mod.ContactDiscoveryError as exc:
-        job.status = "error"
-        job.error = str(exc)
-        job.publish()
+        job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
-        job.status = "error"
-        job.error = f"{type(exc).__name__}: {exc}"
-        job.publish()
+        job.publish(worker_id, status="error", error=f"{type(exc).__name__}: {exc}")
     finally:
         conn.close()
 

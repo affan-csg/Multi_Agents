@@ -46,6 +46,7 @@ from .usage_tracker import classify_error
 ENRICH_CONCURRENCY = 2
 
 ProgressFn = Callable[[str, int, int, str], None]
+ENRICH_TIMEOUT_SECONDS = 180.0
 """stage, done, total, detail"""
 
 
@@ -201,10 +202,18 @@ async def _enrich_all(
     async def one(company: Company) -> None:
         nonlocal done
         async with sem:
+            if on_progress:
+                on_progress("enrich", done, len(todo), f"researching {company.domain}")
             try:
-                reason = await enrich_company_firmographics(company)
+                reason = await asyncio.wait_for(
+                    enrich_company_firmographics(company), timeout=ENRICH_TIMEOUT_SECONDS,
+                )
                 if reason:
                     failures[reason] = failures.get(reason, 0) + 1
+            except asyncio.TimeoutError:
+                reason = "timeout"
+                print(f"  [WARN] enrichment timed out after {ENRICH_TIMEOUT_SECONDS:.0f}s for {company.domain}")
+                failures[reason] = failures.get(reason, 0) + 1
             except Exception as exc:  # a failed lookup must not kill the run
                 reason = classify_error(exc)
                 print(f"  [WARN] enrichment failed for {company.domain} ({reason}): "

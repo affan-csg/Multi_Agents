@@ -225,6 +225,15 @@ _COALESCE_FIELDS = (
 # confidence), not bare scalars -- see models.ProvenanceValue.
 _PROVENANCE_FIELDS = ("website", "headquarters", "company_type", "employee_count", "revenue", "funding")
 _PENDING_CLASSIFICATION_EVIDENCE: dict[str, list[dict[str, Any]]] = {}
+_EVIDENCE_DEFAULTS: dict[str, Any] = {
+    "classification_evidence": [],
+    "research_evidence": [],
+    "research_outcomes": {},
+}
+
+
+def _empty_evidence_value(field: str) -> Any:
+    return {} if field == "research_outcomes" else []
 
 
 def upsert_company(conn: SupabaseConn, c: Company) -> None:
@@ -251,15 +260,17 @@ def upsert_company(conn: SupabaseConn, c: Company) -> None:
     incoming = c.model_dump(mode="json")
     for field in _COALESCE_FIELDS:
         value = incoming.get(field)
-        preserve_empty = field in {"classification_evidence", "research_evidence", "research_outcomes"}
+        preserve_empty = field in _EVIDENCE_DEFAULTS
         if (value is None or (preserve_empty and not value)) and existing is not None:
             prior_value = getattr(existing, field)
             if field in _PROVENANCE_FIELDS and prior_value is not None:
                 prior_value = prior_value.model_dump(mode="json")
             value = prior_value
+        if field in _EVIDENCE_DEFAULTS and value is None:
+            value = _empty_evidence_value(field)
         row[field] = value
 
-    _PENDING_CLASSIFICATION_EVIDENCE[c.domain] = c.classification_evidence
+    _PENDING_CLASSIFICATION_EVIDENCE[c.domain] = row["classification_evidence"]
     optional_fields = ("classification_evidence", "research_evidence", "research_outcomes")
     for _ in range(len(optional_fields) + 1):
         try:
@@ -288,10 +299,21 @@ def claim_company(conn: SupabaseConn, c: Company) -> bool:
     incoming = c.model_dump(mode="json")
     for field in _COALESCE_FIELDS:
         value = incoming.get(field)
-        if field in {"classification_evidence", "research_evidence", "research_outcomes"} and not value:
-            value = None
+        if field in _EVIDENCE_DEFAULTS and not value:
+            value = _empty_evidence_value(field)
         row[field] = value
-    return bool(conn.insert_if_absent("companies", [row], on_conflict="domain"))
+    optional_fields = tuple(_EVIDENCE_DEFAULTS)
+    for _ in range(len(optional_fields) + 1):
+        try:
+            return bool(conn.insert_if_absent("companies", [row], on_conflict="domain"))
+        except SupabaseError as exc:
+            # Keep inserts compatible with projects that have not yet applied
+            # an additive evidence migration, as upsert_company() does.
+            missing_field = next((field for field in optional_fields if field in str(exc)), None)
+            if missing_field is None or missing_field not in row:
+                raise
+            row.pop(missing_field)
+    return False
 
 
 def get_company(conn: SupabaseConn, domain: str) -> Optional[Company]:

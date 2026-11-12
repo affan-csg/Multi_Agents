@@ -89,7 +89,7 @@ def claim(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
     return bool(rows)
 
 
-def update(conn: SupabaseConn, job_id: str, **fields: Any) -> None:
+def update(conn: SupabaseConn, job_id: str, worker_id: str, **fields: Any) -> bool:
     now = utcnow()
     fields["updated_at"] = _iso(now)
     if fields.get("status") in ("done", "error"):
@@ -97,7 +97,10 @@ def update(conn: SupabaseConn, job_id: str, **fields: Any) -> None:
         fields["lease_until"] = None
     elif fields.get("status") == "running":
         fields["lease_until"] = _iso(now + timedelta(seconds=LEASE_SECONDS))
-    conn.update(TABLE, fields, job_id=f"eq.{job_id}")
+    rows = conn.update_returning(
+        TABLE, fields, job_id=f"eq.{job_id}", worker_id=f"eq.{worker_id}",
+    )
+    return bool(rows)
 
 
 def worker_id() -> str:

@@ -65,11 +65,19 @@ def make_ipv4_httpx_clients() -> tuple:
 
     timeout = httpx.Timeout(30.0, connect=_CONNECT_TIMEOUT_S)
     transport = httpx.HTTPTransport(local_address="0.0.0.0")
-    async_transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
     return (
         httpx.Client(transport=transport, timeout=timeout),
-        httpx.AsyncClient(transport=async_transport, timeout=timeout),
+        make_ipv4_async_httpx_client(),
     )
+
+
+def make_ipv4_async_httpx_client():
+    """Build an async IPv4-pinned client for cancellable provider requests."""
+    import httpx
+
+    timeout = httpx.Timeout(30.0, connect=_CONNECT_TIMEOUT_S)
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+    return httpx.AsyncClient(transport=transport, timeout=timeout)
 
 
 def make_gemini_client(api_key: str):

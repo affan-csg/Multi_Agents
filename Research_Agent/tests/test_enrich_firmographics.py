@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from csg import discover
 from csg.discovery import research
 from csg.models import Company
 from csg import usage_tracker
@@ -73,17 +75,15 @@ def _tavily_groq_transport(handler):
 
 
 def _patch_httpx_client(monkeypatch, handler):
-    """_enrich_via_groq_tavily builds its own httpx.Client() with no injection
-    point, so patch httpx.Client globally for the duration of the test to
-    route through a MockTransport instead of the network."""
-    real_client = httpx.Client
-    monkeypatch.setattr(research._time, "sleep", lambda *_: None)
+    """Route async fallback requests through a MockTransport."""
+    async def no_wait(_seconds):
+        pass
 
-    def fake_client(*args, **kwargs):
-        kwargs.pop("timeout", None)
-        return real_client(transport=_tavily_groq_transport(handler))
-
-    monkeypatch.setattr(research.httpx, "Client", fake_client)
+    monkeypatch.setattr(research.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(
+        research, "make_ipv4_async_httpx_client",
+        lambda: httpx.AsyncClient(transport=_tavily_groq_transport(handler)),
+    )
 
 
 def _successful_fallback_handler(request: httpx.Request) -> httpx.Response:
@@ -103,6 +103,51 @@ def gemini_keys(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY_2", raising=False)
     monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
     monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+
+
+def test_timed_out_gemini_response_cannot_mutate_company_later(gemini_keys, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class FakeModels:
+        @staticmethod
+        def generate_content(**_kwargs):
+            started.set()
+            release.wait(2)
+            finished.set()
+            return _fake_response(_FIRMOGRAPHICS_JSON)
+
+    class FakeClient:
+        models = FakeModels()
+
+    class EmptyConn:
+        def select(self, *_args, **_kwargs):
+            return []
+
+    monkeypatch.setattr(
+        "csg.discovery.gemini_keys.make_gemini_client", lambda _key: FakeClient(),
+    )
+    monkeypatch.setattr(discover, "ENRICH_TIMEOUT_SECONDS", 0.02)
+
+    async def run_enrichment():
+        def release_after_timeout(stage, done, _total, _detail):
+            if stage == "enrich" and done == 1:
+                release.set()
+
+        pairs, skipped, failures = await discover._enrich_all(
+            EmptyConn(), [SimpleNamespace(domain="slow.example", name="Slow", industry=None)],
+            "GA", release_after_timeout,
+        )
+        assert skipped == 0
+        assert failures == {"timeout": 1}
+        assert await asyncio.to_thread(finished.wait, 1)
+        return pairs[0][1]
+
+    company = asyncio.run(run_enrichment())
+    assert started.is_set()
+    assert company.employee_count is None
+    assert company.website is None
 
 
 def test_non_quota_gemini_failure_falls_back_to_tavily_groq(

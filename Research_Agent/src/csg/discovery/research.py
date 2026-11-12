@@ -11,6 +11,7 @@ so a Gemini daily-quota outage doesn't leave every company unenriched.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import os
@@ -23,7 +24,10 @@ from typing import Any, Optional
 
 import httpx
 
-from .gemini_keys import GeminiKeyPool, is_connection_error, is_daily_quota_exhausted, make_ipv4_httpx_clients
+from .gemini_keys import (
+    GeminiKeyPool, is_connection_error, is_daily_quota_exhausted,
+    make_ipv4_async_httpx_client,
+)
 from .groq_tavily import GroqTavilyProvider, _GROQ_URL, _GROQ_MODEL, _TAVILY_URL
 from ..models import Company, ProvenanceValue, provenance_value
 from ..usage_tracker import track
@@ -37,6 +41,7 @@ _CONNECTION_ERROR_RETRIES = 1
 _CONNECTION_ERROR_RETRY_DELAY = 2.0
 _GEMINI_RATE_LIMIT_RETRIES = 1
 _GEMINI_RATE_LIMIT_RETRY_DELAY = 2.0
+_ENRICH_RETRY_DELAY_CAP_SECONDS = 30.0
 
 _FIELD_CRITERIA = {
     "official_website": "automatic_website",
@@ -710,13 +715,12 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
     searched_fields: set[str] = set()
 
     try:
-        sync_client, _ = make_ipv4_httpx_clients()
-        with sync_client as client:
+        async with make_ipv4_async_httpx_client() as client:
             results: list[dict[str, Any]] = []
             for field, query in targeted_queries:
                 with track("tavily", "tavily_search", domain=company.domain) as u:
                     for attempt in range(_TAVILY_RATE_LIMIT_RETRIES + 1):
-                        r = client.post(_TAVILY_URL, json={
+                        r = await client.post(_TAVILY_URL, json={
                             "api_key": tavily_key,
                             "query": query,
                             "max_results": 4,
@@ -725,10 +729,11 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
                         }, timeout=20.0)
                         if r.status_code in {429, 500, 502, 503, 504} and attempt < _TAVILY_RATE_LIMIT_RETRIES:
                             u.retry_count += 1
-                            wait = GroqTavilyProvider._retry_delay(r, attempt)
+                            wait = min(_ENRICH_RETRY_DELAY_CAP_SECONDS,
+                                       GroqTavilyProvider._retry_delay(r, attempt))
                             print(f"  [WARN] Tavily rate limited for {company.domain}, waiting "
                                   f"{wait:.0f}s ({attempt + 1}/{_TAVILY_RATE_LIMIT_RETRIES})")
-                            _time.sleep(wait)
+                            await asyncio.sleep(wait)
                             continue
                         if r.status_code in {429, 500, 502, 503, 504}:
                             u.mark_failure(status_code=r.status_code, error_kind="rate_limited" if r.status_code == 429 else "other")
@@ -795,7 +800,7 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
 
             with track("groq", "groq_parse", domain=company.domain) as u:
                 for attempt in range(GroqTavilyProvider._RATE_LIMIT_RETRIES + 1):
-                    gr = client.post(_GROQ_URL, headers={
+                    gr = await client.post(_GROQ_URL, headers={
                         "Authorization": f"Bearer {groq_key}",
                         "Content-Type": "application/json",
                     }, json={
@@ -805,10 +810,11 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
                     }, timeout=30.0)
                     if gr.status_code in {429, 500, 502, 503, 504} and attempt < GroqTavilyProvider._RATE_LIMIT_RETRIES:
                         u.retry_count += 1
-                        wait = GroqTavilyProvider._retry_delay(gr, attempt)
+                        wait = min(_ENRICH_RETRY_DELAY_CAP_SECONDS,
+                                   GroqTavilyProvider._retry_delay(gr, attempt))
                         print(f"  [WARN] Groq rate limited for {company.domain}, waiting "
                               f"{wait:.0f}s ({attempt + 1}/{GroqTavilyProvider._RATE_LIMIT_RETRIES})")
-                        _time.sleep(wait)
+                        await asyncio.sleep(wait)
                         continue
                     if gr.status_code in {429, 500, 502, 503, 504}:
                         u.mark_failure(status_code=gr.status_code, error_kind="rate_limited" if gr.status_code == 429 else "other")
@@ -947,7 +953,7 @@ async def enrich_company_firmographics(company: Company) -> Optional[str]:
         last_exc: Exception | None = None
         for attempt in pool.attempts():
             try:
-                response = _call_with_connection_retry(attempt.key)
+                response = await asyncio.to_thread(_call_with_connection_retry, attempt.key)
                 break
             except Exception as exc:
                 last_exc = exc

@@ -158,6 +158,29 @@ def test_concurrent_claims_create_exactly_one_company():
     assert len(conn.tables["companies"]) == 1
 
 
+def test_enrichment_timeout_is_counted_and_reports_progress(monkeypatch):
+    candidate = CompanyCandidate(
+        domain="slow.example", name="Slow", source="fake", discovered_at=datetime.now(),
+    )
+    progress = []
+
+    async def never_finishes(company):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(discover, "ENRICH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(discover, "enrich_company_firmographics", never_finishes)
+
+    pairs, skipped, failures = asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", lambda *event: progress.append(event),
+    ))
+
+    assert len(pairs) == 1 and skipped == 0
+    assert failures == {"timeout": 1}
+    assert progress[0][0:3] == ("enrich", 0, 1)
+    assert "researching slow.example" in progress[0][3]
+    assert progress[-1][0:3] == ("enrich", 1, 1)
+
+
 # --- run_discovery end to end (network edges faked) --------------------------
 
 class _Env:

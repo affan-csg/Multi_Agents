@@ -7,6 +7,8 @@ failing the whole discovery/enrichment/qualify run, when a second key in
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from csg.discovery.gemini_keys import (
@@ -28,6 +30,13 @@ def test_client_uses_agent_platform_express_mode(monkeypatch):
 
     assert captured["enterprise"] is True
     assert captured["api_key"] == "test-key"
+    options = captured["http_options"]
+    assert options.httpx_client.timeout.connect == 10.0
+    assert options.httpx_client.timeout.read == 30.0
+    assert options.httpx_async_client.timeout.connect == 10.0
+    assert options.httpx_async_client.timeout.read == 30.0
+    options.httpx_client.close()
+    asyncio.run(options.httpx_async_client.aclose())
 
 
 class _FakeError(Exception):

@@ -188,6 +188,8 @@ CREATE TABLE IF NOT EXISTS contacts (
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS revenue     JSONB;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS funding     JSONB;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS classification_evidence JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS research_evidence JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS research_outcomes JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS region      TEXT;
 

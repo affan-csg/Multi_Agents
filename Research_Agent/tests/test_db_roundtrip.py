@@ -35,7 +35,15 @@ class FakeConn:
         }.get(table, ("domain",))
         return tuple(row.get(k) for k in keys)
 
+    @staticmethod
+    def _validate_required_evidence(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            for field in ("classification_evidence", "research_evidence", "research_outcomes"):
+                assert row.get(field) is not None, f"companies.{field} is NOT NULL"
+
     def upsert(self, table: str, rows: list[dict[str, Any]], on_conflict: str = "") -> None:
+        if table == "companies":
+            self._validate_required_evidence(rows)
         store = self.tables.setdefault(table, [])
         for row in rows:
             k = self._key(table, row)
@@ -45,6 +53,17 @@ class FakeConn:
                     break
             else:
                 store.append(dict(row))
+
+    def insert_if_absent(self, table: str, rows: list[dict[str, Any]], on_conflict: str = "") -> list[dict[str, Any]]:
+        if table == "companies":
+            self._validate_required_evidence(rows)
+        store = self.tables.setdefault(table, [])
+        inserted = []
+        for row in rows:
+            if not any(self._key(table, existing) == self._key(table, row) for existing in store):
+                store.append(dict(row))
+                inserted.append(row)
+        return inserted
 
     def select(self, table: str, select: str = "*", limit: int | None = None,
                order: str | None = None, **filters: str) -> list[dict[str, Any]]:
@@ -145,6 +164,12 @@ def test_coalesce_preserves_prior_research(conn):
 
 
 def test_empty_reassessment_preserves_evidence_and_outcomes(conn):
+    classification = [{
+        "category": "system_integrator", "supports": True, "fact": "services",
+        "why": "documented integration services", "source_name": "Services",
+        "source_url": "https://acme.com/services", "excerpt": "We implement software.",
+        "confidence": "high", "evidence_type": "direct",
+    }]
     evidence = [{
         "evidence_key": "stable-key", "field": "services", "criterion": "company_services",
         "claim": {"services": "implementation"}, "source_url": "https://acme.com/services",
@@ -153,14 +178,41 @@ def test_empty_reassessment_preserves_evidence_and_outcomes(conn):
     }]
     outcomes = {"services": {"status": "accepted_and_mapped", "criterion": "company_services"}}
     db.upsert_company(conn, Company(
-        domain="acme.com", research_evidence=evidence, research_outcomes=outcomes,
+        domain="acme.com",
+        website={"value": "https://acme.com", "source": "operator_approved",
+                 "method": "reported", "confidence": "high"},
+        classification_evidence=classification,
+        research_evidence=evidence, research_outcomes=outcomes,
     ))
     db.upsert_company(conn, Company(domain="acme.com", ats_provider="lever"))
 
     refreshed = db.get_company(conn, "acme.com")
     assert refreshed is not None
+    assert refreshed.website is not None
+    assert refreshed.website.value == "https://acme.com"
+    assert refreshed.website.source == "operator_approved"
+    assert refreshed.classification_evidence == classification
     assert refreshed.research_evidence == evidence
     assert refreshed.research_outcomes == outcomes
+
+
+def test_company_claim_and_upsert_use_non_null_evidence_defaults(conn):
+    company = Company(domain="acme.com")
+    assert db.claim_company(conn, company) is True
+    claimed = conn.tables["companies"][0]
+    assert claimed["classification_evidence"] == []
+    assert claimed["research_evidence"] == []
+    assert claimed["research_outcomes"] == {}
+
+    nullable_company = Company.model_construct(
+        domain="nullable.example", classification_evidence=None,
+        research_evidence=None, research_outcomes=None,
+    )
+    db.upsert_company(conn, nullable_company)
+    updated = next(row for row in conn.tables["companies"] if row["domain"] == "nullable.example")
+    assert updated["classification_evidence"] == []
+    assert updated["research_evidence"] == []
+    assert updated["research_outcomes"] == {}
 
 
 def test_posting_classification_survives_the_round_trip(conn):
