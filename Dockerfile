@@ -12,9 +12,10 @@ COPY Outreach_Agent ./Outreach_Agent
 COPY Server ./Server
 
 RUN pip install --no-cache-dir ./Research_Agent ./Outreach_Agent ./Server \
-    && useradd --create-home --shell /usr/sbin/nologin appuser \
-    && mkdir -p /tmp/csg \
-    && chown -R appuser:appuser /app
+    && groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /tmp/csg /tmp/csg/cache /tmp/csg/exports \
+    && chown -R 1000:1000 /app /tmp/csg
 
 USER appuser
 

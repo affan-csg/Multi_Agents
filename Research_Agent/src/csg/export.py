@@ -13,11 +13,11 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from . import db
-from .config import RUNTIME_ROOT
+from .config import RUNTIME_ROOT, ensure_runtime_dir
 from .db import SupabaseConn
 from .models import Prospect, provenance_value
 
-EXPORT_DIR = RUNTIME_ROOT / "exports"
+EXPORT_DIR = ensure_runtime_dir(RUNTIME_ROOT / "exports")
 
 CSV_COLUMNS = [
     "tier", "score", "domain", "name", "region", "employee_count",

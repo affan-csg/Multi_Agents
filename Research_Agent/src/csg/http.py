@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -17,8 +18,9 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import RUNTIME_ROOT
+from .config import RUNTIME_ROOT, ensure_runtime_dir
 
+logger = logging.getLogger(__name__)
 CACHE_DIR = RUNTIME_ROOT / "cache"
 
 
@@ -43,7 +45,7 @@ class Fetcher:
             follow_redirects=True,
             headers={"User-Agent": user_agent, "Accept": "*/*"},
         )
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self.cache_dir = ensure_runtime_dir(CACHE_DIR)
         self.stats = {"hits": 0, "misses": 0, "errors": 0}
 
     async def __aenter__(self) -> "Fetcher":
@@ -58,7 +60,7 @@ class Fetcher:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def _cache_path(self, key: str) -> Path:
-        return CACHE_DIR / (key + ".json")
+        return self.cache_dir / (key + ".json")
 
     def _read_cache(self, key: str) -> Optional[dict[str, Any]]:
         if not self.use_cache:
@@ -72,13 +74,17 @@ class Fetcher:
             return None
 
     def _write_cache(self, key: str, url: str, status: int, body: str) -> None:
+        path = self._cache_path(key)
         try:
-            self._cache_path(key).write_text(
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
                 json.dumps({"url": url, "status": status, "body": body}),
                 encoding="utf-8",
             )
         except OSError:
-            pass
+            self.stats["errors"] += 1
+            logger.exception("Failed to write HTTP cache entry for %s", url)
+            raise
 
     # -- fetch ------------------------------------------------------------
     async def get(self, url: str) -> tuple[int, str]:

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from csg import config
+from pathlib import Path
+
+import pytest
+
+from csg import config, http
 
 
 def test_asset_path_falls_back_to_package_data(tmp_path, monkeypatch):
@@ -30,3 +34,40 @@ def test_installed_config_uses_writable_runtime_copy(tmp_path, monkeypatch):
     editable = config._editable_config_path()
     assert editable == runtime_root / "icp.yaml"
     assert editable.read_text(encoding="utf-8") == package_config.read_text(encoding="utf-8")
+
+
+def test_runtime_directory_is_created_and_is_writable(tmp_path):
+    runtime_root = tmp_path / "runtime" / "nested"
+
+    ensured = config.ensure_runtime_dir(runtime_root)
+
+    assert ensured == runtime_root
+    assert runtime_root.is_dir()
+    assert runtime_root.exists()
+    assert runtime_root.stat().st_mode & 0o777
+
+
+def test_runtime_directory_permission_errors_are_not_silenced(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+
+    def boom(self, *args, **kwargs):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "mkdir", boom)
+
+    with pytest.raises(PermissionError, match="not writable"):
+        config.ensure_runtime_dir(runtime_root)
+
+
+def test_fetcher_cache_writes_surface_permission_failures(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(http, "CACHE_DIR", cache_dir)
+
+    def boom(self, *args, **kwargs):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+
+    fetcher = http.Fetcher("unit-test", use_cache=True)
+    with pytest.raises(PermissionError, match="permission denied"):
+        fetcher._write_cache("abc123", "https://example.com", 200, "ok")

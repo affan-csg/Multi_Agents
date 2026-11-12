@@ -21,13 +21,26 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = Path(__file__).resolve().parent
 
 
+def ensure_runtime_dir(path: str | os.PathLike[str] | Path) -> Path:
+    runtime_path = Path(path)
+    try:
+        runtime_path.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise PermissionError(f"Runtime directory is not writable: {runtime_path}") from exc
+    if not runtime_path.is_dir():
+        raise NotADirectoryError(f"Runtime path is not a directory: {runtime_path}")
+    if not os.access(runtime_path, os.W_OK):
+        raise PermissionError(f"Runtime directory is not writable: {runtime_path}")
+    return runtime_path
+
+
 def _runtime_root() -> Path:
     configured = os.environ.get("CSG_RUNTIME_DIR")
     if configured:
-        return Path(configured)
+        return ensure_runtime_dir(Path(configured))
     if (PROJECT_ROOT / "config" / "icp.yaml").is_file():
-        return PROJECT_ROOT / "data"
-    return Path("/tmp") / "csg"
+        return ensure_runtime_dir(PROJECT_ROOT / "data")
+    return ensure_runtime_dir(Path("/tmp") / "csg")
 
 
 RUNTIME_ROOT = _runtime_root()
@@ -60,7 +73,7 @@ def _editable_config_path() -> Path:
     if current != DEFAULT_CONFIG:
         return current
     target = RUNTIME_ROOT / "icp.yaml"
-    target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_runtime_dir(target.parent)
     if not target.exists():
         target.write_bytes(DEFAULT_CONFIG.read_bytes())
     return target
