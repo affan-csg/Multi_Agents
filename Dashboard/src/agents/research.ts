@@ -230,6 +230,14 @@ export interface CompanyDetail {
     website?: ProvenanceValue<string> | null;
     headquarters?: ProvenanceValue<{ city?: string; state?: string; country?: string }> | null;
     company_type?: ProvenanceValue<string> | null;
+    research_evidence?: Array<Record<string, unknown>>;
+    research_outcomes?: Record<string, {
+      status: "not_searched" | "searched_but_not_found" | "found_but_rejected" | "accepted_and_mapped";
+      criterion: string;
+      checked_at?: string;
+      reason?: string;
+      evidence_keys?: string[];
+    }>;
     employee_count: ProvenanceValue<number> | null;
     revenue: ProvenanceValue<string> | null;
     funding: ProvenanceValue<string> | null;

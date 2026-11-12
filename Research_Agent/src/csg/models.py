@@ -89,6 +89,8 @@ class Company(BaseModel):
     revenue: Optional[ProvenanceValue] = None
     funding: Optional[ProvenanceValue] = None
     classification_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    research_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    research_outcomes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     description: Optional[str] = None
     region: Optional[str] = None
     industry: Optional[str] = None

@@ -144,6 +144,25 @@ def test_coalesce_preserves_prior_research(conn):
     assert got.ats_provider == "lever"
 
 
+def test_empty_reassessment_preserves_evidence_and_outcomes(conn):
+    evidence = [{
+        "evidence_key": "stable-key", "field": "services", "criterion": "company_services",
+        "claim": {"services": "implementation"}, "source_url": "https://acme.com/services",
+        "source_name": "Services", "excerpt": "We implement software.",
+        "evidence_type": "direct", "confidence": "high",
+    }]
+    outcomes = {"services": {"status": "accepted_and_mapped", "criterion": "company_services"}}
+    db.upsert_company(conn, Company(
+        domain="acme.com", research_evidence=evidence, research_outcomes=outcomes,
+    ))
+    db.upsert_company(conn, Company(domain="acme.com", ats_provider="lever"))
+
+    refreshed = db.get_company(conn, "acme.com")
+    assert refreshed is not None
+    assert refreshed.research_evidence == evidence
+    assert refreshed.research_outcomes == outcomes
+
+
 def test_posting_classification_survives_the_round_trip(conn):
     """The bug: pipeline set these, saved, re-read -- and got None back, so the
     CSG Delivery Fit dimension scored zero for every company."""

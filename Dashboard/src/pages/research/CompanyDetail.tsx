@@ -170,7 +170,7 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
         </button>
       </div>
 
-      <ResearchAssessmentPanel assessment={detail.research_assessment} />
+      <ResearchAssessmentPanel assessment={detail.research_assessment} outcomes={company.research_outcomes} />
 
       <div className="detail-grid">
         <div className="card">

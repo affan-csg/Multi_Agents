@@ -8,7 +8,7 @@ from typing import Any
 from csg import contacts, db, discover, pipeline
 from csg.models import Company, JobPosting, ProvenanceValue, ScoreResult
 from csg.research_assessment import ResearchAssessmentInput, build_assessment, derive_readiness
-from csg.research_assessment_generation import generate_company_assessment
+from csg.research_assessment_generation import _assessment_payload, generate_company_assessment
 
 
 class FakeConn:
@@ -128,6 +128,43 @@ def test_scored_pipeline_automatically_creates_new_company_assessment(monkeypatc
     assert assessment.hiring_model_assessments[0].regional_hiring == "open"
     assert assessment.hiring_model_assessments[0].regional_hiring_evidence_status == "verified"
     assert saved_scores[0].tier == "A"
+
+
+def test_company_research_evidence_maps_without_bypassing_assessment_requirements():
+    conn = FakeConn()
+    source_url = "https://example.com/about"
+    conn.upsert("companies", [{
+        **_company_row(),
+        "research_evidence": [
+            {"evidence_key": "size-key", "field": "employee_range",
+             "criterion": "automatic_company_size", "claim": {"employee_range": "51-200"},
+             "source_url": source_url, "source_name": "Company profile", "excerpt": "51-200 employees",
+             "evidence_type": "direct", "confidence": "high", "retrieved_at": "2026-11-12T10:00:00Z"},
+            {"evidence_key": "leadership-key", "field": "leadership",
+             "criterion": "company_leadership", "claim": {"name": "A. Example", "title": "CEO"},
+             "source_url": source_url, "source_name": "About", "excerpt": "A. Example, CEO",
+             "evidence_type": "direct", "confidence": "high", "retrieved_at": "2026-11-12T10:00:00Z"},
+            {"evidence_key": "services-key", "field": "services",
+             "criterion": "company_services", "claim": {"services": "software implementation"},
+             "source_url": source_url, "source_name": "Services", "excerpt": "We implement software.",
+             "evidence_type": "direct", "confidence": "high", "retrieved_at": "2026-11-12T10:00:00Z"},
+            {"evidence_key": "fit-key", "field": "hiring_service_fit",
+             "criterion": "company_hiring_fit", "claim": {"hiring_signal": "roles listed"},
+             "source_url": source_url, "source_name": "Careers", "excerpt": "Open engineering positions",
+             "evidence_type": "direct", "confidence": "high", "retrieved_at": "2026-11-12T10:00:00Z"},
+        ],
+    }], on_conflict="domain")
+
+    company = db.get_company(conn, "example.com")
+    assert company is not None
+    assessment = _assessment_payload(conn, company)
+    mapped = {row.criterion for row in assessment.evidence}
+    criteria = {row.criterion: row.result for row in assessment.criteria_assessments}
+
+    assert {"automatic_company_size", "company_leadership", "company_services", "company_hiring_fit"} <= mapped
+    assert criteria["company_size"] == "met"
+    assert criteria["decision_maker"] == "unknown"
+    assert criteria["service_fit"] == "unknown"
 
 
 def test_pipeline_revalidates_cached_ats_and_excludes_unvalidated_posts_from_score(monkeypatch):

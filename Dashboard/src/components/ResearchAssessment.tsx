@@ -3,6 +3,7 @@ import type {
   CompanyResearchAssessment,
   CompanyResearchAssessmentSummary,
 } from "../agents/research";
+import type { CompanyDetail } from "../agents/research";
 import {
   ASSESSMENT_CATEGORIES,
   ASSESSMENT_HIRING_MODELS,
@@ -50,7 +51,25 @@ const CRITERIA: Array<[string, string]> = [
   ["service_fit", "Service fit supported by evidence"],
 ];
 
-export function ResearchAssessmentPanel({ assessment }: { assessment: CompanyResearchAssessment | null | undefined }) {
+const RESEARCH_FIELDS: Array<[string, string]> = [
+  ["official_website", "Official website"],
+  ["headquarters", "Headquarters"],
+  ["employee_range", "Employee range"],
+  ["company_classification", "Company classification"],
+  ["leadership", "Leadership"],
+  ["services", "Services"],
+  ["hiring_service_fit", "Hiring and service fit"],
+];
+
+type ResearchOutcomes = NonNullable<CompanyDetail["company"]["research_outcomes"]>;
+
+export function ResearchAssessmentPanel({
+  assessment,
+  outcomes,
+}: {
+  assessment: CompanyResearchAssessment | null | undefined;
+  outcomes?: ResearchOutcomes;
+}) {
   if (!assessment) {
     return (
       <section className="card research-assessment" aria-label="Company research assessment">
@@ -125,6 +144,23 @@ export function ResearchAssessmentPanel({ assessment }: { assessment: CompanyRes
           })}
         </ul>
       </div>
+
+      {outcomes && Object.keys(outcomes).length > 0 && (
+        <div className="assessment-block">
+          <h4>Field research outcomes</h4>
+          <ul className="assessment-criteria">
+            {RESEARCH_FIELDS.map(([field, label]) => {
+              const outcome = outcomes[field];
+              if (!outcome) return null;
+              return <li key={field}>
+                <span>{label}</span>
+                <strong>{formatAssessmentValue(outcome.status)}</strong>
+                {outcome.reason && <small>{outcome.reason}</small>}
+              </li>;
+            })}
+          </ul>
+        </div>
+      )}
 
       <div className="assessment-block">
         <h4>Evidence records</h4>

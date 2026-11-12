@@ -214,7 +214,8 @@ def delete_run(conn: SupabaseConn, run_id: str) -> int:
 # --- companies ---------------------------------------------------------------
 
 _COALESCE_FIELDS = (
-    "name", "website", "headquarters", "company_type", "employee_count", "revenue", "funding", "classification_evidence", "description", "region",
+    "name", "website", "headquarters", "company_type", "employee_count", "revenue", "funding",
+    "classification_evidence", "research_evidence", "research_outcomes", "description", "region",
     "industry", "hq_state",
     "ats_provider", "ats_token", "ats_detected_by", "careers_url",
     "job_discovery_method", "job_source", "hiring_signal", "job_discovery_notes",
@@ -250,7 +251,8 @@ def upsert_company(conn: SupabaseConn, c: Company) -> None:
     incoming = c.model_dump(mode="json")
     for field in _COALESCE_FIELDS:
         value = incoming.get(field)
-        if value is None and existing is not None:
+        preserve_empty = field in {"classification_evidence", "research_evidence", "research_outcomes"}
+        if (value is None or (preserve_empty and not value)) and existing is not None:
             prior_value = getattr(existing, field)
             if field in _PROVENANCE_FIELDS and prior_value is not None:
                 prior_value = prior_value.model_dump(mode="json")
@@ -258,16 +260,18 @@ def upsert_company(conn: SupabaseConn, c: Company) -> None:
         row[field] = value
 
     _PENDING_CLASSIFICATION_EVIDENCE[c.domain] = c.classification_evidence
-    try:
-        conn.upsert("companies", [row], on_conflict="domain")
-    except SupabaseError as exc:
-        # Older Supabase projects may not have migration 007 yet. Preserve
-        # the company row and let the versioned assessment store authoritative
-        # category evidence until that additive column is applied.
-        if "classification_evidence" not in str(exc):
-            raise
-        row.pop("classification_evidence", None)
-        conn.upsert("companies", [row], on_conflict="domain")
+    optional_fields = ("classification_evidence", "research_evidence", "research_outcomes")
+    for _ in range(len(optional_fields) + 1):
+        try:
+            conn.upsert("companies", [row], on_conflict="domain")
+            break
+        except SupabaseError as exc:
+            # Older Supabase projects may not have applied the additive JSONB
+            # evidence migrations yet. Keep core company updates working there.
+            missing_field = next((field for field in optional_fields if field in str(exc)), None)
+            if missing_field is None or missing_field not in row:
+                raise
+            row.pop(missing_field)
 
 
 def claim_company(conn: SupabaseConn, c: Company) -> bool:
@@ -283,7 +287,10 @@ def claim_company(conn: SupabaseConn, c: Company) -> bool:
     }
     incoming = c.model_dump(mode="json")
     for field in _COALESCE_FIELDS:
-        row[field] = incoming.get(field)
+        value = incoming.get(field)
+        if field in {"classification_evidence", "research_evidence", "research_outcomes"} and not value:
+            value = None
+        row[field] = value
     return bool(conn.insert_if_absent("companies", [row], on_conflict="domain"))
 
 
@@ -305,6 +312,8 @@ def _row_to_company(row: dict[str, Any]) -> Company:
         revenue=row.get("revenue"), funding=row.get("funding"),
         classification_evidence=(row.get("classification_evidence")
                      or _PENDING_CLASSIFICATION_EVIDENCE.get(row["domain"], [])),
+        research_evidence=row.get("research_evidence") or [],
+        research_outcomes=row.get("research_outcomes") or {},
         description=row.get("description"), region=row.get("region"),
         industry=row.get("industry"), hq_state=row.get("hq_state"),
         ats_provider=row.get("ats_provider"), ats_token=row.get("ats_token"),

@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS companies (
     revenue         JSONB,         -- provenance envelope (see above)
     funding         JSONB,         -- provenance envelope (see above)
     classification_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
+    research_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
+    research_outcomes JSONB NOT NULL DEFAULT '{}'::jsonb,
     description     TEXT,
     region          TEXT,          -- discovery region, e.g. 'GA', 'East Coast'
     industry        TEXT,

@@ -137,6 +137,42 @@ def _classification_evidence(company: Company) -> list[CompanyEvidence]:
     return rows
 
 
+def _company_research_evidence(company: Company) -> list[CompanyEvidence]:
+    rows: list[CompanyEvidence] = []
+    valid_criteria = {
+        "automatic_website", "automatic_headquarters", "automatic_company_size",
+        "automatic_company_type", "company_leadership", "company_services",
+        "company_hiring_fit",
+    }
+    for item in company.research_evidence:
+        if not isinstance(item, dict):
+            continue
+        criterion = str(item.get("criterion") or "")
+        source_url = item.get("source_url")
+        claim = item.get("claim")
+        if criterion not in valid_criteria or not _has_url(source_url) or not isinstance(claim, dict) or not claim:
+            continue
+        evidence_type = str(item.get("evidence_type") or "inferred").lower()
+        status = "verified" if evidence_type == "direct" else "inferred"
+        rows.append(CompanyEvidence(
+            evidence_id=_stable_id("company_research", item.get("evidence_key") or {
+                "domain": company.domain, "criterion": criterion, "claim": claim,
+                "source_url": source_url,
+            }),
+            criterion=criterion,
+            subject=str(item.get("field") or "company research"),
+            claim=claim,
+            evidence_status=status,
+            confidence=item.get("confidence", "medium"),
+            source_name=str(item.get("source_name") or source_url),
+            source_type=_source_type(source_url, company.domain),
+            source_url=source_url,
+            retrieved_at=item.get("retrieved_at"),
+            excerpt=str(item.get("excerpt") or "") or None,
+        ))
+    return rows
+
+
 def _posting_source(posting: JobPosting) -> tuple[str, str, str]:
     validation = posting.raw.get("_csg_validation") or {}
     if validation.get("ownership") == "verified":
@@ -450,6 +486,8 @@ def _assessment_payload(
         if row:
             evidence[row.evidence_id] = row
     for row in _classification_evidence(company):
+        evidence[row.evidence_id] = row
+    for row in _company_research_evidence(company):
         evidence[row.evidence_id] = row
     employee_fact = company.employee_count
     if employee_fact and isinstance(employee_fact.value, int) and employee_fact.value > 500 and employee_fact.url:
