@@ -1325,9 +1325,6 @@ def list_contacts(run_id: str) -> list[dict[str, Any]]:
 
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict[str, Any]:
-    job = _JOBS.get(job_id)
-    if job:
-        return job.snapshot()
     conn = db.connect()
     try:
         row = jobs.get(conn, job_id)
@@ -1344,35 +1341,34 @@ def job_status(job_id: str) -> dict[str, Any]:
 @app.websocket("/jobs/{job_id}/ws")
 async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
     await websocket.accept()
-    job = _JOBS.get(job_id)
-    if not job:
-        conn = db.connect()
-        try:
-            row = jobs.get(conn, job_id)
-        finally:
-            conn.close()
-        if not row:
-            await websocket.close(code=4404)
-            return
-        while True:
-            snap = job_status(job_id)
-            await websocket.send_text(json.dumps(snap))
-            if snap["status"] in ("done", "error"):
-                return
-            await asyncio.sleep(1)
+    try:
+        last_snapshot = await asyncio.to_thread(job_status, job_id)
+    except HTTPException:
+        await websocket.close(code=4404)
+        return
 
+    job = _JOBS.get(job_id)
     queue: asyncio.Queue = asyncio.Queue()
-    job.subscribers.append(queue)
+    if job is not None:
+        job.subscribers.append(queue)
 
     try:
-        await websocket.send_text(json.dumps(job.snapshot()))
+        await websocket.send_text(json.dumps(last_snapshot))
+        if last_snapshot["status"] in ("done", "error"):
+            return
         while True:
-            snap = await queue.get()
+            try:
+                snap = await asyncio.wait_for(queue.get(), timeout=1)
+            except asyncio.TimeoutError:
+                snap = await asyncio.to_thread(job_status, job_id)
+            if snap == last_snapshot:
+                continue
+            last_snapshot = snap
             await websocket.send_text(json.dumps(snap))
             if snap["status"] in ("done", "error"):
                 break
     except WebSocketDisconnect:
         pass
     finally:
-        if queue in job.subscribers:
+        if job is not None and queue in job.subscribers:
             job.subscribers.remove(queue)

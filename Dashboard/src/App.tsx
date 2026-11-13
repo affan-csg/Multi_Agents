@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useCachedFetch, invalidate, patchPrefix } from "./hooks/useCachedFetch";
 import {
   researchApi,
@@ -37,6 +37,7 @@ import { Calendly } from "./pages/outreach/Calendly";
 import { Analytics as OutreachAnalytics } from "./pages/outreach/Analytics";
 import { Learning as OutreachLearning } from "./pages/outreach/Learning";
 import { useRoute } from "./router";
+import { getStoredActiveResearchJobId, JobMonitor } from "./jobMonitor";
 import "./App.css";
 
 type PendingAction = { kind: "qualify" | "contacts"; domains?: string[] };
@@ -60,6 +61,7 @@ function App() {
   const [scopeCampaign, setScopeCampaign] = useState<string | "all">("all");
 
   const [activeJob, setActiveJob] = useState<ResearchJobSnapshot | null>(null);
+  const jobMonitorRef = useRef<JobMonitor | null>(null);
   const [scopeRun, setScopeRun] = useState<string | "all">("all");
   const runId = scopeRun === "all" ? "all" : scopeRun;
   const actionRunId = scopeRun === "all" ? (runs[0]?.run_id ?? null) : scopeRun;
@@ -258,10 +260,10 @@ function App() {
   }
 
   const watchJob = useCallback((jobId: string) => {
-    const ws = researchApi.jobSocket(jobId, (snap) => {
+    jobMonitorRef.current?.stop();
+    const monitor = new JobMonitor(jobId, researchApi, (snap) => {
       setActiveJob(snap);
       if (snap.status === "done" || snap.status === "error") {
-        ws.close();
         if (snap.run_id && snap.kind === "discover") setScopeRun(snap.run_id);
         researchApi.listRuns().then(setRuns).catch(() => {});
         // discover/qualify/contacts all change data the cache is holding
@@ -292,8 +294,29 @@ function App() {
           setActiveJob((current) => (current?.job_id === jobId ? null : current));
         }, 5000);
       }
-    });
+    }, window.localStorage);
+    jobMonitorRef.current = monitor;
+    monitor.start();
   }, [pushToast]);
+
+  useEffect(() => {
+    const jobId = getStoredActiveResearchJobId(window.localStorage);
+    if (jobId) {
+      setActiveJob({
+        job_id: jobId,
+        kind: "discover",
+        run_id: null,
+        status: "pending",
+        done: 0,
+        total: 0,
+        current_domain: null,
+        result: null,
+        error: null,
+      });
+      watchJob(jobId);
+    }
+    return () => jobMonitorRef.current?.stop();
+  }, [watchJob]);
 
   async function handleDiscover(req: DiscoverRequest) {
     setRunError(null);

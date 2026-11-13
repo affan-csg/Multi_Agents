@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
+import json
 import threading
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -86,6 +88,85 @@ def test_claim_does_not_reclaim_unexpired_running_job():
 
     assert jobs.claim(FakeConn(row), "job-2", "worker-b") is False
     assert row["worker_id"] == "worker-a"
+
+
+def test_concurrent_recovery_claims_allow_only_one_worker():
+    now = utcnow()
+    row = {
+        "job_id": "job-claim-race", "status": "pending", "worker_id": None,
+        "lease_until": None, "updated_at": now.isoformat(),
+    }
+    conn = FakeConn(row)
+    barrier = threading.Barrier(2)
+
+    def claim(worker_id):
+        barrier.wait()
+        return jobs.claim(conn, "job-claim-race", worker_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, ["worker-a", "worker-b"]))
+
+    assert sorted(results) == [False, True]
+    assert row["worker_id"] in ("worker-a", "worker-b")
+    assert datetime.fromisoformat(row["lease_until"]) > utcnow()
+
+
+def test_job_status_uses_persisted_state_instead_of_local_snapshot(monkeypatch):
+    row = {
+        "job_id": "job-authoritative", "kind": "discover", "run_id": "run-1",
+        "status": "done", "done": 3, "total": 3, "current_domain": None,
+        "result": {"scored": 3}, "error": None,
+    }
+
+    class StatusConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(api.db, "connect", lambda: StatusConn())
+    monkeypatch.setattr(api.jobs, "get", lambda _conn, _job_id: row)
+    local_job = api.Job(job_id="job-authoritative", kind="discover", status="running", done=1, total=3)
+    monkeypatch.setattr(api, "_JOBS", {"job-authoritative": local_job})
+
+    assert api.job_status("job-authoritative") == {
+        "job_id": "job-authoritative", "kind": "discover", "run_id": "run-1",
+        "status": "done", "done": 3, "total": 3, "current_domain": None,
+        "result": {"scored": 3}, "error": None,
+    }
+
+
+def test_open_websocket_resyncs_terminal_state_after_local_worker_is_stale(monkeypatch):
+    row = {
+        "job_id": "job-ws", "kind": "discover", "run_id": "run-1",
+        "status": "running", "done": 1, "total": 2, "current_domain": "a.example",
+        "result": None, "error": None,
+    }
+
+    class StatusConn:
+        def close(self):
+            pass
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, message):
+            self.messages.append(message)
+            if len(self.messages) == 1:
+                row.update(status="done", done=2, current_domain=None, result={"scored": 2})
+
+    monkeypatch.setattr(api.db, "connect", lambda: StatusConn())
+    monkeypatch.setattr(api.jobs, "get", lambda _conn, _job_id: row)
+    monkeypatch.setattr(api, "_JOBS", {
+        "job-ws": api.Job(job_id="job-ws", kind="discover", status="running", done=1, total=2),
+    })
+    websocket = FakeWebSocket()
+
+    asyncio.run(api.job_progress_ws(websocket, "job-ws"))
+
+    assert [json.loads(message)["status"] for message in websocket.messages] == ["running", "done"]
 
 
 def test_running_job_update_renews_only_the_owning_workers_lease():
