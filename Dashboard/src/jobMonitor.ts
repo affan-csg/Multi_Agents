@@ -23,7 +23,8 @@ type JobMonitorOptions = {
   clearIntervalFn?: typeof window.clearInterval;
 };
 
-const isTerminal = (status: JobSnapshot["status"]) => status === "done" || status === "error";
+const isTerminal = (status: JobSnapshot["status"]) =>
+  status === "done" || status === "error" || status === "cancelled";
 
 export class JobMonitor {
   private socket: WebSocket | null = null;

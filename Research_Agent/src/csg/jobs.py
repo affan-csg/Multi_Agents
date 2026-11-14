@@ -64,6 +64,18 @@ def get(conn: SupabaseConn, job_id: str) -> Optional[dict[str, Any]]:
     return rows[0] if rows else None
 
 
+def owns(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
+    row = get(conn, job_id)
+    if not row or row.get("status") != "running" or row.get("worker_id") != worker_id:
+        return False
+    lease_until = row.get("lease_until")
+    if not lease_until:
+        return False
+    if isinstance(lease_until, str):
+        lease_until = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+    return lease_until > utcnow()
+
+
 def recoverable(conn: SupabaseConn, limit: int = 50) -> list[dict[str, Any]]:
     now = utcnow()
     pending = conn.select(
@@ -97,6 +109,24 @@ def claim(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
         TABLE,
         payload,
         job_id=f"eq.{job_id}", status="eq.running", lease_until=f"lt.{_iso(now)}",
+    )
+    return bool(rows)
+
+
+def cancel(conn: SupabaseConn, job_id: str) -> bool:
+    """Atomically cancel a job that has not already reached a terminal state."""
+    now = utcnow()
+    rows = conn.update_returning(
+        TABLE,
+        {
+            "status": "cancelled",
+            "error": "Cancelled by user.",
+            "finished_at": _iso(now),
+            "lease_until": None,
+            "updated_at": _iso(now),
+        },
+        job_id=f"eq.{job_id}",
+        status="in.(pending,running)",
     )
     return bool(rows)
 

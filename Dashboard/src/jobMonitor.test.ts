@@ -182,4 +182,26 @@ describe("JobMonitor", () => {
     expect(jobSocket).toHaveBeenCalledTimes(socketsAtTerminal);
     expect(storage.getItem(ACTIVE_RESEARCH_JOB_KEY)).toBeNull();
   });
+
+  it("treats cancelled jobs as terminal and clears any stored active job", async () => {
+    vi.useFakeTimers();
+    const jobStatus = vi.fn().mockResolvedValue(snapshot("cancelled"));
+    const jobSocket = vi.fn();
+    const onSnapshot = vi.fn();
+    const storage = new MemoryStorage();
+    storage.setItem(ACTIVE_RESEARCH_JOB_KEY, "job-1");
+
+    const monitor = new JobMonitor("job-1", { jobStatus, jobSocket }, onSnapshot, storage, {
+      pollIntervalMs: 200,
+      reconnectBaseMs: 100,
+      reconnectMaxMs: 400,
+    });
+
+    monitor.start();
+    await flushPromises();
+
+    expect(onSnapshot).toHaveBeenCalledWith(expect.objectContaining({ status: "cancelled" }));
+    expect(storage.getItem(ACTIVE_RESEARCH_JOB_KEY)).toBeNull();
+    expect(jobSocket).not.toHaveBeenCalled();
+  });
 });

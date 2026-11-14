@@ -564,6 +564,7 @@ async def resume_stalled(
     on_progress: Optional[ProgressFn] = None,
     checkpoint_load: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
     checkpoint_save: Optional[Callable[[str, str, dict[str, Any]], bool]] = None,
+    ensure_owned: Optional[Callable[[], None]] = None,
 ) -> DiscoveryStats:
     """Continue a run for the companies that stalled last time -- scored 0
     with no ATS board and no firmographics, the signature of every provider
@@ -587,6 +588,8 @@ async def resume_stalled(
     owns_conn = conn is None
     conn = conn or db.connect()
     try:
+        if ensure_owned:
+            ensure_owned()
         fetched = [(d, db.get_company(conn, d)) for d in domains]
         missing = [d for d, c in fetched if c is None]
         companies = [c for _, c in fetched if c is not None]
@@ -606,6 +609,8 @@ async def resume_stalled(
         todo = []
         failed: dict[str, str] = {}
         for index, company in enumerate(companies):
+            if ensure_owned:
+                ensure_owned()
             checkpoint = checkpoint_load(f"enrich:{company.domain}") if checkpoint_load else None
             if checkpoint and checkpoint.get("status") in ("done", "failed"):
                 saved = checkpoint.get("payload") or {}
@@ -641,6 +646,8 @@ async def resume_stalled(
                         else enrich_company_firmographics(company)
                     )
                     reason = await asyncio.wait_for(enrichment, timeout=ENRICH_TIMEOUT_SECONDS)
+                    if ensure_owned:
+                        ensure_owned()
                     if reason:
                         failures[reason] = failures.get(reason, 0) + 1
                     checkpoint_status = "failed" if reason else "done"
@@ -674,6 +681,8 @@ async def resume_stalled(
 
         if todo:
             await asyncio.gather(*(one(c) for c in todo))
+        if ensure_owned:
+            ensure_owned()
         for reason in failed.values():
             failures[reason] = failures.get(reason, 0) + 1
         stats.enriched = len(companies) - len(todo) - sum(failures.values())
@@ -692,6 +701,7 @@ async def resume_stalled(
         stats.pipeline = await pipeline.run(
             cfg, companies, conn, rid,
             on_progress=pipeline_progress,
+            ensure_owned=ensure_owned,
         )
 
         stats.exports = {

@@ -61,6 +61,7 @@ function App() {
   const [scopeCampaign, setScopeCampaign] = useState<string | "all">("all");
 
   const [activeJob, setActiveJob] = useState<ResearchJobSnapshot | null>(null);
+  const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
   const jobMonitorRef = useRef<JobMonitor | null>(null);
   const [scopeRun, setScopeRun] = useState<string | "all">("all");
   const runId = scopeRun === "all" ? "all" : scopeRun;
@@ -263,7 +264,8 @@ function App() {
     jobMonitorRef.current?.stop();
     const monitor = new JobMonitor(jobId, researchApi, (snap) => {
       setActiveJob(snap);
-      if (snap.status === "done" || snap.status === "error") {
+      if (snap.status === "done" || snap.status === "error" || snap.status === "cancelled") {
+        setCancellingJobId((current) => current === jobId ? null : current);
         if (snap.run_id && snap.kind === "discover") setScopeRun(snap.run_id);
         researchApi.listRuns().then(setRuns).catch(() => {});
         // discover/qualify/contacts all change data the cache is holding
@@ -281,6 +283,9 @@ function App() {
           const message = snap.error || "Failed for an unknown reason.";
           setRunError(message);
           pushToast({ tone: "error", title: `${label} failed`, message });
+        } else if (snap.status === "cancelled") {
+          setRunError(null);
+          pushToast({ tone: "success", title: `${label} cancelled`, message: "Progress and results saved before cancellation remain available." });
         } else if (snap.kind === "discover") {
           const { tone, message } = describeDiscoverResult(snap.result);
           setRunError(null);
@@ -341,6 +346,19 @@ function App() {
       const message = e instanceof Error ? e.message : String(e);
       setRunError(message);
       pushToast({ tone: "error", title: "Couldn't start research run", message });
+    }
+  }
+
+  async function handleCancelResearch() {
+    const jobId = activeJob?.job_id;
+    if (!jobId || activeJob?.kind !== "discover" || cancellingJobId === jobId) return;
+    setCancellingJobId(jobId);
+    try {
+      await researchApi.cancelJob(jobId);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setCancellingJobId(null);
+      pushToast({ tone: "error", title: "Couldn't cancel research", message });
     }
   }
 
@@ -455,6 +473,8 @@ function App() {
           <RunConfig
             regions={regions}
             onDiscover={handleDiscover}
+            onCancel={handleCancelResearch}
+            cancelling={cancellingJobId === activeJob?.job_id}
             activeJob={activeJob}
             error={runError}
             resetKey={runFormResetKey}

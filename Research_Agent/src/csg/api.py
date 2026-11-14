@@ -183,6 +183,17 @@ def _ensure_job_owned(job: Job) -> None:
         raise asyncio.CancelledError("Research job ownership was lost")
 
 
+def _ensure_durable_job_owned(job: Job, worker_id: str, conn: db.SupabaseConn) -> None:
+    if job.ownership_lost.is_set():
+        raise asyncio.CancelledError("Research job ownership was lost")
+    if jobs.owns(conn, job.job_id, worker_id):
+        return
+    job.ownership_lost.set()
+    row = jobs.get(conn, job.job_id)
+    message = "Research job was cancelled" if row and row.get("status") == "cancelled" else "Research job ownership was lost"
+    raise asyncio.CancelledError(message)
+
+
 def _new_job(kind: str, run_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,
              idempotency_key: Optional[str] = None, total: int = 0) -> Job:
     conn = db.connect()
@@ -295,20 +306,24 @@ def _run_discover_job(job: Job, req: DiscoverRequest) -> None:
             return jobs.save_checkpoint(conn, job.job_id, worker_id, key, status=status, payload=payload)
 
         def progress(stage: str, done: int, total: int, detail: str) -> None:
-            job.publish(
+            _ensure_durable_job_owned(job, worker_id, conn)
+            if not job.publish(
                 worker_id, done=done, total=total or req.limit,
                 current_domain=f"{stage}: {detail}",
-            )
+            ):
+                _ensure_durable_job_owned(job, worker_id, conn)
 
         stats = asyncio.run(discover_mod.run_discovery(
             cfg, region=req.region, limit=req.limit, conn=conn, run_id=job.run_id,
             label=req.label, use_cache=req.use_cache, on_progress=progress,
             auto_qualify_top=req.auto_qualify_top,
             checkpoint_load=load_checkpoint, checkpoint_save=save_checkpoint,
+            ensure_owned=lambda: _ensure_durable_job_owned(job, worker_id, conn),
         ))
         job.publish(worker_id, run_id=stats.run_id, status="done", result=stats.as_dict())
     except asyncio.CancelledError:
-        job.publish(worker_id, status="error", error="Research job was cancelled and can be retried.")
+        if not job.ownership_lost.is_set():
+            job.publish(worker_id, status="error", error="Research job was cancelled and can be retried.")
     except DiscoveryError as exc:
         job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
@@ -363,18 +378,22 @@ def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
             return jobs.save_checkpoint(conn, job.job_id, worker_id, key, status=status, payload=payload)
 
         def progress(stage: str, done: int, total: int, detail: str) -> None:
-            job.publish(
+            _ensure_durable_job_owned(job, worker_id, conn)
+            if not job.publish(
                 worker_id, done=done, total=total or len(domains),
                 current_domain=f"{stage}: {detail}",
-            )
+            ):
+                _ensure_durable_job_owned(job, worker_id, conn)
 
         stats = asyncio.run(discover_mod.resume_stalled(
             cfg, run_id, domains, conn=conn, on_progress=progress,
             checkpoint_load=load_checkpoint, checkpoint_save=save_checkpoint,
+            ensure_owned=lambda: _ensure_durable_job_owned(job, worker_id, conn),
         ))
         job.publish(worker_id, run_id=stats.run_id, status="done", result=stats.as_dict())
     except asyncio.CancelledError:
-        job.publish(worker_id, status="error", error="Research job was cancelled and can be retried.")
+        if not job.ownership_lost.is_set():
+            job.publish(worker_id, status="error", error="Research job was cancelled and can be retried.")
     except DiscoveryError as exc:
         job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
@@ -1323,6 +1342,15 @@ def list_contacts(run_id: str) -> list[dict[str, Any]]:
 # job status + progress streaming
 # ----------------------------------------------------------------------------
 
+def _job_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": row["job_id"], "kind": row["kind"], "run_id": row.get("run_id"),
+        "status": row["status"], "done": row.get("done", 0), "total": row.get("total", 0),
+        "current_domain": row.get("current_domain"), "result": row.get("result"),
+        "error": row.get("error"),
+    }
+
+
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict[str, Any]:
     conn = db.connect()
@@ -1333,12 +1361,30 @@ def job_status(job_id: str) -> dict[str, Any]:
     if not row:
         log_event("job_status_missing", job_id=job_id, status="not_found")
         raise HTTPException(404, "job not found")
-    snap = {"job_id": row["job_id"], "kind": row["kind"], "run_id": row.get("run_id"),
-            "status": row["status"], "done": row.get("done", 0), "total": row.get("total", 0),
-            "current_domain": row.get("current_domain"), "result": row.get("result"),
-            "error": row.get("error")}
+    snap = _job_snapshot(row)
     log_event("job_status_read", **snap, worker_id=row.get("worker_id"), lease_until=row.get("lease_until"), updated_at=row.get("updated_at"))
     return snap
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict[str, Any]:
+    conn = db.connect()
+    try:
+        row = jobs.get(conn, job_id)
+        if not row:
+            raise HTTPException(404, "job not found")
+        if row.get("kind") != "discover":
+            raise HTTPException(409, "Only research discovery jobs can be cancelled here")
+        if row.get("status") in ("pending", "running"):
+            jobs.cancel(conn, job_id)
+            row = jobs.get(conn, job_id)
+        if not row:
+            raise HTTPException(404, "job not found")
+        snapshot = _job_snapshot(row)
+        log_event("job_cancel_requested", **snapshot)
+        return snapshot
+    finally:
+        conn.close()
 
 
 @app.websocket("/jobs/{job_id}/ws")
@@ -1352,7 +1398,7 @@ async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
 
     try:
         await websocket.send_text(json.dumps(last_snapshot))
-        if last_snapshot["status"] in ("done", "error"):
+        if last_snapshot["status"] in ("done", "error", "cancelled"):
             return
         while True:
             await asyncio.sleep(1)
@@ -1361,7 +1407,7 @@ async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
                 continue
             last_snapshot = snap
             await websocket.send_text(json.dumps(snap))
-            if snap["status"] in ("done", "error"):
+            if snap["status"] in ("done", "error", "cancelled"):
                 break
     except WebSocketDisconnect:
         pass

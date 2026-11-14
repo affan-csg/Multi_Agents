@@ -18,13 +18,15 @@ interface Props {
   activeJob: JobSnapshot | null;
   error: string | null;
   onDiscover: (req: DiscoverRequest) => void;
+  onCancel: () => void;
+  cancelling: boolean;
   /** Bumped by the parent after a run completes successfully, so this form
    * clears back to defaults for the next run instead of showing stale
    * values from the one that just finished. */
   resetKey?: number;
 }
 
-export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: Props) {
+export function RunConfig({ regions, activeJob, error, onDiscover, onCancel, cancelling, resetKey }: Props) {
   const [label, setLabel] = useState("");
   const [region, setRegion] = useState<string | null>(null);
   const [limit, setLimit] = useState("100");
@@ -39,6 +41,7 @@ export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: P
   }, [resetKey]);
 
   const running = activeJob?.status === "running" || activeJob?.status === "pending";
+  const cancelled = activeJob?.status === "cancelled";
   const activeRegion = region ?? regions?.active ?? null;
   const selectedRegion = regions?.regions.find((r) => r.key === activeRegion) ?? null;
 
@@ -115,8 +118,8 @@ export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: P
             </span>
           </div>
           <span className={`status-pill status-pill--live${running ? " status-pill--glow" : ""}`}>
-            <Icon name={running ? "refresh" : "check"} size={12} className={running ? "icon-spin" : undefined} />
-            {running ? "Running…" : "Pipeline ready"}
+            <Icon name={running ? "refresh" : cancelled ? "close" : "check"} size={12} className={running ? "icon-spin" : undefined} />
+            {running ? "Running…" : cancelled ? "Cancelled" : "Pipeline ready"}
           </span>
         </div>
       </div>
@@ -326,10 +329,12 @@ export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: P
           <div className="summary-ready">
             <div className="summary-ready-title">
               <Icon name="sparkle" size={15} />
-              {running ? "Run in progress" : "Ready to run"}
+              {running ? "Run in progress" : cancelled ? "Research cancelled" : "Ready to run"}
             </div>
             <p>
-              {running
+              {cancelled
+                ? "Results saved before cancellation remain available to review."
+                : running
                 ? backendStage === "outreach"
                   // done/total here are the 2-step outreach hand-off (0/1, 1/2, 2/2),
                   // not discovery counts -- showing "1 of 2" would be more confusing
@@ -344,10 +349,17 @@ export function RunConfig({ regions, activeJob, error, onDiscover, resetKey }: P
             </p>
           </div>
 
-          <button type="button" className="mint" onClick={start} disabled={running}>
-            <Icon name="play" size={15} />
-            {running ? "Running…" : "Start discovery"}
-          </button>
+          {running && activeJob?.kind === "discover" ? (
+            <button type="button" className="danger" onClick={onCancel} disabled={cancelling}>
+              <Icon name="close" size={15} />
+              {cancelling ? "Cancelling…" : "Cancel research"}
+            </button>
+          ) : (
+            <button type="button" className="mint" onClick={start} disabled={running}>
+              <Icon name="play" size={15} />
+              {running ? "Running…" : "Start discovery"}
+            </button>
+          )}
 
           <p className="summary-footnote">
             <Icon name="info" size={13} />

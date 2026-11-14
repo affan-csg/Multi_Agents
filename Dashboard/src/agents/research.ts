@@ -86,7 +86,7 @@ export interface JobSnapshot {
   job_id: string;
   kind: "discover" | "qualify" | "contacts";
   run_id: string | null;
-  status: "pending" | "running" | "done" | "error";
+  status: "pending" | "running" | "done" | "error" | "cancelled";
   done: number;
   total: number;
   current_domain: string | null;
@@ -583,6 +583,9 @@ export const researchApi = {
   exportPdfUrl: (runId: string) => withToken(`${BASE}/runs/${runId}/export/pdf`),
 
   jobStatus: (jobId: string) => req<JobSnapshot>(`/jobs/${jobId}`),
+
+  cancelJob: (jobId: string) =>
+    req<JobSnapshot>(`/jobs/${jobId}/cancel`, { method: "POST" }),
 
   jobSocket: (jobId: string, onMessage: (s: JobSnapshot) => void): WebSocket => {
     const wsBase = BASE.replace(/^http/, "ws");

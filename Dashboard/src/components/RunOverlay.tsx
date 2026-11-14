@@ -3,7 +3,7 @@ import { Icon } from "./ui";
 export interface GenericJobSnapshot {
   job_id: string;
   kind: string;
-  status: "pending" | "running" | "done" | "error";
+  status: "pending" | "running" | "done" | "error" | "cancelled";
   done: number;
   total: number;
   current_domain: string | null;

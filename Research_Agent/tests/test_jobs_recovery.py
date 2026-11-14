@@ -101,6 +101,79 @@ def test_claim_does_not_reclaim_unexpired_running_job():
     assert row["worker_id"] == "worker-a"
 
 
+@pytest.mark.parametrize("status", ["pending", "running"])
+def test_cancel_transitions_active_job_to_terminal_and_clears_lease(status):
+    now = utcnow()
+    row = {
+        "job_id": "job-cancel", "status": status, "worker_id": "worker-a",
+        "lease_until": (now + timedelta(minutes=5)).isoformat(),
+    }
+
+    class CancelConn:
+        def update_returning(self, table, data, **filters):
+            if filters.get("job_id") != "eq.job-cancel" or filters.get("status") != "in.(pending,running)":
+                return []
+            if row["status"] not in ("pending", "running"):
+                return []
+            row.update(data)
+            return [row]
+
+    assert jobs.cancel(CancelConn(), "job-cancel")
+    assert row["status"] == "cancelled"
+    assert row["worker_id"] == "worker-a"
+    assert row["lease_until"] is None
+    assert row["finished_at"]
+    assert jobs.claim(FakeConn(row), "job-cancel", "worker-b") is False
+
+
+def test_cancel_does_not_overwrite_a_terminal_job():
+    row = {"job_id": "job-done", "status": "done"}
+
+    class CancelConn:
+        def update_returning(self, table, data, **filters):
+            return []
+
+    assert not jobs.cancel(CancelConn(), "job-done")
+    assert row["status"] == "done"
+
+
+def test_cancelled_job_is_no_longer_owned_by_worker():
+    row = {
+        "job_id": "job-cancelled", "status": "cancelled", "worker_id": "worker-a",
+        "lease_until": None,
+    }
+
+    assert not jobs.owns(FakeConn(row), "job-cancelled", "worker-a")
+
+
+def test_cancel_endpoint_returns_authoritative_cancelled_snapshot(monkeypatch):
+    row = {
+        "job_id": "job-cancel-api", "kind": "discover", "run_id": "run-1",
+        "status": "running", "done": 2, "total": 10, "current_domain": "pipeline: example.com",
+        "result": None, "error": None,
+    }
+
+    class CancelConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(api.db, "connect", lambda: CancelConn())
+    monkeypatch.setattr(api.jobs, "get", lambda _conn, _job_id: row)
+
+    def cancel(_conn, _job_id):
+        row.update(status="cancelled", error="Cancelled by user.")
+        return True
+
+    monkeypatch.setattr(api.jobs, "cancel", cancel)
+
+    assert api.cancel_job("job-cancel-api") == {
+        "job_id": "job-cancel-api", "kind": "discover", "run_id": "run-1",
+        "status": "cancelled", "done": 2, "total": 10,
+        "current_domain": "pipeline: example.com", "result": None,
+        "error": "Cancelled by user.",
+    }
+
+
 def test_concurrent_recovery_claims_allow_only_one_worker():
     now = utcnow()
     row = {
