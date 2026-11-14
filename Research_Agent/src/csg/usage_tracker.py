@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
+from .diagnostics import log_event
+
 _LOCK = threading.Lock()
 
 
@@ -117,6 +119,11 @@ def classify_error(exc: Exception) -> str:
     through to 'other', since misclassifying a failure must never itself
     break error handling.
     """
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    status_code = status_code or getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status_code == 432:
+        return "quota_exhausted"
     try:
         import httpx
         if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout)):
@@ -157,6 +164,19 @@ def _record_async(usage: _Usage, latency_ms: int) -> None:
         "total_tokens": usage.total_tokens,
         "created_at": _utc_now_iso(),
     }
+    log_event(
+        "provider_call",
+        provider=usage.provider,
+        call_kind=usage.call_kind,
+        run_id=usage.run_id,
+        domain=usage.domain,
+        success=usage.success,
+        status_code=usage.status_code,
+        error_kind=usage.error_kind,
+        retry_count=usage.retry_count,
+        latency_ms=latency_ms,
+        created_at=row["created_at"],
+    )
     # A daemon thread per call is deliberately simple (usage volume is low --
     # at most a few dozen calls per research run) rather than a shared queue/
     # worker: it guarantees this module can never block the caller waiting

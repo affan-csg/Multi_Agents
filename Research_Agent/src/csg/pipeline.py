@@ -81,11 +81,14 @@ class Stats:
 async def _process_one(
     fetcher: Fetcher, conn: SupabaseConn, cfg: Config, company: Company,
     stats: Stats, now: datetime, run_id: str, force: bool,
+    ensure_owned: Optional[Callable[[], None]] = None,
 ) -> None:
     # --- stage 1: detect ATS (unchanged -- cheap, cached, highest precision) ---
     # Stored tokens are hints only: the source page and owner token are
     # revalidated on every run before any board postings are admitted.
     ats_result: Optional[tuple] = await ats.detect(fetcher, company.domain, company.name)
+    if ensure_owned:
+        ensure_owned()
 
     if not ats_result:
         stats.no_ats += 1
@@ -94,6 +97,8 @@ async def _process_one(
     # discover_jobs() re-fetches ATS postings itself when ats_result is set, and
     # never lets one stage's failure abort the rest -- see jobs_discovery.py. ---
     job_result = await discover_jobs(fetcher, company, ats_result)
+    if ensure_owned:
+        ensure_owned()
 
     company.ats_provider = job_result.ats_provider
     company.ats_token = job_result.ats_token
@@ -123,6 +128,8 @@ async def _process_one(
             if validation:
                 validation["run_id"] = run_id
                 p.raw["_csg_validation"] = validation
+        if ensure_owned:
+            ensure_owned()
         db.upsert_postings(conn, postings)
         stats.reqs_fetched += len(postings)
     scoring_postings = [p for p in postings if db.is_validated_current_posting(p)]
@@ -135,6 +142,8 @@ async def _process_one(
     else:
         company.status = "ats_found"
 
+    if ensure_owned:
+        ensure_owned()
     db.upsert_company(conn, company)
     if ats_result is None:
         conn.update("companies", {
@@ -143,9 +152,13 @@ async def _process_one(
     conn.commit()
 
     refresh_company_assessment_safely(conn, company.domain, run_id)
+    if ensure_owned:
+        ensure_owned()
     # Re-read so first_seen (our own age fallback) is populated.
     # --- stages 3+4: filter and score ---
     result: ScoreResult = evaluate(cfg, company, scoring_postings, now)
+    if ensure_owned:
+        ensure_owned()
     db.save_score(conn, run_id, result)
 
     if result.disqualified:
@@ -168,6 +181,8 @@ async def _process_one(
     # in one run. It is a separate, serial, quota-aware stage:
     # contacts.discover_run(), invoked by `csg contacts` / the /contacts route.
 
+    if ensure_owned:
+        ensure_owned()
     conn.commit()
 
 
@@ -181,12 +196,20 @@ async def run(
     use_cache: bool = True,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     label: Optional[str] = None,
+    skip_scored: bool = False,
+    ensure_owned: Optional[Callable[[], None]] = None,
 ) -> Stats:
+    if ensure_owned:
+        ensure_owned()
     if limit:
         companies = companies[:limit]
 
     stats = Stats(companies=len(companies))
     suppressed = db.load_suppression(conn)
+    already_scored = (
+        {row["domain"] for row in conn.select("scores", run_id=f"eq.{run_id}", select="domain")}
+        if skip_scored else set()
+    )
     now = db.utcnow()
     h = cfg.http
 
@@ -194,6 +217,10 @@ async def run(
 
     work = []
     for c in companies:
+        if ensure_owned:
+            ensure_owned()
+        if c.domain in already_scored:
+            continue
         if c.domain in suppressed:
             c.status = "suppressed"
             db.upsert_company(conn, c)
@@ -201,6 +228,8 @@ async def run(
             continue
         db.upsert_company(conn, c)
         work.append(c)
+    if ensure_owned:
+        ensure_owned()
     conn.commit()
 
     async with Fetcher(
@@ -218,8 +247,13 @@ async def run(
             nonlocal done
             async with sem:
                 try:
-                    await _process_one(fetcher, conn, cfg, c, stats, now, run_id, force)
+                    await _process_one(
+                        fetcher, conn, cfg, c, stats, now, run_id, force,
+                        ensure_owned=ensure_owned,
+                    )
                 except Exception as exc:  # keep one bad domain from killing the run
+                    if ensure_owned:
+                        ensure_owned()
                     db.set_status(conn, c.domain, "error", f"{type(exc).__name__}: {exc}")
                     conn.commit()
                 done += 1

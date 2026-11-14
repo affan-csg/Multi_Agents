@@ -29,6 +29,17 @@ class FakeConn:
         if self.row.get("status") == "pending" and filters.get("status") == "eq.pending":
             self.row.update(data)
             return [self.row]
+        if filters.get("worker_id") and filters.get("status") == "eq.running":
+            if filters["worker_id"] != f"eq.{self.row.get('worker_id')}":
+                return []
+            lease_filter = filters.get("lease_until", "")
+            if not lease_filter.startswith("gt."):
+                return []
+            if datetime.fromisoformat(self.row["lease_until"]) <= datetime.fromisoformat(lease_filter[3:]):
+                return []
+            self.row.update(data)
+            self.updated.set()
+            return [self.row]
         if filters.get("worker_id") and not filters.get("status"):
             if filters["worker_id"] != f"eq.{self.row.get('worker_id')}":
                 return []
@@ -111,6 +122,41 @@ def test_concurrent_recovery_claims_allow_only_one_worker():
     assert datetime.fromisoformat(row["lease_until"]) > utcnow()
 
 
+def test_concurrent_job_creation_with_same_idempotency_key_returns_one_job():
+    class IdempotencyConn:
+        def __init__(self):
+            self.rows = []
+            self.lock = threading.Lock()
+            self.inserts_ready = threading.Barrier(2)
+
+        def select(self, table, **filters):
+            key = filters.get("idempotency_key", "")
+            return [dict(row) for row in self.rows if f"eq.{row.get('idempotency_key')}" == key]
+
+        def insert_if_absent(self, table, rows, on_conflict):
+            self.inserts_ready.wait()
+            with self.lock:
+                candidate = rows[0]
+                if any(row.get(on_conflict) == candidate.get(on_conflict) for row in self.rows):
+                    return []
+                self.rows.append(dict(candidate))
+                return [self.rows[-1]]
+
+    conn = IdempotencyConn()
+
+    def create_job():
+        return jobs.create(
+            conn, kind="discover", payload={"limit": 1}, idempotency_key="same-request",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: create_job(), range(2)))
+
+    assert results[0]["job_id"] == results[1]["job_id"]
+    assert sorted(result["_created"] for result in results) == [False, True]
+    assert len(conn.rows) == 1
+
+
 def test_job_status_uses_persisted_state_instead_of_local_snapshot(monkeypatch):
     row = {
         "job_id": "job-authoritative", "kind": "discover", "run_id": "run-1",
@@ -182,6 +228,31 @@ def test_running_job_update_renews_only_the_owning_workers_lease():
 
     jobs.update(conn, "job-lease", worker_id="worker-a", status="running")
     assert datetime.fromisoformat(row["lease_until"]) > now + timedelta(minutes=5)
+
+
+def test_expired_worker_cannot_mark_job_done():
+    now = utcnow()
+    row = {
+        "job_id": "job-expired-completion", "status": "running",
+        "worker_id": "worker-old", "lease_until": (now - timedelta(seconds=1)).isoformat(),
+    }
+
+    assert jobs.update(FakeConn(row), "job-expired-completion", "worker-old", status="done") is False
+    assert row["status"] == "running"
+
+
+def test_owned_retryable_job_is_requeued_with_a_persisted_delay():
+    now = utcnow()
+    row = {
+        "job_id": "job-handoff-retry", "status": "running",
+        "worker_id": "worker-a", "lease_until": (now + timedelta(minutes=5)).isoformat(),
+    }
+
+    assert jobs.requeue(FakeConn(row), "job-handoff-retry", "worker-a", delay_seconds=30)
+    assert row["status"] == "pending"
+    assert row["worker_id"] is None
+    assert row["lease_until"] is None
+    assert datetime.fromisoformat(row["updated_at"]) > now + timedelta(seconds=20)
 
 
 def test_discovery_heartbeat_thread_renews_the_persisted_job(monkeypatch):
@@ -283,39 +354,22 @@ def test_discovery_heartbeat_stops_when_worker_exits(monkeypatch, outcome):
         assert row["error"] == "Research job was cancelled and can be retried."
 
 
-def test_recovery_scan_dispatches_persisted_discovery(monkeypatch):
+def test_worker_dispatches_persisted_discovery(monkeypatch):
+    from csg import worker
+
     job_row = {
-        "job_id": "job-3", "kind": "discover", "status": "running",
+        "job_id": "job-3", "kind": "discover", "status": "running", "total": 4,
         "request_payload": {"region": "US", "limit": 4}, "run_id": None,
         "lease_until": (utcnow() - timedelta(minutes=5)).isoformat(),
     }
+    dispatched = []
+    monkeypatch.setattr(worker.research_api, "_run_discover_job", lambda *args: dispatched.append(args))
 
-    class ScanConn:
-        def select(self, table, **params):
-            if params.get("status") == "eq.running":
-                return [job_row]
-            return []
+    worker._dispatch(job_row)
 
-        def close(self):
-            pass
-
-    class CaptureLoop:
-        def __init__(self):
-            self.calls = []
-
-        def run_in_executor(self, executor, function, *args):
-            self.calls.append((function, args))
-
-    loop = CaptureLoop()
-    monkeypatch.setattr(api.db, "connect", lambda: ScanConn())
-    monkeypatch.setattr(api, "_MAIN_LOOP", loop)
-    monkeypatch.setattr(api, "_JOBS", {})
-
-    api._recover_jobs_once()
-
-    assert len(loop.calls) == 1
-    function, args = loop.calls[0]
-    assert function is api._run_discover_job
-    assert args[0].job_id == "job-3"
-    assert args[1].region == "US"
-    assert args[1].limit == 4
+    assert len(dispatched) == 1
+    job, request = dispatched[0]
+    assert job.job_id == "job-3"
+    assert job.total == 4
+    assert request.region == "US"
+    assert request.limit == 4

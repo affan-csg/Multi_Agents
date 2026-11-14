@@ -32,7 +32,9 @@ DEFAULT_LIMIT = 5
 
 
 class ContactDiscoveryError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, error_kind: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
 
 
 def _api_key() -> str:
@@ -81,7 +83,8 @@ async def _search(domain: str, api_key: str, limit: int, department: Optional[st
             # rate_limited (contrast with Tavily/Groq's per-minute 429s).
             u.mark_failure(status_code=429, error_kind="quota_exhausted")
             raise ContactDiscoveryError(
-                f"Hunter.io rate/quota limit hit for {domain}: {resp.json().get('errors', resp.text)}"
+                f"Hunter.io rate/quota limit hit for {domain}: {resp.json().get('errors', resp.text)}",
+                error_kind="quota_exhausted",
             )
         resp.raise_for_status()
         u.status_code = resp.status_code
@@ -117,6 +120,9 @@ async def discover_run(
     limit_per_domain: int = DEFAULT_LIMIT,
     force: bool = False,
     on_progress: Optional[Any] = None,
+    checkpoint_load: Optional[Any] = None,
+    checkpoint_save: Optional[Any] = None,
+    ensure_owned: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Look up contacts for each domain not already in the `contacts` table
     (unless `force`). Serial by design -- Hunter's monthly quota is too tight
@@ -136,25 +142,77 @@ async def discover_run(
     }
 
     for i, domain in enumerate(pending):
+        if ensure_owned:
+            ensure_owned()
+        checkpoint_key = f"contacts:{domain}"
+        checkpoint = checkpoint_load(checkpoint_key) if checkpoint_load else None
+        if checkpoint and checkpoint.get("status") in ("done", "failed"):
+            saved = checkpoint.get("payload") or {}
+            if checkpoint.get("status") == "done":
+                stats["skipped"] += 1
+            else:
+                stats["errors"] += 1
+                reason = saved.get("reason", "previous contact search failed")
+                stats["error_details"][domain] = reason
+                if saved.get("error_kind") == "quota_exhausted" or "quota" in reason.lower():
+                    if on_progress:
+                        on_progress(i + 1, len(pending), domain)
+                    break
+            if on_progress:
+                on_progress(i + 1, len(pending), domain)
+            continue
+        if checkpoint and checkpoint.get("status") == "started":
+            reason = "contact search was interrupted; not replayed to avoid a duplicate provider charge"
+            if checkpoint_save and not checkpoint_save(checkpoint_key, "failed", {"reason": reason}):
+                raise asyncio.CancelledError()
+            stats["errors"] += 1
+            stats["error_details"][domain] = reason
+            if on_progress:
+                on_progress(i + 1, len(pending), domain)
+            continue
+        if checkpoint_save and not checkpoint_save(checkpoint_key, "started", {}):
+            raise asyncio.CancelledError()
         try:
             contacts = await find_contacts(domain, limit=limit_per_domain)
+            if ensure_owned:
+                ensure_owned()
             n = db.save_contacts(conn, domain, contacts, source="hunter")
             conn.commit()
+            if checkpoint_save and not checkpoint_save(
+                checkpoint_key, "done", {"contacts_saved": n, "result_count": len(contacts)},
+            ):
+                raise asyncio.CancelledError()
             stats["found"] += 1
             stats["contacts_saved"] += n
         except ContactDiscoveryError as exc:
             stats["errors"] += 1
             stats["error_details"][domain] = str(exc)
+            if checkpoint_save and not checkpoint_save(checkpoint_key, "failed", {
+                "reason": str(exc), "error_kind": exc.error_kind,
+            }):
+                raise asyncio.CancelledError()
             if on_progress:
                 on_progress(i + 1, len(pending), domain)
             break  # quota errors won't clear mid-run; stop burning attempts
         except httpx.HTTPStatusError as exc:
             stats["errors"] += 1
             stats["error_details"][domain] = f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"
+            if checkpoint_save and not checkpoint_save(
+                checkpoint_key, "failed", {"reason": stats["error_details"][domain]},
+            ):
+                raise asyncio.CancelledError()
+        except Exception as exc:
+            if checkpoint_save and not checkpoint_save(
+                checkpoint_key, "failed", {"reason": f"{type(exc).__name__}: {exc}"},
+            ):
+                raise asyncio.CancelledError()
+            raise
         if on_progress:
             on_progress(i + 1, len(pending), domain)
 
     for domain in domains:
+        if ensure_owned:
+            ensure_owned()
         refresh_company_assessment_safely(conn, domain)
 
     return stats

@@ -136,6 +136,10 @@ class SupabaseConn:
         ))
         return r.json() if r.content else []
 
+    def rpc(self, function: str, payload: dict[str, Any]) -> Any:
+        r = self._check(self._client.post(f"/rpc/{function}", json=payload))
+        return r.json() if r.content else None
+
     def delete(self, table: str, **filters: Any) -> None:
         self._check(self._client.delete(f"/{table}", params=filters))
 

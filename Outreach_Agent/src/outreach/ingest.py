@@ -126,7 +126,7 @@ def import_prospects(
 def create_campaign_from_prospects(
     conn: SupabaseConn, cfg: Config, *, name: Optional[str] = None,
     research_run_id: Optional[str] = None, limit: Optional[int] = None,
-    tiers: Optional[list[str]] = None,
+    tiers: Optional[list[str]] = None, campaign_id: Optional[str] = None,
 ) -> tuple[Campaign, list[dict[str, Any]]]:
     """Select the configured top-N contactable, already-cached prospects and
     create outreach_items for them. Returns `(campaign, excluded)`.
@@ -178,14 +178,18 @@ def create_campaign_from_prospects(
             "Research Agent), or none have been imported yet"
         )
 
-    campaign = Campaign(
-        campaign_id=str(uuid.uuid4()),
-        name=name or f"Campaign {db.utcnow().isoformat(timespec='seconds')}",
-        research_run_id=research_run_id,
-        channel=cfg.sending.get("channel", "email"),
-        selection={"limit": limit, "tiers": tiers, "min_score": sel.get("min_score")},
-    )
-    db.create_campaign(conn, campaign)
+    campaign = db.get_campaign(conn, campaign_id) if campaign_id else None
+    if campaign is not None and campaign.research_run_id != research_run_id:
+        raise ValueError("campaign_id is already assigned to another research run")
+    if campaign is None:
+        campaign = Campaign(
+            campaign_id=campaign_id or str(uuid.uuid4()),
+            name=name or f"Campaign {db.utcnow().isoformat(timespec='seconds')}",
+            research_run_id=research_run_id,
+            channel=cfg.sending.get("channel", "email"),
+            selection={"limit": limit, "tiers": tiers, "min_score": sel.get("min_score")},
+        )
+        db.create_campaign(conn, campaign)
 
     # Fetch guidance from the Feedback Learning Agent and the Campaign-Level
     # Optimization layer before drafting -- both optional, both wrapped in

@@ -73,11 +73,13 @@ def test_auto_qualify_selects_only_tier_ab_within_the_cap(monkeypatch):
 
     captured_domains = {}
 
-    async def fake_qualify_run(conn, run_id, *, domains, on_progress=None):
+    async def fake_qualify_run(conn, run_id, *, domains, on_progress=None, ensure_owned=None):
         captured_domains["qualify"] = domains
         return {"qualified": len(domains), "skipped": 0, "errors": 0, "error_details": {}}
 
-    async def fake_discover_run(conn, domains, *, on_progress=None):
+    async def fake_discover_run(
+        conn, domains, *, on_progress=None, checkpoint_load=None, checkpoint_save=None, ensure_owned=None,
+    ):
         captured_domains["contacts"] = domains
         return {"found": len(domains), "skipped": 0, "errors": 0, "contacts_saved": 0, "error_details": {}}
 
@@ -115,11 +117,13 @@ def test_auto_qualify_top_n_ranks_within_tier_ab_not_across_all_tiers(monkeypatc
 
     captured_domains = {}
 
-    async def fake_qualify_run(conn, run_id, *, domains, on_progress=None):
+    async def fake_qualify_run(conn, run_id, *, domains, on_progress=None, ensure_owned=None):
         captured_domains["qualify"] = domains
         return {"qualified": len(domains), "skipped": 0, "errors": 0, "error_details": {}}
 
-    async def fake_discover_run(conn, domains, *, on_progress=None):
+    async def fake_discover_run(
+        conn, domains, *, on_progress=None, checkpoint_load=None, checkpoint_save=None, ensure_owned=None,
+    ):
         return {"found": len(domains), "skipped": 0, "errors": 0, "contacts_saved": 0, "error_details": {}}
 
     monkeypatch.setattr(discover.qualify_mod, "qualify_run", fake_qualify_run)
@@ -144,11 +148,13 @@ def test_auto_qualify_cap_limits_how_many_tier_ab_are_covered(monkeypatch):
 
     captured = {}
 
-    async def fake_qualify_run(conn, run_id, *, domains, on_progress=None):
+    async def fake_qualify_run(conn, run_id, *, domains, on_progress=None, ensure_owned=None):
         captured["domains"] = domains
         return {"qualified": len(domains), "skipped": 0, "errors": 0, "error_details": {}}
 
-    async def fake_discover_run(conn, domains, *, on_progress=None):
+    async def fake_discover_run(
+        conn, domains, *, on_progress=None, checkpoint_load=None, checkpoint_save=None, ensure_owned=None,
+    ):
         return {"found": len(domains), "skipped": 0, "errors": 0, "contacts_saved": 0, "error_details": {}}
 
     monkeypatch.setattr(discover.qualify_mod, "qualify_run", fake_qualify_run)
@@ -205,8 +211,8 @@ class _FakeOutreachClient:
         self._raise: Exception | None = None
         type(self).instances.append(self)
 
-    def import_prospects(self, run_id, *, tiers):
-        self.import_calls.append((run_id, tuple(tiers)))
+    def import_prospects(self, run_id, *, tiers, idempotency_key=None):
+        self.import_calls.append((run_id, tuple(tiers), idempotency_key))
         if self._raise:
             raise self._raise
         return self._import_result
@@ -215,8 +221,8 @@ class _FakeOutreachClient:
         self._import_result = {**self._import_result, "excluded_no_contact": import_excluded or []}
         self._campaign_result = {**self._campaign_result, "excluded_no_contact": campaign_excluded or []}
 
-    def create_campaign(self, *, name=None, research_run_id, tiers, limit=None):
-        self.campaign_calls.append((name, research_run_id, tuple(tiers)))
+    def create_campaign(self, *, name=None, research_run_id, tiers, campaign_id=None, limit=None):
+        self.campaign_calls.append((name, research_run_id, tuple(tiers), campaign_id))
         return self._campaign_result
 
     def close(self) -> None:
@@ -256,15 +262,68 @@ def test_handoff_imports_then_creates_campaign_for_tier_ab(monkeypatch):
     asyncio.run(discover._handoff_to_outreach(cfg, "run1", stats, on_progress=None))
 
     client = _FakeOutreachClient.instances[0]
-    assert client.import_calls == [("run1", ("A", "B"))]
-    name, campaign_run_id, tiers = client.campaign_calls[0]
+    assert client.import_calls == [("run1", ("A", "B"), "research-handoff-import:run1")]
+    name, campaign_run_id, tiers, campaign_id = client.campaign_calls[0]
     assert name.startswith("GA — 1 Tier A + 1 Tier B (")
     assert campaign_run_id == "run1"
     assert tiers == ("A", "B")
+    assert campaign_id
     assert client.closed is True
     assert stats.outreach == {
         "imported": 2, "campaign_id": "camp-1", "item_count": 2, "excluded_no_contact": [],
     }
+
+
+def test_handoff_uses_same_campaign_id_after_retry(monkeypatch):
+    cfg = load_config()
+    monkeypatch.setenv("OUTREACH_API_BASE", "http://fake-outreach:8001")
+    _patch_outreach_client(monkeypatch, _FakeOutreachClient)
+
+    asyncio.run(discover._handoff_to_outreach(cfg, "stable-run", discover.DiscoveryStats(), None))
+    asyncio.run(discover._handoff_to_outreach(cfg, "stable-run", discover.DiscoveryStats(), None))
+
+    first, second = _FakeOutreachClient.instances
+    assert first.campaign_calls[0][3] == second.campaign_calls[0][3]
+
+
+def test_handoff_reuses_completed_checkpoint_without_remote_calls(monkeypatch):
+    cfg = load_config()
+    monkeypatch.setenv("OUTREACH_API_BASE", "http://fake-outreach:8001")
+    _patch_outreach_client(monkeypatch, _FakeOutreachClient)
+    result = {"imported": 2, "campaign_id": "stable", "item_count": 2}
+    stats = discover.DiscoveryStats(region="GA", run_id="run1")
+
+    asyncio.run(discover._handoff_to_outreach(
+        cfg, "run1", stats, on_progress=None,
+        checkpoint_load=lambda _key: {"status": "done", "payload": {"result": result}},
+    ))
+
+    assert stats.outreach == result
+    assert _FakeOutreachClient.instances == []
+
+
+def test_transient_handoff_error_is_raised_for_durable_retry(monkeypatch):
+    from csg.outreach_client import OutreachClientError
+
+    cfg = load_config()
+    monkeypatch.setenv("OUTREACH_API_BASE", "http://fake-outreach:8001")
+
+    class UnavailableClient(_FakeOutreachClient):
+        def import_prospects(self, *_args, **_kwargs):
+            raise OutreachClientError("temporary outage", retryable=True)
+
+    _patch_outreach_client(monkeypatch, UnavailableClient)
+    saved = []
+    stats = discover.DiscoveryStats(region="GA", run_id="run1")
+
+    with pytest.raises(OutreachClientError) as error:
+        asyncio.run(discover._handoff_to_outreach(
+            cfg, "run1", stats, on_progress=None,
+            checkpoint_save=lambda key, status, payload: saved.append((key, status, payload)) or True,
+        ))
+
+    assert error.value.retryable is True
+    assert saved == [("outreach_handoff", "started", {"run_id": "run1"})]
 
 
 def test_handoff_reports_excluded_no_contact_companies(monkeypatch):
@@ -332,7 +391,7 @@ def test_handoff_stops_after_import_when_nothing_was_imported(monkeypatch):
     asyncio.run(discover._handoff_to_outreach(cfg, "run1", stats, on_progress=None))
 
     client = ZeroImportClient.instances[0]
-    assert client.import_calls == [("run1", ("A", "B"))]
+    assert client.import_calls == [("run1", ("A", "B"), "research-handoff-import:run1")]
     assert client.campaign_calls == []  # never reached
     assert stats.outreach == {
         "imported": 0, "campaign_id": None, "item_count": 0, "excluded_no_contact": [],

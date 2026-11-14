@@ -301,6 +301,7 @@ function App() {
 
   useEffect(() => {
     const jobId = getStoredActiveResearchJobId(window.localStorage);
+    console.info("research:startup:restore", { jobId, hasStoredJob: !!jobId });
     if (jobId) {
       setActiveJob({
         job_id: jobId,
@@ -322,6 +323,7 @@ function App() {
     setRunError(null);
     try {
       const { job_id } = await researchApi.startDiscover(req);
+      console.info("research:startup:new-discover", { jobId: job_id, region: req.region, limit: req.limit, autoQualifyTop: req.auto_qualify_top });
       setActiveJob({
         job_id,
         kind: "discover",

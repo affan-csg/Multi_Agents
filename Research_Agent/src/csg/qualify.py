@@ -375,6 +375,7 @@ async def qualify_run(
     force: bool = False,
     on_progress: Optional[Any] = None,
     domains: Optional[list[str]] = None,
+    ensure_owned: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Qualify scored companies in `run_id` whose tier is in `tiers` (default A/B).
 
@@ -384,6 +385,8 @@ async def qualify_run(
     {"qualified", "skipped", "errors", "error_details"}.
     """
     backend = _select_backend()
+    if ensure_owned:
+        ensure_owned()
     rows = pending_rows(conn, run_id, tiers, force=force, domains=domains)
 
     stats: dict[str, Any] = {"qualified": 0, "skipped": 0, "errors": 0, "error_details": {}}
@@ -396,6 +399,8 @@ async def qualify_run(
     async def worker(row: dict[str, Any]) -> None:
         nonlocal done
         async with sem:
+            if ensure_owned:
+                ensure_owned()
             postings = db.get_validated_postings(conn, row["domain"], run_id=run_id)[:limit_reqs]
             postings_ctx = [
                 {
@@ -413,6 +418,8 @@ async def qualify_run(
                 qual = await _complete_with_retry(
                     backend, prompt, run_id=run_id, domain=row["domain"],
                 )
+                if ensure_owned:
+                    ensure_owned()
                 db.save_qualification(
                     conn, run_id, row["domain"],
                     pain_summary=qual.pain_summary,
@@ -423,6 +430,8 @@ async def qualify_run(
                 conn.commit()
                 stats["qualified"] += 1
             except Exception as exc:
+                if ensure_owned:
+                    ensure_owned()
                 stats["errors"] += 1
                 reason = classify_error(exc)
                 detail = f"{type(exc).__name__}: {exc}"
@@ -456,6 +465,7 @@ async def retry_failed_run(
     run_id: str,
     limit_reqs: int = 8,
     on_progress: Optional[Any] = None,
+    ensure_owned: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Retry only the domains whose last qualification attempt for `run_id`
     failed (see `failed_rows`) and have not since succeeded. Reuses
@@ -474,5 +484,5 @@ async def retry_failed_run(
     domains = [r["domain"] for r in rows]
     return await qualify_run(
         conn, run_id, limit_reqs=limit_reqs, force=True,
-        on_progress=on_progress, domains=domains,
+        on_progress=on_progress, domains=domains, ensure_owned=ensure_owned,
     )

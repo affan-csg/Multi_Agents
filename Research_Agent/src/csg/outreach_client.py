@@ -25,6 +25,7 @@ discover.py and db.delete_run).
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Optional
 
@@ -32,53 +33,79 @@ import httpx
 
 
 class OutreachClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class OutreachClient:
     def __init__(self, base_url: str, timeout: float = 30.0) -> None:
         self.base = base_url.rstrip("/")
-        self._client = httpx.Client(base_url=self.base, timeout=timeout)
+        headers = {}
+        service_token = os.environ.get("RESEARCH_OUTREACH_SERVICE_TOKEN")
+        if service_token:
+            headers["X-Research-Service-Token"] = service_token
+        self._client = httpx.Client(base_url=self.base, timeout=timeout, headers=headers)
 
     def close(self) -> None:
         self._client.close()
 
-    def _post(self, path: str, json_body: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self, path: str, json_body: dict[str, Any], *, headers: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
         try:
-            r = self._client.post(path, json=json_body)
+            request_options = {"headers": headers} if headers is not None else {}
+            r = self._client.post(path, json=json_body, **request_options)
         except httpx.RequestError as exc:
-            raise OutreachClientError(f"Outreach Agent API unreachable at {self.base}{path}: {exc}") from exc
+            raise OutreachClientError(
+                f"Outreach Agent API unreachable at {self.base}{path}: {exc}", retryable=True,
+            ) from exc
         if r.status_code >= 400:
-            raise OutreachClientError(f"POST {self.base}{path} -> {r.status_code}: {r.text}")
+            raise OutreachClientError(
+                f"POST {self.base}{path} -> {r.status_code}: {r.text}",
+                retryable=r.status_code == 408 or r.status_code == 429 or r.status_code >= 500,
+            )
         return r.json()
 
     def _get(self, path: str) -> dict[str, Any]:
         try:
             r = self._client.get(path)
         except httpx.RequestError as exc:
-            raise OutreachClientError(f"Outreach Agent API unreachable at {self.base}{path}: {exc}") from exc
+            raise OutreachClientError(
+                f"Outreach Agent API unreachable at {self.base}{path}: {exc}", retryable=True,
+            ) from exc
         if r.status_code >= 400:
-            raise OutreachClientError(f"GET {self.base}{path} -> {r.status_code}: {r.text}")
+            raise OutreachClientError(
+                f"GET {self.base}{path} -> {r.status_code}: {r.text}",
+                retryable=r.status_code == 408 or r.status_code == 429 or r.status_code >= 500,
+            )
         return r.json()
 
     def _delete(self, path: str) -> dict[str, Any]:
         try:
             r = self._client.delete(path)
         except httpx.RequestError as exc:
-            raise OutreachClientError(f"Outreach Agent API unreachable at {self.base}{path}: {exc}") from exc
+            raise OutreachClientError(
+                f"Outreach Agent API unreachable at {self.base}{path}: {exc}", retryable=True,
+            ) from exc
         if r.status_code >= 400:
-            raise OutreachClientError(f"DELETE {self.base}{path} -> {r.status_code}: {r.text}")
+            raise OutreachClientError(
+                f"DELETE {self.base}{path} -> {r.status_code}: {r.text}",
+                retryable=r.status_code == 408 or r.status_code == 429 or r.status_code >= 500,
+            )
         return r.json()
 
     def import_prospects(
-        self, run_id: str, *, tiers: list[str], poll_interval: float = 1.0, timeout: float = 120.0,
+        self, run_id: str, *, tiers: list[str], idempotency_key: Optional[str] = None,
+        poll_interval: float = 1.0, timeout: float = 120.0,
     ) -> dict[str, Any]:
         """Start an import job on Outreach and block until it finishes.
         Returns the job's result dict (e.g. {"imported": N, "domains": [...]})."""
-        started = self._post("/import", {"run_id": run_id, "tiers": tiers})
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        started = self._post("/import", {"run_id": run_id, "tiers": tiers}, headers=headers)
         job_id = started.get("job_id")
         if not job_id:
-            raise OutreachClientError(f"POST /import did not return a job_id: {started}")
+            raise OutreachClientError(f"POST /import did not return a job_id: {started}", retryable=True)
 
         deadline = time.monotonic() + timeout
         while True:
@@ -87,13 +114,18 @@ class OutreachClient:
             if status == "done":
                 return snap.get("result") or {}
             if status == "error":
-                raise OutreachClientError(f"Outreach import job failed: {snap.get('error')}")
+                raise OutreachClientError(
+                    f"Outreach import job failed: {snap.get('error')}", retryable=True,
+                )
             if time.monotonic() > deadline:
-                raise OutreachClientError(f"Outreach import job {job_id} did not finish within {timeout}s")
+                raise OutreachClientError(
+                    f"Outreach import job {job_id} did not finish within {timeout}s", retryable=True,
+                )
             time.sleep(poll_interval)
 
     def create_campaign(
-        self, *, name: Optional[str] = None, research_run_id: str, tiers: list[str], limit: Optional[int] = None,
+        self, *, name: Optional[str] = None, research_run_id: str, tiers: list[str],
+        campaign_id: Optional[str] = None, limit: Optional[int] = None,
     ) -> dict[str, Any]:
         """Synchronous on Outreach's side -- drafts a personalized campaign
         from whatever prospects import_prospects() just cached. Returns
@@ -101,6 +133,8 @@ class OutreachClient:
         body: dict[str, Any] = {"research_run_id": research_run_id, "tiers": tiers}
         if name:
             body["name"] = name
+        if campaign_id:
+            body["campaign_id"] = campaign_id
         if limit is not None:
             body["limit"] = limit
         return self._post("/campaigns", body)

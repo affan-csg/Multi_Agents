@@ -153,4 +153,14 @@ def test_status_code_extracted_from_httpx_http_status_error(captured_rows):
             raise exc
 
     _join_background_writes()
+    assert len(captured_rows) == 1
     assert captured_rows[0]["status_code"] == 500
+
+
+def test_tavily_432_is_classified_as_quota_exhaustion():
+    request = httpx.Request("POST", "https://api.tavily.com/search")
+    response = httpx.Response(432, request=request, text="plan limit exceeded")
+    exc = httpx.HTTPStatusError("plan limit", request=request, response=response)
+
+    assert usage_tracker._guess_status_code(exc) == 432
+    assert usage_tracker.classify_error(exc) == "quota_exhausted"

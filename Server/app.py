@@ -213,6 +213,18 @@ _AUTH_PUBLIC_PATHS = {
 }
 
 
+def _is_research_service_request(method: str, path: str) -> bool:
+    if method == "POST" and path in {"/outreach/import", "/outreach/campaigns"}:
+        return True
+    if method == "GET" and path.startswith("/outreach/jobs/") and path.count("/") == 3:
+        return True
+    return (
+        method == "DELETE"
+        and path.startswith("/outreach/research/runs/")
+        and path.count("/") == 4
+    )
+
+
 def _dashboard_password() -> str:
     return os.environ.get("DASHBOARD_PASSWORD", "")
 
@@ -247,6 +259,15 @@ class DashboardAuthMiddleware:
             return await self.app(scope, receive, send)
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        service_token = os.environ.get("RESEARCH_OUTREACH_SERVICE_TOKEN", "")
+        supplied_service_token = headers.get("x-research-service-token", "")
+        if (
+            service_token
+            and supplied_service_token
+            and hmac.compare_digest(supplied_service_token, service_token)
+            and _is_research_service_request(scope.get("method", ""), path)
+        ):
+            return await self.app(scope, receive, send)
         # The agents call each other over loopback HTTP (research <-> outreach
         # hand-off). Those server-side calls come from 127.0.0.1 and, unlike any
         # browser request, carry no Origin header.

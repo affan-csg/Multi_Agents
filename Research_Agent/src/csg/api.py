@@ -1,16 +1,8 @@
-"""FastAPI backend for the frontend UI.
+"""FastAPI API for starting Research jobs and reporting durable job state.
 
-Wraps the discover/qualify/contacts modules -- no business logic lives here,
-only HTTP/WebSocket plumbing and request validation. A research run is
-started with POST /discover, whose entire input is a region; everything else
-comes from the ICP config. Runs locally (uvicorn) for one user at a time; job
-state is kept in-process memory (see `_JOBS`), not persisted -- a server
-restart loses in-flight progress tracking, but nothing in Supabase, which is
-where the actual results live.
-
-SupabaseConn is a synchronous httpx.Client (see db.py), so all DB-touching
-pipeline work runs in a background thread (via the default executor) rather
-than blocking the async event loop that serves the WebSocket/HTTP requests.
+Long-running execution and recovery run in the independent ``csg.worker``
+service. This app keeps the existing REST/WebSocket contract and reads job
+progress from the Supabase ledger, so API instances can scale independently.
 """
 
 from __future__ import annotations
@@ -35,8 +27,10 @@ from .ats import normalize_domain
 from .config import load_config, update_icp_basics
 from .discovery import DiscoveryError
 from . import jobs
+from .diagnostics import log_event
 from .models import Prospect
 from .research_assessment import ResearchAssessmentInput, build_assessment
+from .outreach_client import OutreachClientError
 
 _MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 _RECOVERY_INTERVAL_SECONDS = 15
@@ -46,22 +40,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
-    # FastAPI dispatches sync `def` route handlers to a worker thread pool
-    # (via anyio), where asyncio.get_event_loop() raises -- there is no
-    # per-thread loop there. Capturing the one true loop here, from an
-    # actual coroutine running on it, is what lets Job.publish() hand
-    # progress events back to it safely from any thread.
+    # Job execution and recovery are owned by csg.worker, not this API process.
     global _MAIN_LOOP
     _MAIN_LOOP = asyncio.get_running_loop()
-    recovery_task = asyncio.create_task(_recover_jobs_forever())
-    try:
-        yield
-    finally:
-        recovery_task.cancel()
-        try:
-            await recovery_task
-        except asyncio.CancelledError:
-            pass
+    yield
 
 
 app = FastAPI(title="CSG Research Agent API", lifespan=_lifespan)
@@ -97,6 +79,7 @@ class Job:
     persist: bool = True
     worker_id: Optional[str] = None
     _state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    ownership_lost: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
@@ -113,9 +96,12 @@ class Job:
     def publish(self, worker_id: str, **updates: Any) -> bool:
         with self._state_lock:
             if self.worker_id != worker_id:
+                self.ownership_lost.set()
                 return False
             payload = self.snapshot()
             payload.update(updates)
+            before = {"status": self.status, "done": self.done, "total": self.total,
+                      "current_domain": self.current_domain, "run_id": self.run_id}
             conn = db.connect()
             try:
                 persisted = jobs.update(
@@ -128,11 +114,34 @@ class Job:
             finally:
                 conn.close()
             if not persisted:
+                self.ownership_lost.set()
+                log_event(
+                    "job_update_rejected",
+                    job_id=self.job_id,
+                    kind=self.kind,
+                    worker_id=worker_id,
+                    before=before,
+                    updates=updates,
+                    reason="stale_worker_or_lease",
+                )
                 return False
             for name, value in updates.items():
                 setattr(self, name, value)
             snap = self.snapshot()
             subscribers = list(self.subscribers)
+        log_event(
+            "job_progress",
+            job_id=self.job_id,
+            kind=self.kind,
+            worker_id=worker_id,
+            status=snap["status"],
+            done=snap["done"],
+            total=snap["total"],
+            current_domain=snap["current_domain"],
+            run_id=snap["run_id"],
+            before=before,
+            persisted=True,
+        )
         for q in subscribers:
             if self.loop is not None:
                 self.loop.call_soon_threadsafe(q.put_nowait, snap)
@@ -148,9 +157,13 @@ def _start_job_heartbeat(job: Job, worker_id: str) -> tuple[threading.Event, thr
     def pulse() -> None:
         while not stop.wait(_JOB_HEARTBEAT_INTERVAL_SECONDS):
             try:
-                job.publish(worker_id)
+                if not job.publish(worker_id):
+                    job.ownership_lost.set()
+                    return
             except Exception:
                 logger.exception("Research job heartbeat failed for %s", job.job_id)
+                job.ownership_lost.set()
+                return
 
     thread = threading.Thread(target=pulse, name=f"research-job-{job.job_id}", daemon=True)
     thread.start()
@@ -165,73 +178,16 @@ def _stop_job_heartbeat(heartbeat: Optional[tuple[threading.Event, threading.Thr
     thread.join()
 
 
-async def _recover_jobs_forever() -> None:
-    while True:
-        try:
-            await asyncio.to_thread(_recover_jobs_once)
-        except Exception:
-            logger.exception("Research durable job recovery scan failed")
-        await asyncio.sleep(_RECOVERY_INTERVAL_SECONDS)
-
-
-def _recover_jobs_once() -> None:
-    conn = db.connect()
-    try:
-        rows = jobs.recoverable(conn)
-    finally:
-        conn.close()
-
-    for row in rows:
-        job_id = row["job_id"]
-        job = _JOBS.get(job_id)
-        if job is None:
-            job = Job(
-                job_id=job_id, kind=row["kind"], run_id=row.get("run_id"),
-                status=row.get("status", "pending"), done=row.get("done", 0),
-                total=row.get("total", 0), current_domain=row.get("current_domain"),
-                result=row.get("result"), error=row.get("error"), loop=_MAIN_LOOP,
-            )
-            _JOBS[job_id] = job
-        if job.status in ("done", "error"):
-            continue
-
-        payload = row.get("request_payload") or {}
-        if row["kind"] == "discover" and payload.get("domains"):
-            _MAIN_LOOP.run_in_executor(
-                None, _run_resume_job, job, row.get("run_id") or payload["run_id"], payload["domains"],
-            )
-        elif row["kind"] == "discover":
-            _MAIN_LOOP.run_in_executor(None, _run_discover_job, job, DiscoverRequest.model_validate(payload))
-        elif row["kind"] == "qualify" and "tiers" in payload:
-            _MAIN_LOOP.run_in_executor(
-                None, _run_qualify_job, job, row["run_id"], QualifyRequest.model_validate(payload),
-            )
-        elif row["kind"] == "qualify":
-            _MAIN_LOOP.run_in_executor(None, _run_qualify_retry_job, job, row["run_id"])
-        elif row["kind"] == "contacts":
-            _MAIN_LOOP.run_in_executor(
-                None, _run_contacts_job, job, row["run_id"], ContactsRequest.model_validate(payload),
-            )
-        else:
-            worker_id = jobs.worker_id()
-            conn = db.connect()
-            try:
-                claimed = jobs.claim(conn, job_id, worker_id)
-            finally:
-                conn.close()
-            if claimed:
-                job.set_worker_id(worker_id)
-                job.publish(
-                    worker_id, status="error",
-                    error=f"Unsupported recovered Research job kind: {row['kind']}",
-                )
+def _ensure_job_owned(job: Job) -> None:
+    if job.ownership_lost.is_set():
+        raise asyncio.CancelledError("Research job ownership was lost")
 
 
 def _new_job(kind: str, run_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,
-             idempotency_key: Optional[str] = None) -> Job:
+             idempotency_key: Optional[str] = None, total: int = 0) -> Job:
     conn = db.connect()
     try:
-        row = jobs.create(conn, kind=kind, payload=payload or {}, run_id=run_id,
+        row = jobs.create(conn, kind=kind, payload=payload or {}, run_id=run_id, total=total,
                           idempotency_key=idempotency_key)
     finally:
         conn.close()
@@ -323,12 +279,20 @@ def _run_discover_job(job: Job, req: DiscoverRequest) -> None:
     worker_id = ""
     try:
         worker_id = jobs.worker_id()
+        log_event("job_worker_claim", job_id=job.job_id, kind=job.kind, worker_id=worker_id, action="discover_start")
         if not jobs.claim(conn, job.job_id, worker_id):
+            log_event("job_worker_claim_failed", job_id=job.job_id, kind=job.kind, worker_id=worker_id, action="discover_start", reason="claim_rejected")
             return
         job.set_worker_id(worker_id)
         heartbeat = _start_job_heartbeat(job, worker_id)
         cfg = load_config()
         job.publish(worker_id, status="running", total=req.limit)
+
+        def load_checkpoint(key: str) -> Optional[dict[str, Any]]:
+            return jobs.get_checkpoint(conn, job.job_id, key)
+
+        def save_checkpoint(key: str, status: str, payload: dict[str, Any]) -> bool:
+            return jobs.save_checkpoint(conn, job.job_id, worker_id, key, status=status, payload=payload)
 
         def progress(stage: str, done: int, total: int, detail: str) -> None:
             job.publish(
@@ -337,9 +301,10 @@ def _run_discover_job(job: Job, req: DiscoverRequest) -> None:
             )
 
         stats = asyncio.run(discover_mod.run_discovery(
-            cfg, region=req.region, limit=req.limit, conn=conn,
+            cfg, region=req.region, limit=req.limit, conn=conn, run_id=job.run_id,
             label=req.label, use_cache=req.use_cache, on_progress=progress,
             auto_qualify_top=req.auto_qualify_top,
+            checkpoint_load=load_checkpoint, checkpoint_save=save_checkpoint,
         ))
         job.publish(worker_id, run_id=stats.run_id, status="done", result=stats.as_dict())
     except asyncio.CancelledError:
@@ -356,6 +321,28 @@ def _run_discover_job(job: Job, req: DiscoverRequest) -> None:
 def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
     """Continue an already-started run for the specific companies that
     stalled (see db.stalled_companies) -- does not re-run discovery, just
+    except OutreachClientError as exc:
+        if not exc.retryable:
+            job.publish(worker_id, status="error", error=f"Outreach handoff failed: {exc}")
+            return
+        try:
+            checkpoint = jobs.get_checkpoint(conn, job.job_id, "outreach_handoff_retry") or {}
+            previous = checkpoint.get("payload") or {}
+            attempts = int(previous.get("attempts", 0)) + 1
+            delay_seconds = min(5 * (2 ** min(attempts - 1, 6)), 300)
+            saved = jobs.save_checkpoint(
+                conn, job.job_id, worker_id, "outreach_handoff_retry",
+                status="retrying", payload={"attempts": attempts, "error": str(exc)},
+            )
+            if saved and jobs.requeue(conn, job.job_id, worker_id, delay_seconds=delay_seconds):
+                log_event(
+                    "outreach_handoff_requeued", job_id=job.job_id, run_id=job.run_id,
+                    worker_id=worker_id, attempts=attempts, delay_seconds=delay_seconds,
+                )
+                return
+        except Exception:
+            logger.exception("Could not durably requeue Research job %s", job.job_id)
+        job.ownership_lost.set()
     re-enrichment + re-scoring for these domains under the same run_id."""
     conn = db.connect()
     heartbeat = None
@@ -369,6 +356,12 @@ def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
         cfg = load_config()
         job.publish(worker_id, status="running", total=len(domains))
 
+        def load_checkpoint(key: str) -> Optional[dict[str, Any]]:
+            return jobs.get_checkpoint(conn, job.job_id, key)
+
+        def save_checkpoint(key: str, status: str, payload: dict[str, Any]) -> bool:
+            return jobs.save_checkpoint(conn, job.job_id, worker_id, key, status=status, payload=payload)
+
         def progress(stage: str, done: int, total: int, detail: str) -> None:
             job.publish(
                 worker_id, done=done, total=total or len(domains),
@@ -377,6 +370,7 @@ def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
 
         stats = asyncio.run(discover_mod.resume_stalled(
             cfg, run_id, domains, conn=conn, on_progress=progress,
+            checkpoint_load=load_checkpoint, checkpoint_save=save_checkpoint,
         ))
         job.publish(worker_id, run_id=stats.run_id, status="done", result=stats.as_dict())
     except asyncio.CancelledError:
@@ -392,12 +386,14 @@ def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
 
 def _run_qualify_job(job: Job, run_id: str, req: QualifyRequest) -> None:
     conn = db.connect()
+    heartbeat = None
     worker_id = ""
     try:
         worker_id = jobs.worker_id()
         if not jobs.claim(conn, job.job_id, worker_id):
             return
         job.set_worker_id(worker_id)
+        heartbeat = _start_job_heartbeat(job, worker_id)
         job.publish(worker_id, status="running")
 
         def progress(done: int, total: int, domain: str) -> None:
@@ -413,17 +409,20 @@ def _run_qualify_job(job: Job, run_id: str, req: QualifyRequest) -> None:
     except Exception as exc:
         job.publish(worker_id, status="error", error=f"{type(exc).__name__}: {exc}")
     finally:
+        _stop_job_heartbeat(heartbeat)
         conn.close()
 
 
 def _run_qualify_retry_job(job: Job, run_id: str) -> None:
     conn = db.connect()
+    heartbeat = None
     worker_id = ""
     try:
         worker_id = jobs.worker_id()
         if not jobs.claim(conn, job.job_id, worker_id):
             return
         job.set_worker_id(worker_id)
+        heartbeat = _start_job_heartbeat(job, worker_id)
         job.publish(worker_id, status="running")
 
         def progress(done: int, total: int, domain: str) -> None:
@@ -436,17 +435,20 @@ def _run_qualify_retry_job(job: Job, run_id: str) -> None:
     except Exception as exc:
         job.publish(worker_id, status="error", error=f"{type(exc).__name__}: {exc}")
     finally:
+        _stop_job_heartbeat(heartbeat)
         conn.close()
 
 
 def _run_contacts_job(job: Job, run_id: str, req: ContactsRequest) -> None:
     conn = db.connect()
+    heartbeat = None
     worker_id = ""
     try:
         worker_id = jobs.worker_id()
         if not jobs.claim(conn, job.job_id, worker_id):
             return
         job.set_worker_id(worker_id)
+        heartbeat = _start_job_heartbeat(job, worker_id)
         job.publish(worker_id, status="running")
 
         rows = [r for r in db.get_scores(conn, run_id) if r["tier"] in req.tiers]
@@ -457,8 +459,15 @@ def _run_contacts_job(job: Job, run_id: str, req: ContactsRequest) -> None:
         def progress(done: int, total: int, domain: str) -> None:
             job.publish(worker_id, done=done, total=total, current_domain=domain)
 
+        def load_checkpoint(key: str) -> Optional[dict[str, Any]]:
+            return jobs.get_checkpoint(conn, job.job_id, key)
+
+        def save_checkpoint(key: str, status: str, payload: dict[str, Any]) -> bool:
+            return jobs.save_checkpoint(conn, job.job_id, worker_id, key, status=status, payload=payload)
+
         stats = asyncio.run(contacts_mod.discover_run(
             conn, pending, limit_per_domain=req.limit_per_domain, force=req.force, on_progress=progress,
+            checkpoint_load=load_checkpoint, checkpoint_save=save_checkpoint,
         ))
         job.publish(worker_id, status="done", result=stats)
     except contacts_mod.ContactDiscoveryError as exc:
@@ -466,6 +475,7 @@ def _run_contacts_job(job: Job, run_id: str, req: ContactsRequest) -> None:
     except Exception as exc:
         job.publish(worker_id, status="error", error=f"{type(exc).__name__}: {exc}")
     finally:
+        _stop_job_heartbeat(heartbeat)
         conn.close()
 
 
@@ -505,9 +515,8 @@ def list_regions() -> dict[str, Any]:
 def start_discover(req: DiscoverRequest, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     """Start an autonomous discovery run. Region is the only input."""
     cfg = load_config()
-    job = _new_job(kind="discover", payload=req.model_dump(), idempotency_key=idempotency_key)
-    if job.start_allowed:
-        _MAIN_LOOP.run_in_executor(None, _run_discover_job, job, req)
+    job = _new_job(kind="discover", run_id=jobs.new_run_id(), payload=req.model_dump(),
+                   idempotency_key=idempotency_key, total=req.limit)
     return {"job_id": job.job_id, "region": cfg.resolve_region(req.region)}
 
 
@@ -569,9 +578,7 @@ def resume_run(run_id: str, idempotency_key: Optional[str] = Header(default=None
         conn.close()
 
     job = _new_job(kind="discover", run_id=run_id, payload={"run_id": run_id, "domains": stalled},
-                   idempotency_key=idempotency_key)
-    if job.start_allowed:
-        _MAIN_LOOP.run_in_executor(None, _run_resume_job, job, run_id, stalled)
+                   idempotency_key=idempotency_key, total=len(stalled))
     return {"job_id": job.job_id, "run_id": run_id, "stalled_count": len(stalled)}
 
 
@@ -1242,10 +1249,8 @@ def start_qualify(run_id: str, req: QualifyRequest, idempotency_key: Optional[st
     finally:
         conn.close()
 
-    job = _new_job(kind="qualify", run_id=run_id, payload=req.model_dump(), idempotency_key=idempotency_key)
-    job.total = len(pending)
-    if job.start_allowed:
-        _MAIN_LOOP.run_in_executor(None, _run_qualify_job, job, run_id, req)
+    job = _new_job(kind="qualify", run_id=run_id, payload=req.model_dump(),
+                   idempotency_key=idempotency_key, total=len(pending))
     return {"job_id": job.job_id, "provider": provider, "companies": len(pending)}
 
 
@@ -1276,10 +1281,7 @@ def start_qualify_retry(run_id: str, idempotency_key: Optional[str] = Header(def
         conn.close()
 
     job = _new_job(kind="qualify", run_id=run_id, payload={"run_id": run_id},
-                   idempotency_key=idempotency_key)
-    job.total = len(pending)
-    if job.start_allowed:
-        _MAIN_LOOP.run_in_executor(None, _run_qualify_retry_job, job, run_id)
+                   idempotency_key=idempotency_key, total=len(pending))
     return {"job_id": job.job_id, "provider": provider, "companies": len(pending)}
 
 
@@ -1295,10 +1297,8 @@ def start_contacts(run_id: str, req: ContactsRequest, idempotency_key: Optional[
     finally:
         conn.close()
 
-    job = _new_job(kind="contacts", run_id=run_id, payload=req.model_dump(), idempotency_key=idempotency_key)
-    job.total = len(pending)
-    if job.start_allowed:
-        _MAIN_LOOP.run_in_executor(None, _run_contacts_job, job, run_id, req)
+    job = _new_job(kind="contacts", run_id=run_id, payload=req.model_dump(),
+                   idempotency_key=idempotency_key, total=len(pending))
     return {"job_id": job.job_id, "companies": len(pending)}
 
 
@@ -1331,11 +1331,14 @@ def job_status(job_id: str) -> dict[str, Any]:
     finally:
         conn.close()
     if not row:
+        log_event("job_status_missing", job_id=job_id, status="not_found")
         raise HTTPException(404, "job not found")
-    return {"job_id": row["job_id"], "kind": row["kind"], "run_id": row.get("run_id"),
+    snap = {"job_id": row["job_id"], "kind": row["kind"], "run_id": row.get("run_id"),
             "status": row["status"], "done": row.get("done", 0), "total": row.get("total", 0),
             "current_domain": row.get("current_domain"), "result": row.get("result"),
             "error": row.get("error")}
+    log_event("job_status_read", **snap, worker_id=row.get("worker_id"), lease_until=row.get("lease_until"), updated_at=row.get("updated_at"))
+    return snap
 
 
 @app.websocket("/jobs/{job_id}/ws")
@@ -1347,20 +1350,13 @@ async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
         await websocket.close(code=4404)
         return
 
-    job = _JOBS.get(job_id)
-    queue: asyncio.Queue = asyncio.Queue()
-    if job is not None:
-        job.subscribers.append(queue)
-
     try:
         await websocket.send_text(json.dumps(last_snapshot))
         if last_snapshot["status"] in ("done", "error"):
             return
         while True:
-            try:
-                snap = await asyncio.wait_for(queue.get(), timeout=1)
-            except asyncio.TimeoutError:
-                snap = await asyncio.to_thread(job_status, job_id)
+            await asyncio.sleep(1)
+            snap = await asyncio.to_thread(job_status, job_id)
             if snap == last_snapshot:
                 continue
             last_snapshot = snap
@@ -1369,6 +1365,3 @@ async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
                 break
     except WebSocketDisconnect:
         pass
-    finally:
-        if job is not None and queue in job.subscribers:
-            job.subscribers.remove(queue)

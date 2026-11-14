@@ -66,6 +66,7 @@ export class JobMonitor {
 
   start(): void {
     if (this.stopped) return;
+    console.info("research:monitor:start", { jobId: this.jobId, activeStorage: this.storage.getItem(ACTIVE_RESEARCH_JOB_KEY) });
     this.storage.setItem(ACTIVE_RESEARCH_JOB_KEY, this.jobId);
     void this.connectWithSync();
   }
@@ -81,10 +82,12 @@ export class JobMonitor {
   private async syncStatus(): Promise<JobSnapshot | null> {
     try {
       const snapshot = await this.api.jobStatus(this.jobId);
+      console.info("research:monitor:status", { jobId: this.jobId, status: snapshot.status, done: snapshot.done, total: snapshot.total, currentDomain: snapshot.current_domain, runId: snapshot.run_id });
       if (this.stopped) return snapshot;
       this.receive(snapshot);
       return snapshot;
-    } catch {
+    } catch (error) {
+      console.info("research:monitor:status-error", { jobId: this.jobId, error: error instanceof Error ? error.message : String(error) });
       return null;
     }
   }
@@ -118,8 +121,10 @@ export class JobMonitor {
 
   private receive(snapshot: JobSnapshot): void {
     if (this.stopped) return;
+    console.info("research:monitor:receive", { jobId: this.jobId, status: snapshot.status, done: snapshot.done, total: snapshot.total, currentDomain: snapshot.current_domain, runId: snapshot.run_id });
     this.onSnapshot(snapshot);
     if (isTerminal(snapshot.status)) {
+      console.info("research:monitor:terminal", { jobId: this.jobId, status: snapshot.status, runId: snapshot.run_id });
       this.storage.removeItem(ACTIVE_RESEARCH_JOB_KEY);
       this.stop();
     }

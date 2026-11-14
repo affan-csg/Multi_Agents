@@ -217,6 +217,7 @@ class ImportRequest(BaseModel):
 
 
 class CampaignCreateRequest(BaseModel):
+    campaign_id: Optional[str] = None
     name: Optional[str] = None
     research_run_id: Optional[str] = None
     limit: Optional[int] = None
@@ -363,15 +364,29 @@ def list_campaigns() -> list[dict[str, Any]]:
 
 @app.post("/campaigns")
 def create_campaign(req: CampaignCreateRequest) -> dict[str, Any]:
-    cfg = load_config()
     conn = db.connect()
     try:
+        existing = None
+        if req.campaign_id:
+            existing = db.get_campaign(conn, req.campaign_id)
+            if existing:
+                if existing.research_run_id != req.research_run_id:
+                    raise HTTPException(409, "campaign_id is already assigned to another research run")
+
+        cfg = load_config()
         try:
             campaign, excluded = ingest.create_campaign_from_prospects(
                 conn, cfg, name=req.name, research_run_id=req.research_run_id,
-                limit=req.limit, tiers=req.tiers,
+                campaign_id=req.campaign_id, limit=req.limit, tiers=req.tiers,
             )
         except ValueError as exc:
+            if existing:
+                items = db.list_items(conn, campaign_id=existing.campaign_id)
+                return {
+                    "campaign": existing.model_dump(mode="json"),
+                    "item_count": len(items),
+                    "excluded_no_contact": [],
+                }
             raise HTTPException(400, str(exc))
         items = db.list_items(conn, campaign_id=campaign.campaign_id)
         return {

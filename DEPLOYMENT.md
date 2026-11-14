@@ -6,7 +6,7 @@ This system consists of three independent services:
 2. **Outreach Agent** — campaigns, email drafting, sending, conversation (replies/follow-ups)
 3. **Dashboard** — React/Vite UI that calls both agents' APIs
 
-The Research and Outreach agents are typically deployed together as one backend service (using the Server composition layer, `Server/app.py`). The Dashboard is a separate static frontend. Each agent uses its own Supabase project.
+The Research API and Outreach Agent are deployed together behind the Server composition layer (`Server/app.py`); a dedicated Research worker is a separate, continuously running Cloud Run service built from the same image. The Dashboard is a separate static frontend. Each agent uses its own Supabase project.
 
 Three deployment shapes exist in this repo:
 
@@ -115,7 +115,69 @@ The platform's `PORT` (Railway injects it) is honored, and `CSG_API_BASE` is der
 
 **Health check**: use `GET /healthz`. It is unauthenticated and reports only whether required backend environment variables are present; it never returns secret values. Configure Cloud Run startup/readiness probes against this route.
 
-**Cloud Scheduler**: keep `AUTO_SYNC_ENABLED=false` on Cloud Run and create an authenticated `POST /outreach/automation/trigger` job at the desired interval. Send `X-Automation-Token` from Secret Manager. This wakes a scaled-to-zero service; the database lease in `automation_state` prevents overlapping cycles. `AUTO_SYNC_ENABLED=true` remains suitable for Railway/local single-instance deployments.
+**Cloud Scheduler**: keep `AUTO_SYNC_ENABLED=false` on Cloud Run and create an authenticated `POST /outreach/automation/trigger` job at the desired interval. Send `X-Automation-Token` from Secret Manager. This wakes a scaled-to-zero API service; the database lease in `automation_state` prevents overlapping cycles. `AUTO_SYNC_ENABLED=true` remains suitable for Railway/local single-instance deployments.
+
+### Dedicated Research worker on Cloud Run
+
+Research job execution must use a separate worker service. The API service only creates durable `agent_jobs` rows and serves REST/WebSocket status; it does not execute or recover jobs. The worker polls pending and expired rows, atomically claims each row, and writes heartbeats/checkpoints through the same Research Supabase project. Its WebSocket clients remain compatible because the API streams the authoritative database snapshots.
+
+The worker image is the same root `Dockerfile`; override its command to `python -m csg.worker`. Before applying `Research_Agent/migrations/010_job_checkpoints.sql`, inspect the target project's `public.agent_jobs` columns and existing checkpoint objects, confirm the deploy role can alter/create them, and confirm the Supabase `anon`, `authenticated`, and `service_role` roles exist. The migration is additive and repeatable: it enables RLS and revokes `PUBLIC`/`anon`/`authenticated` access to both `agent_jobs` and the new checkpoint ledger, grants the Research `service_role` access, and restricts the checkpoint RPC to that role. It does not install client-role policies or change existing job rows. The RPC runs as invoker with a pinned search path, locks the job row, and writes only for the current worker with a live lease. No production database is changed until the SQL is separately applied.
+
+Build and push one immutable image, then deploy the API and worker independently. Use separate runtime service accounts and grant each only Secret Manager access to the secrets its process needs. The deployment identity needs `roles/run.admin`, `roles/iam.serviceAccountUser` on the runtime accounts, and Artifact Registry write access to publish the image; the Cloud Run service agent needs image read access.
+
+```powershell
+gcloud builds submit --tag asia-northeast1-docker.pkg.dev/PROJECT/agents/csg-agents:TAG .
+
+gcloud run deploy multi-agents `
+   --image asia-northeast1-docker.pkg.dev/PROJECT/agents/csg-agents:TAG `
+   --region asia-northeast1 `
+   --service-account csg-research-api@PROJECT.iam.gserviceaccount.com `
+   --port 8080 `
+   --cpu 2 `
+   --memory 2Gi `
+   --concurrency 10 `
+   --min 0 `
+   --max 5 `
+   --timeout 300 `
+   --cpu-throttling `
+   --allow-unauthenticated `
+   --startup-probe=httpGet.path=/healthz,httpGet.port=8080,periodSeconds=10,timeoutSeconds=2,failureThreshold=6 `
+   --liveness-probe=httpGet.path=/healthz,httpGet.port=8080,periodSeconds=30,timeoutSeconds=2,failureThreshold=3 `
+   --update-env-vars CSG_API_BASE=http://127.0.0.1:8080,OUTREACH_API_BASE=enabled,AUTO_SYNC_ENABLED=false,CORS_ALLOWED_ORIGINS=https://multi-agents-beta.vercel.app,SMTP_HOST=smtp.example.com,SMTP_PORT=587,SMTP_USERNAME=sender@example.com,OUTREACH_FROM_EMAIL=sender@example.com,OUTREACH_FROM_NAME="CSG Outreach",IMAP_HOST=imap.example.com,IMAP_PORT=993,IMAP_USERNAME=sender@example.com,IMAP_FOLDER=INBOX `
+   --update-secrets RESEARCH_SUPABASE_URL=research-supabase-url:latest,RESEARCH_SUPABASE_SERVICE_KEY=research-supabase-service-key:latest,OUTREACH_SUPABASE_URL=outreach-supabase-url:latest,OUTREACH_SUPABASE_SERVICE_KEY=outreach-supabase-service-key:latest,DASHBOARD_PASSWORD=dashboard-password:latest,RESEARCH_OUTREACH_SERVICE_TOKEN=research-outreach-service-token:latest,GEMINI_API_KEY=gemini-api-key:latest,SMTP_PASSWORD=outreach-smtp-password:latest,IMAP_PASSWORD=outreach-imap-password:latest
+
+gcloud run deploy multi-agents-research-worker `
+   --image asia-northeast1-docker.pkg.dev/PROJECT/agents/csg-agents:TAG `
+   --region asia-northeast1 `
+   --service-account csg-research-worker@PROJECT.iam.gserviceaccount.com `
+   --command python `
+   --args=-m,csg.worker `
+   --port 8080 `
+   --cpu 2 `
+   --memory 2Gi `
+   --concurrency 1 `
+   --min 1 `
+   --max 3 `
+   --no-cpu-throttling `
+   --no-allow-unauthenticated `
+   --startup-probe=httpGet.path=/healthz,httpGet.port=8080,periodSeconds=10,timeoutSeconds=2,failureThreshold=6 `
+   --liveness-probe=httpGet.path=/healthz,httpGet.port=8080,periodSeconds=30,timeoutSeconds=2,failureThreshold=3 `
+   --readiness-probe=httpGet.path=/readyz,httpGet.port=8080,periodSeconds=10,timeoutSeconds=2,failureThreshold=3 `
+   --update-env-vars RESEARCH_SUPABASE_URL=https://PROJECT.supabase.co,OUTREACH_API_BASE=https://API_SERVICE.run.app/outreach,RESEARCH_WORKER_ENABLED=true `
+   --update-secrets RESEARCH_SUPABASE_SERVICE_KEY=research-supabase-service-key:latest,RESEARCH_OUTREACH_SERVICE_TOKEN=research-outreach-service-token:latest,GEMINI_API_KEY=gemini-api-key:latest,TAVILY_API_KEY=tavily-api-key:latest,GROQ_API_KEY=groq-api-key:latest,HUNTER_API_KEY=hunter-api-key:latest
+```
+
+Also attach any configured `GEMINI_API_KEY_2`/additional Gemini keys and optional qualification credentials such as `ANTHROPIC_API_KEY`. The worker needs Research provider variables and `OUTREACH_API_BASE` if automatic Outreach handoff is enabled; it does not need Outreach's Supabase credentials. `RESEARCH_OUTREACH_SERVICE_TOKEN` must be the same high-entropy Secret Manager value on API and worker. It authorizes only `POST /outreach/import`, `GET /outreach/jobs/{id}`, `POST /outreach/campaigns`, and `DELETE /outreach/research/runs/{id}`. Other endpoints still require Dashboard authentication. Do not reuse the Dashboard password or a Supabase key. Grant each runtime service account `roles/secretmanager.secretAccessor` on only its required secrets. The worker does not need `roles/run.invoker`; it calls the API using the scoped application token. Allow outbound HTTPS to Supabase, providers, and the API URL.
+
+The API requires both Supabase URL/key pairs, `DASHBOARD_PASSWORD`, and `RESEARCH_OUTREACH_SERVICE_TOKEN`. Configure the mail host/port/user/from-address and IMAP host/port/user as plain service environment variables; store SMTP and IMAP passwords in Secret Manager. The API also needs the Research/Outreach provider keys that its enabled routes use. Add optional secrets only when configured: `TAVILY_API_KEY`, `GROQ_API_KEY`, `HUNTER_API_KEY`, `ANTHROPIC_API_KEY`, numbered Gemini keys, sender-account credentials (`SENDER2_*`, etc.), `CALENDLY_API_TOKEN`, `CALENDLY_WEBHOOK_SIGNING_KEY`, and `AUTOMATION_TRIGGER_TOKEN` if Cloud Scheduler invokes the automation trigger. `CALENDLY_URL` is a non-secret environment variable. Remove absent optional secret bindings from the example command rather than creating empty or fake secrets. Keep `AUTO_SYNC_ENABLED=false` for the Cloud Run composition service.
+
+The worker requires only the Research Supabase URL/key, `GEMINI_API_KEY`, and `RESEARCH_WORKER_ENABLED=true`. Add `HUNTER_API_KEY` if discovery jobs perform contact search, `TAVILY_API_KEY` and `GROQ_API_KEY` for fallback discovery, `ANTHROPIC_API_KEY` if qualification fallback is enabled, additional Gemini keys as configured, and the shared handoff token plus `OUTREACH_API_BASE` if automatic handoff is enabled. No Outreach database credentials or mail-sending credentials belong on the worker.
+
+The API settings above are request-based CPU, minimum 0 / maximum 5 instances, concurrency 10, and a 300-second timeout. CPU 2 and memory 2Gi are example sizing values and must be adjusted to the verified current service or load test; the production configuration should not be assumed from this example. The worker uses instance-based billing / always-allocated CPU, minimum 1 / maximum 3 instances, and HTTP concurrency 1. The deploy commands configure startup/liveness probes on `GET /healthz` and worker readiness on `GET /readyz`, port 8080. While enabled, `/readyz` reports `ready`; while intentionally disabled, it remains HTTP 200 with `paused` so Cloud Run can route to the idle revision; it returns 503 only if the lifespan is not active or is stopping. `/healthz` includes the enabled flag, worker identity, active job ID, and last scan timestamp. Multiple worker instances are safe because database claims are conditional; a stale recoverable-row scan cannot itself claim work.
+
+Deploy in this order: apply migration 010, deploy the API revision, then deploy the worker. Verify API `/healthz`, worker `/healthz` and `/readyz`, `worker_started` logs, and a test job's `worker_id`, `lease_until`, checkpoint rows, and terminal status. On SIGTERM the worker stops scanning for additional jobs. A synchronous provider call cannot be safely interrupted; Cloud Run's shutdown grace period is finite, so an active call may be terminated, leaving the job running until its lease expires (10 minutes) and a replacement worker reclaims it. Completed checkpointed work is reused; a provider call interrupted before its result is checkpointed can repeat. Do not delete old `agent_jobs` rows as part of deployment.
+
+**Independent rollback**: keep migration 010 applied; it is additive and the previous API does not depend on it. Roll the API back without changing the worker using `gcloud run services update-traffic multi-agents --region asia-northeast1 --to-revisions=KNOWN_GOOD_API_REVISION=100`. Roll the worker back independently with `gcloud run services update-traffic multi-agents-research-worker --region asia-northeast1 --to-revisions=KNOWN_GOOD_WORKER_REVISION=100`. If rolling the API back to a revision that executes jobs in-process, first deploy a worker revision with `RESEARCH_WORKER_ENABLED=false`, route 100% worker traffic to that paused revision (`gcloud run services update-traffic multi-agents-research-worker --region asia-northeast1 --to-latest`), and verify the active revision reports `/readyz` `{"status":"paused"}`, `/healthz` reports `worker_enabled:false`, and `worker_disabled` is logged. Confirm prior worker revisions have 0% traffic and inspect active `agent_jobs` leases before shifting API traffic. To resume worker processing, deploy/update with `RESEARCH_WORKER_ENABLED=true` and verify the enabled revision is receiving traffic. If migration rollback is later required, first roll both services to versions that do not call the RPC and verify no checkpoint reads are in flight; only then should a database owner remove the function/table. Do not drop the migration as part of routine application rollback.
 
 **Calendly webhook**: register `https://<backend>/outreach/calendly/webhook` (or the root alias `/calendly/webhook`) and set `CALENDLY_WEBHOOK_SIGNING_KEY`; the signature is verified and unsigned calls are rejected. See [Outreach_Agent/README.md](Outreach_Agent/README.md#calendly-integration).
 
@@ -166,7 +228,7 @@ Each agent uses its own Supabase project. For each project:
    - Research Agent: [Research_Agent/schema.sql](Research_Agent/schema.sql)
    - Outreach Agent: [Outreach_Agent/schema.sql](Outreach_Agent/schema.sql)
 3. Copy the project's URL and service-role key (Settings → API) to your `.env`.
-4. Apply every migration newer than the existing project's recorded state. Research currently has migrations `001` through `007` (including both `006` files); Outreach has `001` through `010`, `014`, and `015`. Apply `014b_backfill_sender_email.sql` only after confirming every past send used the default `OUTREACH_FROM_EMAIL` account. Do not run migrations blindly against production; review them in the Supabase SQL editor first. The complete `schema.sql` files are idempotent and include the current assessment, evidence, Calendly, follow-up, learning, optimization, and automation tables.
+4. Apply every migration newer than the existing project's recorded state. Research currently has migrations `001` through `010` (including both `006` files); Outreach has `001` through `010`, `014`, and `015`. Apply `014b_backfill_sender_email.sql` only after confirming every past send used the default `OUTREACH_FROM_EMAIL` account. Do not run migrations blindly against production; review them in the Supabase SQL editor first. The complete `schema.sql` files are idempotent and include the current assessment, evidence, durable jobs/checkpoints, Calendly, follow-up, learning, optimization, and automation tables.
 
 ## Monitoring & logs
 

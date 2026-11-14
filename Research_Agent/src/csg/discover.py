@@ -26,6 +26,8 @@ a campaign -- sending an email is always a separate, later, human action.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -36,8 +38,10 @@ from .config import Config
 from .db import SupabaseConn
 from .discovery import (DiscoveryError, WebSearchProvider, GroqTavilyProvider,
                         deduplicate_and_resolve, enrich_company_firmographics)
+from .discovery.base import CompanyCandidate
 from .http import Fetcher
 from .models import Company
+from .diagnostics import log_event
 from .usage_tracker import classify_error
 
 # Enrichment is one LLM round trip per company; run a bounded number at once so
@@ -48,6 +52,27 @@ ENRICH_CONCURRENCY = 2
 ProgressFn = Callable[[str, int, int, str], None]
 ENRICH_TIMEOUT_SECONDS = 180.0
 """stage, done, total, detail"""
+
+
+def _call_with_compatible_kwargs(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Pass only the keyword arguments a caller actually accepts.
+
+    The discovery pipeline adds checkpoint/lease hooks over time. Older mocks,
+    wrappers, and compatibility shims still call the legacy entrypoints without
+    these newer kwargs, so we drop the unsupported names instead of crashing.
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return func(*args, **kwargs)
+
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    filtered = {
+        key: value
+        for key, value in kwargs.items()
+        if accepts_var_kw or key in params
+    }
+    return func(*args, **filtered)
 
 
 @dataclass
@@ -163,8 +188,26 @@ def _needs_identity_enrichment(existing: Optional[Company]) -> bool:
     return datetime.now(timezone.utc) - newest >= timedelta(days=30)
 
 
+def _restore_discovery_manifest(
+    checkpoint: Optional[dict[str, Any]],
+) -> Optional[tuple[str, list[CompanyCandidate]]]:
+    if not checkpoint or checkpoint.get("status") != "done":
+        return None
+    payload = checkpoint.get("payload") or {}
+    provider_name = payload.get("provider_name")
+    if not isinstance(provider_name, str) or not provider_name:
+        return None
+    return provider_name, [
+        CompanyCandidate.model_validate(row) for row in payload.get("candidates", [])
+    ]
+
+
 async def _enrich_all(
     conn: SupabaseConn, candidates: list, region: str, on_progress: Optional[ProgressFn],
+    checkpoint_load: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
+    checkpoint_save: Optional[Callable[[str, str, dict[str, Any]], bool]] = None,
+    tavily_plan_limited: Optional[asyncio.Event] = None,
+    ensure_owned: Optional[Callable[[], None]] = None,
 ) -> tuple[list[tuple[Any, Company]], int, dict[str, int]]:
     """Build Company rows, enriching only the ones we have not researched yet."""
     pairs: list[tuple[Any, Company]] = []
@@ -181,6 +224,25 @@ async def _enrich_all(
             industry=c.industry or (existing.industry if existing else None),
             status="discovered",
         )
+        checkpoint = checkpoint_load(f"enrich:{c.domain}") if checkpoint_load else None
+        if checkpoint and checkpoint.get("status") in ("done", "failed"):
+            saved = checkpoint.get("payload") or {}
+            company = Company.model_validate(saved.get("company") or company.model_dump(mode="json"))
+            reason = saved.get("reason")
+            if reason:
+                failures[reason] = failures.get(reason, 0) + 1
+            pairs.append((c, company))
+            continue
+        if checkpoint and checkpoint.get("status") == "started":
+            reason = "interrupted"
+            failures[reason] = failures.get(reason, 0) + 1
+            if checkpoint_save and not checkpoint_save(
+                f"enrich:{c.domain}", "failed",
+                {"company": company.model_dump(mode="json"), "reason": reason},
+            ):
+                raise asyncio.CancelledError()
+            pairs.append((c, company))
+            continue
         if existing is not None and not (_needs_enrichment(existing) or _needs_identity_enrichment(existing)):
             # Carry forward what we already know instead of paying for it again.
             company.employee_count = existing.employee_count
@@ -202,23 +264,52 @@ async def _enrich_all(
     async def one(company: Company) -> None:
         nonlocal done
         async with sem:
+            if ensure_owned:
+                ensure_owned()
             if on_progress:
                 on_progress("enrich", done, len(todo), f"researching {company.domain}")
+            checkpoint_key = f"enrich:{company.domain}"
+            if checkpoint_save and not checkpoint_save(checkpoint_key, "started", {}):
+                raise asyncio.CancelledError()
             try:
-                reason = await asyncio.wait_for(
-                    enrich_company_firmographics(company), timeout=ENRICH_TIMEOUT_SECONDS,
+                enrichment = (
+                    enrich_company_firmographics(company, tavily_plan_limited)
+                    if tavily_plan_limited is not None
+                    else enrich_company_firmographics(company)
                 )
+                reason = await asyncio.wait_for(
+                    enrichment, timeout=ENRICH_TIMEOUT_SECONDS,
+                )
+                if ensure_owned:
+                    ensure_owned()
                 if reason:
                     failures[reason] = failures.get(reason, 0) + 1
             except asyncio.TimeoutError:
                 reason = "timeout"
                 print(f"  [WARN] enrichment timed out after {ENRICH_TIMEOUT_SECONDS:.0f}s for {company.domain}")
+                log_event("enrichment_timeout", domain=company.domain, timeout_seconds=ENRICH_TIMEOUT_SECONDS)
                 failures[reason] = failures.get(reason, 0) + 1
+                if checkpoint_save and not checkpoint_save(
+                    checkpoint_key, "failed",
+                    {"company": company.model_dump(mode="json"), "reason": reason},
+                ):
+                    raise asyncio.CancelledError()
             except Exception as exc:  # a failed lookup must not kill the run
                 reason = classify_error(exc)
                 print(f"  [WARN] enrichment failed for {company.domain} ({reason}): "
                       f"{type(exc).__name__}: {exc}")
                 failures[reason] = failures.get(reason, 0) + 1
+                if checkpoint_save and not checkpoint_save(
+                    checkpoint_key, "failed",
+                    {"company": company.model_dump(mode="json"), "reason": reason},
+                ):
+                    raise asyncio.CancelledError()
+            else:
+                if checkpoint_save and not checkpoint_save(
+                    checkpoint_key, "done",
+                    {"company": company.model_dump(mode="json"), "reason": reason},
+                ):
+                    raise asyncio.CancelledError()
             done += 1
             if on_progress:
                 on_progress("enrich", done, len(todo), company.domain)
@@ -239,6 +330,9 @@ async def run_discovery(
     on_progress: Optional[ProgressFn] = None,
     auto_qualify_top: Optional[int] = None,
     auto_pipeline: bool = True,
+    checkpoint_load: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
+    checkpoint_save: Optional[Callable[[str, str, dict[str, Any]], bool]] = None,
+    ensure_owned: Optional[Callable[[], None]] = None,
 ) -> DiscoveryStats:
     """Discover, research, score, and export prospects for one region.
 
@@ -270,29 +364,42 @@ async def run_discovery(
     owns_conn = conn is None
     conn = conn or db.connect()
     try:
+        if ensure_owned:
+            ensure_owned()
         h = cfg.http
 
         # --- 1. discover ---
         if on_progress:
             on_progress("discover", 0, 1, region)
-        async with Fetcher(
-            user_agent=h["user_agent"], per_host_delay=float(h["per_host_delay_seconds"]),
-            timeout=float(h["timeout_seconds"]), cache_ttl_hours=float(h["cache_ttl_hours"]),
-            max_concurrency=int(h["max_concurrency"]), use_cache=use_cache,
-        ) as fetcher:
-            provider = WebSearchProvider(fetcher=fetcher, cfg=cfg)
-            try:
-                candidates = deduplicate_and_resolve(
-                    await provider.discover(region=region, limit=limit))
-            except DiscoveryError as exc:
-                # Gemini's key pool is exhausted/unavailable -- fall back to
-                # Tavily search + Groq parsing rather than failing the run,
-                # same ICP-driven prompts, just a different backend.
-                print(f"  [WARN] Gemini discovery unavailable ({exc}); falling back to Tavily+Groq")
-                provider = GroqTavilyProvider(fetcher=fetcher, cfg=cfg)
-                candidates = deduplicate_and_resolve(
-                    await provider.discover(region=region, limit=limit))
-        provider_name = provider.name
+        discovery_checkpoint = checkpoint_load("discovery") if checkpoint_load else None
+        restored_manifest = _restore_discovery_manifest(discovery_checkpoint)
+        if restored_manifest is not None:
+            provider_name, candidates = restored_manifest
+        else:
+            if checkpoint_save and not checkpoint_save("discovery", "started", {}):
+                raise asyncio.CancelledError()
+            async with Fetcher(
+                user_agent=h["user_agent"], per_host_delay=float(h["per_host_delay_seconds"]),
+                timeout=float(h["timeout_seconds"]), cache_ttl_hours=float(h["cache_ttl_hours"]),
+                max_concurrency=int(h["max_concurrency"]), use_cache=use_cache,
+            ) as fetcher:
+                provider = WebSearchProvider(fetcher=fetcher, cfg=cfg)
+                try:
+                    candidates = deduplicate_and_resolve(
+                        await provider.discover(region=region, limit=limit))
+                except DiscoveryError as exc:
+                    print(f"  [WARN] Gemini discovery unavailable ({exc}); falling back to Tavily+Groq")
+                    provider = GroqTavilyProvider(fetcher=fetcher, cfg=cfg)
+                    candidates = deduplicate_and_resolve(
+                        await provider.discover(region=region, limit=limit))
+            if ensure_owned:
+                ensure_owned()
+            provider_name = provider.name
+            if checkpoint_save and not checkpoint_save("discovery", "done", {
+                "provider_name": provider_name,
+                "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+            }):
+                raise asyncio.CancelledError()
         stats.discovered = len(candidates)
         if on_progress:
             on_progress("discover", 1, 1, f"{len(candidates)} companies")
@@ -340,10 +447,20 @@ async def run_discovery(
         stats.discovered = len(candidates) + len(matches)
 
         # --- 2. enrich (skips companies already researched) ---
-        pairs, skipped, enrich_failures = await _enrich_all(conn, candidates, region, on_progress)
+        tavily_plan_limited = asyncio.Event() if checkpoint_save else None
+        pairs, skipped, enrich_failures = await _enrich_all(
+            conn, candidates, region, on_progress,
+            checkpoint_load=checkpoint_load,
+            checkpoint_save=checkpoint_save,
+            tavily_plan_limited=tavily_plan_limited,
+            ensure_owned=ensure_owned,
+        )
         stats.enriched = len(pairs) - skipped - sum(enrich_failures.values())
         stats.enrich_skipped = skipped
         stats.enrich_failures = enrich_failures
+
+        if ensure_owned:
+            ensure_owned()
 
         # --- 3. persist ---
         # claim_company is an atomic insert-if-absent: if a concurrent run
@@ -352,6 +469,8 @@ async def run_discovery(
         rows = []
         claimed_pairs = []
         for candidate, company in pairs:
+            if ensure_owned:
+                ensure_owned()
             if (not db.claim_company(conn, company) and company.domain not in own
                     and company.domain not in reeligible):
                 matches[company.domain] = Match(company.domain, "domain")
@@ -396,6 +515,8 @@ async def run_discovery(
             cfg, [c for _, c in pairs], conn, rid,
             use_cache=use_cache, on_progress=pipeline_progress,
             label=label or f"discover {region}",
+            skip_scored=checkpoint_save is not None,
+            ensure_owned=ensure_owned,
         )
 
         # --- 5. export ---
@@ -411,9 +532,23 @@ async def run_discovery(
         # None falls through to auto_pipeline's configured default cap.
         top_n = auto_qualify_top if auto_qualify_top is not None else (cfg.auto_qualify_top_n if auto_pipeline else 0)
         if top_n:
-            await _auto_qualify_and_contact(conn, rid, top_n, stats, on_progress)
+            await _call_with_compatible_kwargs(
+                _auto_qualify_and_contact,
+                conn, rid, top_n, stats, on_progress,
+                checkpoint_load=checkpoint_load,
+                checkpoint_save=checkpoint_save,
+                ensure_owned=ensure_owned,
+            )
             if stats.qualify or stats.contacts:
-                await _handoff_to_outreach(cfg, rid, stats, on_progress)
+                if ensure_owned:
+                    ensure_owned()
+                await _call_with_compatible_kwargs(
+                    _handoff_to_outreach,
+                    cfg, rid, stats, on_progress,
+                    checkpoint_load=checkpoint_load,
+                    checkpoint_save=checkpoint_save,
+                    ensure_owned=ensure_owned,
+                )
 
         return stats
     finally:
@@ -427,6 +562,8 @@ async def resume_stalled(
     domains: list[str],
     conn: Optional[SupabaseConn] = None,
     on_progress: Optional[ProgressFn] = None,
+    checkpoint_load: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
+    checkpoint_save: Optional[Callable[[str, str, dict[str, Any]], bool]] = None,
 ) -> DiscoveryStats:
     """Continue a run for the companies that stalled last time -- scored 0
     with no ATS board and no firmographics, the signature of every provider
@@ -466,29 +603,79 @@ async def resume_stalled(
         stats.discovered = len(companies)
 
         # --- re-enrich only the stalled ones (skips if already researched) ---
-        todo = [c for c in companies if _needs_enrichment(c) or _needs_identity_enrichment(c)]
+        todo = []
+        failed: dict[str, str] = {}
+        for index, company in enumerate(companies):
+            checkpoint = checkpoint_load(f"enrich:{company.domain}") if checkpoint_load else None
+            if checkpoint and checkpoint.get("status") in ("done", "failed"):
+                saved = checkpoint.get("payload") or {}
+                companies[index] = Company.model_validate(saved.get("company") or company.model_dump(mode="json"))
+                if saved.get("reason"):
+                    failed[company.domain] = saved["reason"]
+                continue
+            if checkpoint and checkpoint.get("status") == "started":
+                failed[company.domain] = "interrupted"
+                if checkpoint_save and not checkpoint_save(
+                    f"enrich:{company.domain}", "failed",
+                    {"company": company.model_dump(mode="json"), "reason": "interrupted"},
+                ):
+                    raise asyncio.CancelledError()
+                continue
+            if _needs_enrichment(company) or _needs_identity_enrichment(company):
+                todo.append(company)
         sem = asyncio.Semaphore(ENRICH_CONCURRENCY)
         done = 0
         failures: dict[str, int] = {}
+        tavily_plan_limited = asyncio.Event() if checkpoint_save else None
 
         async def one(company: Company) -> None:
             nonlocal done
             async with sem:
+                checkpoint_key = f"enrich:{company.domain}"
+                if checkpoint_save and not checkpoint_save(checkpoint_key, "started", {}):
+                    raise asyncio.CancelledError()
                 try:
-                    reason = await enrich_company_firmographics(company)
+                    enrichment = (
+                        enrich_company_firmographics(company, tavily_plan_limited)
+                        if tavily_plan_limited is not None
+                        else enrich_company_firmographics(company)
+                    )
+                    reason = await asyncio.wait_for(enrichment, timeout=ENRICH_TIMEOUT_SECONDS)
                     if reason:
                         failures[reason] = failures.get(reason, 0) + 1
+                    checkpoint_status = "failed" if reason else "done"
+                    if checkpoint_save and not checkpoint_save(
+                        checkpoint_key, checkpoint_status,
+                        {"company": company.model_dump(mode="json"), "reason": reason},
+                    ):
+                        raise asyncio.CancelledError()
+                except asyncio.TimeoutError:
+                    reason = "timeout"
+                    failures[reason] = failures.get(reason, 0) + 1
+                    log_event("enrichment_timeout", domain=company.domain, timeout_seconds=ENRICH_TIMEOUT_SECONDS)
+                    if checkpoint_save and not checkpoint_save(
+                        checkpoint_key, "failed",
+                        {"company": company.model_dump(mode="json"), "reason": reason},
+                    ):
+                        raise asyncio.CancelledError()
                 except Exception as exc:
                     reason = classify_error(exc)
                     print(f"  [WARN] enrichment failed for {company.domain} ({reason}): "
                           f"{type(exc).__name__}: {exc}")
                     failures[reason] = failures.get(reason, 0) + 1
+                    if checkpoint_save and not checkpoint_save(
+                        checkpoint_key, "failed",
+                        {"company": company.model_dump(mode="json"), "reason": reason},
+                    ):
+                        raise asyncio.CancelledError()
                 done += 1
                 if on_progress:
                     on_progress("enrich", done, len(todo), company.domain)
 
         if todo:
             await asyncio.gather(*(one(c) for c in todo))
+        for reason in failed.values():
+            failures[reason] = failures.get(reason, 0) + 1
         stats.enriched = len(companies) - len(todo) - sum(failures.values())
         stats.enrich_skipped = len(companies) - len(todo)
         stats.enrich_failures = failures
@@ -519,7 +706,9 @@ async def resume_stalled(
 
 async def _auto_qualify_and_contact(
     conn: SupabaseConn, run_id: str, top_n: int, stats: DiscoveryStats,
-    on_progress: Optional[ProgressFn],
+    on_progress: Optional[ProgressFn], ensure_owned: Optional[Callable[[], None]] = None,
+    checkpoint_load: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
+    checkpoint_save: Optional[Callable[[str, str, dict[str, Any]], bool]] = None,
 ) -> None:
     """Qualify + find contacts for the top `top_n` Tier A/B scored companies
     -- see run_discovery's docstring.
@@ -548,13 +737,18 @@ async def _auto_qualify_and_contact(
     stats.auto_qualify_skipped_tier = 0
     if not domains:
         return
+    if ensure_owned:
+        ensure_owned()
 
     def qual_progress(done: int, total: int, domain: str) -> None:
         if on_progress:
             on_progress("qualify", done, total, domain)
 
     try:
-        stats.qualify = await qualify_mod.qualify_run(conn, run_id, domains=domains, on_progress=qual_progress)
+        stats.qualify = await _call_with_compatible_kwargs(
+            qualify_mod.qualify_run,
+            conn, run_id, domains=domains, on_progress=qual_progress, ensure_owned=ensure_owned,
+        )
     except qualify_mod.QualificationError as exc:
         stats.qualify = {"error": str(exc)}
 
@@ -563,7 +757,15 @@ async def _auto_qualify_and_contact(
             on_progress("contacts", done, total, domain)
 
     try:
-        stats.contacts = await contacts_mod.discover_run(conn, domains, on_progress=contact_progress)
+        stats.contacts = await _call_with_compatible_kwargs(
+            contacts_mod.discover_run,
+            conn, domains, on_progress=contact_progress,
+            checkpoint_load=(lambda key: checkpoint_load(f"auto:{key}")) if checkpoint_load else None,
+            checkpoint_save=(
+                lambda key, status, payload: checkpoint_save(f"auto:{key}", status, payload)
+            ) if checkpoint_save else None,
+            ensure_owned=ensure_owned,
+        )
     except contacts_mod.ContactDiscoveryError as exc:
         stats.contacts = {"error": str(exc)}
 
@@ -597,6 +799,9 @@ def _campaign_name(run_id: str, stats: DiscoveryStats, imported_count: int) -> s
 
 async def _handoff_to_outreach(
     cfg: Config, run_id: str, stats: DiscoveryStats, on_progress: Optional[ProgressFn],
+    checkpoint_load: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
+    checkpoint_save: Optional[Callable[[str, str, dict[str, Any]], bool]] = None,
+    ensure_owned: Optional[Callable[[], None]] = None,
 ) -> None:
     """Pull this run's freshly-qualified Tier A/B prospects into the Outreach
     Agent and draft a campaign for them -- the automatic Research -> Outreach
@@ -615,6 +820,16 @@ async def _handoff_to_outreach(
     if not base:
         return
 
+    handoff_key = "outreach_handoff"
+    existing = checkpoint_load(handoff_key) if checkpoint_load else None
+    if existing and existing.get("status") == "done":
+        stats.outreach = (existing.get("payload") or {}).get("result")
+        return
+    if ensure_owned:
+        ensure_owned()
+    if checkpoint_save and not checkpoint_save(handoff_key, "started", {"run_id": run_id}):
+        raise asyncio.CancelledError()
+
     if on_progress:
         on_progress("outreach", 0, 1, "importing prospects")
 
@@ -622,7 +837,14 @@ async def _handoff_to_outreach(
 
     client = OutreachClient(base)
     try:
-        imported = client.import_prospects(run_id, tiers=["A", "B"])
+        imported = _call_with_compatible_kwargs(
+            client.import_prospects,
+            run_id,
+            tiers=["A", "B"],
+            idempotency_key=f"research-handoff-import:{run_id}",
+        )
+        if ensure_owned:
+            ensure_owned()
         imported_count = imported.get("imported", 0)
         excluded = imported.get("excluded_no_contact", [])
         if not imported_count:
@@ -630,15 +852,23 @@ async def _handoff_to_outreach(
                 "imported": 0, "campaign_id": None, "item_count": 0,
                 "excluded_no_contact": excluded,
             }
+            if checkpoint_save and not checkpoint_save(
+                handoff_key, "done", {"run_id": run_id, "result": stats.outreach},
+            ):
+                raise asyncio.CancelledError()
             return
 
         if on_progress:
             on_progress("outreach", 1, 2, "drafting campaign")
 
-        created = client.create_campaign(
+        created = _call_with_compatible_kwargs(
+            client.create_campaign,
             name=_campaign_name(run_id, stats, imported_count),
             research_run_id=run_id, tiers=["A", "B"],
+            campaign_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"csg-research-run:{run_id}")),
         )
+        if ensure_owned:
+            ensure_owned()
         campaign = created.get("campaign") or {}
         # Merge import-time and campaign-time exclusions (the latter would
         # only differ if a prospect lost its contact between the two calls,
@@ -655,9 +885,19 @@ async def _handoff_to_outreach(
             "item_count": created.get("item_count", 0),
             "excluded_no_contact": excluded,
         }
+        if checkpoint_save and not checkpoint_save(
+            handoff_key, "done", {"run_id": run_id, "result": stats.outreach},
+        ):
+            raise asyncio.CancelledError()
         if on_progress:
             on_progress("outreach", 2, 2, "done")
     except OutreachClientError as exc:
+        if exc.retryable:
+            raise
         stats.outreach = {"error": str(exc)}
+        if checkpoint_save and not checkpoint_save(
+            handoff_key, "done", {"run_id": run_id, "result": stats.outreach},
+        ):
+            raise asyncio.CancelledError()
     finally:
         client.close()

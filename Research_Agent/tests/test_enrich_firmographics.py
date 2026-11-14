@@ -776,6 +776,27 @@ def test_no_gemini_and_no_fallback_keys_reports_quota_exhausted(monkeypatch):
     assert reason == "quota_exhausted"
 
 
+def test_tavily_432_stops_later_fallback_calls(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(432, request=request, json={"detail": {"error": "plan limit exceeded"}})
+
+    _patch_httpx_client(monkeypatch, handler)
+    limited = asyncio.Event()
+
+    first_reason = asyncio.run(research._enrich_via_groq_tavily(_company("first.example"), limited))
+    second_reason = asyncio.run(research._enrich_via_groq_tavily(_company("second.example"), limited))
+
+    assert first_reason == "quota_exhausted"
+    assert second_reason == "quota_exhausted"
+    assert limited.is_set()
+    assert len(requests) == 1
+
+
 def test_tavily_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
     """Regression: seen live as 2 companies reported "enrichment request
     failed" in a run where Gemini was fully quota-exhausted for every

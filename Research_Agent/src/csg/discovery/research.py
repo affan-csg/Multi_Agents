@@ -30,6 +30,7 @@ from .gemini_keys import (
 )
 from .groq_tavily import GroqTavilyProvider, _GROQ_URL, _GROQ_MODEL, _TAVILY_URL
 from ..models import Company, ProvenanceValue, provenance_value
+from ..diagnostics import log_event
 from ..usage_tracker import track
 
 _GEMINI_MODEL = "gemini-3.8-flash"
@@ -684,7 +685,9 @@ _TAVILY_RATE_LIMIT_RETRIES = 2
 _TAVILY_RATE_LIMIT_DEFAULT_WAIT = 5.0
 
 
-async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
+async def _enrich_via_groq_tavily(
+    company: Company, tavily_plan_limited: Optional[asyncio.Event] = None,
+) -> Optional[str]:
     """Fallback firmographic enrichment via Tavily search + Groq parsing.
 
     Used when the Gemini key pool is missing or every key's daily quota is
@@ -698,6 +701,15 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
     on either provider surfaced immediately as "enrichment request failed"
     even though the correct response was just to wait and retry.
     """
+    if tavily_plan_limited is not None and tavily_plan_limited.is_set():
+        now = _utc_now_iso()
+        for field, criterion in _FIELD_CRITERIA.items():
+            outcome = company.research_outcomes.setdefault(field, {
+                "status": "not_searched", "criterion": criterion, "checked_at": now,
+            })
+            outcome["reason"] = "Tavily key or plan limit was reached earlier in this run"
+        return "quota_exhausted"
+
     groq_key = os.environ.get("GROQ_API_KEY")
     tavily_key = os.environ.get("TAVILY_API_KEY")
     if not groq_key or not tavily_key:
@@ -727,6 +739,10 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
                             "search_depth": "basic",
                             "include_raw_content": "markdown",
                         }, timeout=20.0)
+                        if r.status_code == 432:
+                            u.mark_failure(status_code=432, error_kind="quota_exhausted")
+                            if tavily_plan_limited is not None:
+                                tavily_plan_limited.set()
                         if r.status_code in {429, 500, 502, 503, 504} and attempt < _TAVILY_RATE_LIMIT_RETRIES:
                             u.retry_count += 1
                             wait = min(_ENRICH_RETRY_DELAY_CAP_SECONDS,
@@ -878,10 +894,12 @@ async def _enrich_via_groq_tavily(company: Company) -> Optional[str]:
                 outcome["reason"] = f"search did not complete: {reason}"
             else:
                 outcome["reason"] = f"search completed but structured extraction failed: {reason}"
-        return reason if reason in ("connection_error", "timeout", "rate_limited") else "request_error"
+        return reason if reason in ("connection_error", "timeout", "rate_limited", "quota_exhausted") else "request_error"
 
 
-async def enrich_company_firmographics(company: Company) -> Optional[str]:
+async def enrich_company_firmographics(
+    company: Company, tavily_plan_limited: Optional[asyncio.Event] = None,
+) -> Optional[str]:
     """Enrich a company with real firmographic data via Gemini API.
 
     Falls back to Tavily+Groq (see _enrich_via_groq_tavily) if no Gemini key
@@ -896,9 +914,15 @@ async def enrich_company_firmographics(company: Company) -> Optional[str]:
     """
     _mark_research_not_searched(company, "provider call has not returned usable research results")
     pool = GeminiKeyPool.from_env()
+
+    async def fallback() -> Optional[str]:
+        if tavily_plan_limited is None:
+            return await _enrich_via_groq_tavily(company)
+        return await _enrich_via_groq_tavily(company, tavily_plan_limited)
+
     if not pool:
         print(f"  [WARN] No GEMINI_API_KEY set, trying Tavily+Groq fallback for {company.domain}")
-        return await _enrich_via_groq_tavily(company)
+        return await fallback()
 
     prompt = _PROMPT_TEMPLATE.format(
         domain=company.domain,
@@ -977,12 +1001,12 @@ async def enrich_company_firmographics(company: Company) -> Optional[str]:
             else:
                 reason = "Gemini request failed"
             print(f"  [WARN] {reason} for {company.domain}, trying Tavily+Groq fallback: {last_exc}")
-            return await _enrich_via_groq_tavily(company)
+            return await fallback()
 
         raw_text = (getattr(response, "text", "") or "").strip()
         if not raw_text:
             print(f"  [WARN] Empty Gemini response for {company.domain}, trying Tavily+Groq fallback")
-            return await _enrich_via_groq_tavily(company)
+            return await fallback()
 
         data = _extract_json_object(raw_text)
         grounding_urls: set[str] = set()
@@ -997,7 +1021,13 @@ async def enrich_company_firmographics(company: Company) -> Optional[str]:
 
         if _gemini_fallback_required(data, grounding_urls):
             print(f"  [WARN] Gemini response for {company.domain} lacked valid grounding URLs, trying Tavily+Groq fallback")
-            return await _enrich_via_groq_tavily(company)
+            log_event(
+                "gemini_grounding_rejected",
+                domain=company.domain,
+                grounding_url_count=len(grounding_urls),
+                reason="missing_or_unverified_grounding",
+            )
+            return await fallback()
 
         _apply_firmographics(
             company, data, source="gemini_grounded_search", allowed_source_urls=grounding_urls,
@@ -1006,7 +1036,7 @@ async def enrich_company_firmographics(company: Company) -> Optional[str]:
 
     except json.JSONDecodeError as e:
         print(f"  [WARN] Could not parse Gemini response for {company.domain}: {e}; trying Tavily+Groq fallback")
-        return await _enrich_via_groq_tavily(company)
+        return await fallback()
     except Exception as e:
         # Reachable only for a failure outside the key-attempt loop itself
         # (e.g. _extract_json_object/_apply_firmographics raising on a

@@ -468,3 +468,27 @@ def test_dashboard_auth_fails_closed_without_password(monkeypatch):
     client = TestClient(server_app.app)
     assert client.get("/research/runs").status_code == 503
     assert client.post("/auth/login", json={"password": ""}).status_code == 503
+
+
+def test_research_service_token_is_limited_to_handoff_routes(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "dashboard-test")
+    monkeypatch.setenv("RESEARCH_OUTREACH_SERVICE_TOKEN", "worker-test-token")
+
+    assert server_app._is_research_service_request("POST", "/outreach/import")
+    assert server_app._is_research_service_request("GET", "/outreach/jobs/job-1")
+    assert server_app._is_research_service_request("POST", "/outreach/campaigns")
+    assert server_app._is_research_service_request("DELETE", "/outreach/research/runs/run-1")
+    assert not server_app._is_research_service_request("POST", "/outreach/campaigns/job-1/send")
+    assert not server_app._is_research_service_request("GET", "/outreach/campaigns")
+
+    client = TestClient(server_app.app)
+    allowed = client.get(
+        "/outreach/jobs/job-1",
+        headers={"X-Research-Service-Token": "worker-test-token"},
+    )
+    denied = client.get(
+        "/outreach/campaigns",
+        headers={"X-Research-Service-Token": "worker-test-token"},
+    )
+    assert allowed.status_code != 401
+    assert denied.status_code == 401

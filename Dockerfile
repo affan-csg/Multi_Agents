@@ -23,4 +23,6 @@ EXPOSE 8000
 
 # Railway injects PORT. CSG_API_BASE is derived from it so the internal
 # Research/Outreach hand-off URLs target the port this server listens on.
+# Cloud Run's dedicated Research worker uses this same image with command
+# override `python -m csg.worker` and its own instance-based service settings.
 CMD ["sh", "-c", "export CSG_API_BASE=\"http://127.0.0.1:${PORT:-8000}\" && exec python -m uvicorn app:app --app-dir Server --host 0.0.0.0 --port ${PORT:-8000}"]

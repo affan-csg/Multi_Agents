@@ -181,7 +181,7 @@ Both agents use PostgreSQL via Supabase PostgREST (service-role key, backend onl
 - `draft_versions`, `learning_insights`, `learning_events` — Learning Agent
 - `campaign_optimization_insights`, `optimization_recommendation_adoptions` — Optimization layer
 
-Migrations are numbered in `migrations/NNN_*.sql` and tracked in git. Research has 001-005. Outreach has 001-010, `014_sender_email.sql`, `015_calendly_deleted_events.sql` and the optional `014b_backfill_sender_email.sql` (only valid if every past send came from the single default account); 011-013 were folded into `schema.sql` and deleted. `schema.sql` in each agent is the full current schema and is safe to re-run on an existing project.
+Migrations are numbered in `migrations/NNN_*.sql` and tracked in git. Research has 001-010 (including both 006 files); 010 adds owner-fenced durable job checkpoints used by the independent `csg.worker` Cloud Run service. Outreach has 001-010, `014_sender_email.sql`, `015_calendly_deleted_events.sql` and the optional `014b_backfill_sender_email.sql` (only valid if every past send came from the single default account); 011-013 were folded into `schema.sql` and deleted. `schema.sql` in each agent is the full current schema and is safe to re-run on an existing project.
 
 ## Common issues & solutions
 

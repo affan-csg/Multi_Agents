@@ -43,6 +43,33 @@ def test_import_prospects_polls_until_done():
     assert calls["job_status_hits"] == 3
 
 
+def test_import_prospects_sends_stable_idempotency_key():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            captured["key"] = request.headers.get("Idempotency-Key")
+            return httpx.Response(200, json={"job_id": "job-1"})
+        return httpx.Response(200, json={"status": "running"})
+
+    client = _client(handler)
+    with pytest.raises(OutreachClientError, match="within"):
+        client.import_prospects(
+            "run-1", tiers=["A", "B"], idempotency_key="research-handoff-import:run-1",
+            poll_interval=0, timeout=0,
+        )
+
+    assert captured["key"] == "research-handoff-import:run-1"
+
+
+def test_http_500_outreach_errors_are_retryable_but_4xx_are_not():
+    for status_code, retryable in ((503, True), (429, True), (400, False)):
+        client = _client(lambda _request: httpx.Response(status_code, text="test"))
+        with pytest.raises(OutreachClientError) as error:
+            client.create_campaign(research_run_id="run-1", tiers=["A", "B"])
+        assert error.value.retryable is retryable
+
+
 def test_import_prospects_raises_on_job_error():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/import":
