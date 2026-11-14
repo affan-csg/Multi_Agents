@@ -68,7 +68,7 @@ Or use the Makefile:
 make install
 ```
 
-## 4. Run the backend (Terminal 1)
+## 4. Run the API (Terminal 1)
 
 ```bash
 python -m uvicorn app:app --app-dir Server --reload \
@@ -84,12 +84,20 @@ make backend
 
 Wait for the output: `Uvicorn running on http://127.0.0.1:8000` (with hot-reload enabled).
 
+## 5. Run the Research worker (Terminal 2)
+
+The API persists Research jobs; this worker claims and executes them.
+
+```bash
+python -m csg.worker
+```
+
 **API endpoints:**
 - Research Agent: http://127.0.0.1:8000/research/docs
 - Outreach Agent: http://127.0.0.1:8000/outreach/docs
 - Combined API: http://127.0.0.1:8000/docs
 
-## 5. Run the Dashboard (Terminal 2)
+## 6. Run the Dashboard (Terminal 3)
 
 ```bash
 cd Dashboard && npm run dev
@@ -132,7 +140,7 @@ make test-dashboard
 
 | Goal | Command |
 |------|---------|
-| Full stack (backend + dashboard) | `make backend` (term 1), `make dashboard` (term 2) |
+| Full stack (API + worker + dashboard) | `make backend` (term 1), `make worker` (term 2), `make dashboard` (term 3) |
 | Run all tests | `make test` |
 | Clean up cache/build files | `make clean` |
 | View all commands | `make help` |

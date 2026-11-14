@@ -24,7 +24,7 @@ cd ..
 
 ### Running the full stack
 
-**Terminal 1 — Backend (both agents + server on :8000)**
+**Terminal 1 — API (both agents + server on :8000)**
 ```bash
 # Activate the shared venv, then:
 python -m uvicorn app:app --app-dir Server --reload \
@@ -32,7 +32,12 @@ python -m uvicorn app:app --app-dir Server --reload \
   --port 8000
 ```
 
-**Terminal 2 — Dashboard (:5173)**
+**Terminal 2 — Durable Research worker**
+```bash
+python -m csg.worker
+```
+
+**Terminal 3 — Dashboard (:5173)**
 ```bash
 cd Dashboard
 npm run dev

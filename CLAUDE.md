@@ -94,9 +94,9 @@ CONTRIBUTING.md, SECURITY.md.
 
 ## Development workflow
 
-### Start the backend and dashboard
+### Start the API, Research worker, and dashboard
 ```bash
-# Terminal 1: Both agents on :8000 via Server composition layer
+# Terminal 1: Both APIs on :8000 via Server composition layer
 python -m venv .venv
 .venv\Scripts\activate  # Windows
 source .venv/bin/activate  # macOS/Linux
@@ -105,7 +105,10 @@ python -m uvicorn app:app --app-dir Server --reload \
   --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src \
   --reload-dir Server --port 8000
 
-# Terminal 2: Dashboard on :5173
+# Terminal 2: Durable Research job worker
+python -m csg.worker
+
+# Terminal 3: Dashboard on :5173
 cd Dashboard && npm install && npm run dev
 ```
 

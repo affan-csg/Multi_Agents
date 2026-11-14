@@ -84,17 +84,20 @@ Outreach Agent.
 
 ## Quickstart
 
-Two terminals: one venv holding both agents' backends behind one port, plus
-the Dashboard (see `run.txt` for the copy-pasteable version):
+Three terminals: the API, the durable Research worker, and the Dashboard
+(see `run.txt` for the copy-pasteable version):
 
 ```
-# Terminal 1 -- one venv, both agents' backends, :8000
+# Terminal 1 -- API, both agents, :8000
 python -m venv .venv
 .venv/Scripts/activate            # macOS/Linux: source .venv/bin/activate
 pip install -e Research_Agent -e Outreach_Agent -e Server
 python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
 
-# Terminal 2 -- the shared Dashboard, :5173
+# Terminal 2 -- durable Research worker
+python -m csg.worker
+
+# Terminal 3 -- the shared Dashboard, :5173
 cd Dashboard
 npm run dev
 ```

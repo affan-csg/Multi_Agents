@@ -8,8 +8,9 @@ help:
 	@echo "  make install       Install all dependencies (Python venv + npm packages)"
 	@echo ""
 	@echo "Development:"
-	@echo "  make dev           Run backend (:8000) + Dashboard (:5173) together [requires 2 terminals]"
-	@echo "  make backend       Run backend only (both agents on :8000)"
+	@echo "  make dev           Run API (:8000), Research worker, and Dashboard [requires 3 terminals]"
+	@echo "  make backend       Run API only (Research + Outreach on :8000)"
+	@echo "  make worker        Run the durable Research job worker"
 	@echo "  make dashboard     Run Dashboard only (:5173)"
 	@echo ""
 	@echo "Testing:"
@@ -38,18 +39,23 @@ install:
 	cd Dashboard && npm ci
 
 dev:
-	@echo "Starting full stack (backend + dashboard)"
-	@echo "Terminal 1: Backend on :8000"
-	@echo "Terminal 2: Dashboard on :5173"
+	@echo "Starting full stack (API + Research worker + dashboard)"
+	@echo "Terminal 1: API on :8000"
+	@echo "Terminal 2: Research worker"
+	@echo "Terminal 3: Dashboard on :5173"
 	@echo ""
 	@echo "To start, run these in separate terminals:"
 	@echo "  make backend"
+	@echo "  make worker"
 	@echo "  make dashboard"
 
 backend:
 	python -m uvicorn app:app --app-dir Server --reload \
 		--reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server \
 		--port 8000
+
+worker:
+	python -m csg.worker
 
 dashboard:
 	cd Dashboard && npm run dev

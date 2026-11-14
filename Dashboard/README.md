@@ -52,7 +52,8 @@ which serves Research at `:8000/research` and Outreach at `:8000/outreach`
 — matching this app's `.env.example` default. For deployment, set
 `VITE_API_URL` in the hosting environment to the backend origin; Vercel
 builds then send API requests to that origin under `/research` and
-`/outreach`.
+`/outreach`. Research jobs also require the separate durable worker process,
+started from the repository root with `python -m csg.worker`.
 
 Use `python -m uvicorn ...`, not the bare `uvicorn` command — on Windows, a
 venv's `uvicorn.exe` launcher hardcodes an absolute path to `python.exe` at

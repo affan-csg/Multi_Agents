@@ -9,10 +9,13 @@ Set-Location Dashboard
 npm install
 Set-Location ..
 
-# Terminal 1: backend (Research + Outreach)
+# Terminal 1: API (Research + Outreach)
 python -m uvicorn app:app --app-dir Server --reload --reload-dir Research_Agent/src --reload-dir Outreach_Agent/src --reload-dir Server --port 8000
 
-# Terminal 2: Dashboard
+# Terminal 2: durable Research worker
+python -m csg.worker
+
+# Terminal 3: Dashboard
 Set-Location Dashboard
 npm run dev
 

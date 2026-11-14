@@ -362,6 +362,22 @@ def test_worker_health_and_readiness_are_available():
     assert getattr(exc_info.value, "status_code", None) == 503
 
 
+@pytest.mark.parametrize("configured_port, expected_port", [(None, 8081), ("8080", 8080)])
+def test_worker_main_uses_local_default_and_honors_runtime_port(
+    monkeypatch, configured_port, expected_port,
+):
+    if configured_port is None:
+        monkeypatch.delenv("PORT", raising=False)
+    else:
+        monkeypatch.setenv("PORT", configured_port)
+    captured = {}
+    monkeypatch.setattr("uvicorn.run", lambda _app, **kwargs: captured.update(kwargs))
+
+    worker.main()
+
+    assert captured["port"] == expected_port
+
+
 def test_disabled_worker_does_not_claim_jobs(monkeypatch):
     scans = []
     monkeypatch.setattr(worker, "WORKER_ENABLED", False)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import threading
 from types import SimpleNamespace
@@ -144,6 +144,28 @@ def test_cancelled_job_is_no_longer_owned_by_worker():
     }
 
     assert not jobs.owns(FakeConn(row), "job-cancelled", "worker-a")
+
+
+@pytest.mark.parametrize("offset_hours", [0, 5])
+def test_owns_normalizes_timezone_aware_supabase_lease(offset_hours):
+    lease_until = (utcnow() + timedelta(minutes=5)).replace(tzinfo=timezone.utc)
+    lease_until = lease_until.astimezone(timezone(timedelta(hours=offset_hours))).isoformat()
+    row = {
+        "job_id": "job-aware-lease", "status": "running", "worker_id": "worker-a",
+        "lease_until": lease_until,
+    }
+
+    assert jobs.owns(FakeConn(row), "job-aware-lease", "worker-a")
+
+
+def test_owns_rejects_expired_timezone_aware_lease():
+    lease_until = (utcnow() - timedelta(seconds=30)).replace(tzinfo=timezone.utc).isoformat()
+    row = {
+        "job_id": "job-expired-aware-lease", "status": "running", "worker_id": "worker-a",
+        "lease_until": lease_until,
+    }
+
+    assert not jobs.owns(FakeConn(row), "job-expired-aware-lease", "worker-a")
 
 
 def test_cancel_endpoint_returns_authoritative_cancelled_snapshot(monkeypatch):

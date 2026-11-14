@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import uuid
 from typing import Any, Optional
@@ -73,6 +73,8 @@ def owns(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
         return False
     if isinstance(lease_until, str):
         lease_until = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+    if lease_until.tzinfo is not None:
+        lease_until = lease_until.astimezone(timezone.utc).replace(tzinfo=None)
     return lease_until > utcnow()
 
 

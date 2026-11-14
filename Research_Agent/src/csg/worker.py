@@ -156,7 +156,7 @@ def main() -> None:
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8080")),
+        port=int(os.environ.get("PORT", "8081")),
         log_level=os.environ.get("LOG_LEVEL", "info"),
     )
 
