@@ -24,7 +24,7 @@ type JobMonitorOptions = {
 };
 
 const isTerminal = (status: JobSnapshot["status"]) =>
-  status === "done" || status === "error" || status === "cancelled";
+  status === "done" || status === "error" || status === "cancelled" || status === "quota_blocked";
 
 export class JobMonitor {
   private socket: WebSocket | null = null;

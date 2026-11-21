@@ -15,6 +15,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
@@ -28,6 +29,7 @@ from .config import load_config, update_icp_basics
 from .discovery import DiscoveryError
 from . import jobs
 from .diagnostics import log_event
+from .gemini_queue import GeminiQuotaBlocked, GeminiRetryLater, resume_global_quota, scheduler_status
 from .models import Prospect
 from .research_assessment import ResearchAssessmentInput, build_assessment
 from .outreach_client import OutreachClientError
@@ -74,6 +76,7 @@ class Job:
     current_domain: Optional[str] = None
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    quota_blocked_until: Optional[str] = None
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     loop: Optional[asyncio.AbstractEventLoop] = None
     persist: bool = True
@@ -83,11 +86,14 @@ class Job:
 
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
-            return {
+            snapshot = {
                 "job_id": self.job_id, "kind": self.kind, "run_id": self.run_id,
                 "status": self.status, "done": self.done, "total": self.total,
                 "current_domain": self.current_domain, "result": self.result, "error": self.error,
             }
+            if self.quota_blocked_until is not None:
+                snapshot["quota_blocked_until"] = self.quota_blocked_until
+            return snapshot
 
     def set_worker_id(self, worker_id: str) -> None:
         with self._state_lock:
@@ -110,6 +116,7 @@ class Job:
                     done=payload["done"], total=payload["total"],
                     current_domain=payload["current_domain"],
                     result=payload["result"], error=payload["error"],
+                    quota_blocked_until=payload.get("quota_blocked_until"),
                 )
             finally:
                 conn.close()
@@ -192,6 +199,23 @@ def _ensure_durable_job_owned(job: Job, worker_id: str, conn: db.SupabaseConn) -
     row = jobs.get(conn, job.job_id)
     message = "Research job was cancelled" if row and row.get("status") == "cancelled" else "Research job ownership was lost"
     raise asyncio.CancelledError(message)
+
+
+def _handle_gemini_pause(job: Job, worker_id: str, conn: db.SupabaseConn,
+                         exc: GeminiQuotaBlocked | GeminiRetryLater) -> None:
+    if isinstance(exc, GeminiQuotaBlocked):
+        until = None
+        if exc.retry_after is not None:
+            until = (datetime.now(timezone.utc) + timedelta(seconds=exc.retry_after)).isoformat()
+        job.publish(worker_id, status="quota_blocked", error=str(exc), quota_blocked_until=until)
+        log_event("job_quota_blocked", job_id=job.job_id, kind=job.kind,
+                  classification=exc.classification, quota_blocked_until=until)
+        return
+    if jobs.requeue(conn, job.job_id, worker_id, delay_seconds=exc.delay_seconds):
+        log_event("job_gemini_retry_queued", job_id=job.job_id, kind=job.kind,
+                  classification=exc.classification, delay_seconds=exc.delay_seconds)
+    else:
+        job.ownership_lost.set()
 
 
 def _new_job(kind: str, run_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,
@@ -324,6 +348,8 @@ def _run_discover_job(job: Job, req: DiscoverRequest) -> None:
     except asyncio.CancelledError:
         if not job.ownership_lost.is_set():
             job.publish(worker_id, status="error", error="Research job was cancelled and can be retried.")
+    except (GeminiQuotaBlocked, GeminiRetryLater) as exc:
+        _handle_gemini_pause(job, worker_id, conn, exc)
     except DiscoveryError as exc:
         job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
@@ -336,28 +362,6 @@ def _run_discover_job(job: Job, req: DiscoverRequest) -> None:
 def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
     """Continue an already-started run for the specific companies that
     stalled (see db.stalled_companies) -- does not re-run discovery, just
-    except OutreachClientError as exc:
-        if not exc.retryable:
-            job.publish(worker_id, status="error", error=f"Outreach handoff failed: {exc}")
-            return
-        try:
-            checkpoint = jobs.get_checkpoint(conn, job.job_id, "outreach_handoff_retry") or {}
-            previous = checkpoint.get("payload") or {}
-            attempts = int(previous.get("attempts", 0)) + 1
-            delay_seconds = min(5 * (2 ** min(attempts - 1, 6)), 300)
-            saved = jobs.save_checkpoint(
-                conn, job.job_id, worker_id, "outreach_handoff_retry",
-                status="retrying", payload={"attempts": attempts, "error": str(exc)},
-            )
-            if saved and jobs.requeue(conn, job.job_id, worker_id, delay_seconds=delay_seconds):
-                log_event(
-                    "outreach_handoff_requeued", job_id=job.job_id, run_id=job.run_id,
-                    worker_id=worker_id, attempts=attempts, delay_seconds=delay_seconds,
-                )
-                return
-        except Exception:
-            logger.exception("Could not durably requeue Research job %s", job.job_id)
-        job.ownership_lost.set()
     re-enrichment + re-scoring for these domains under the same run_id."""
     conn = db.connect()
     heartbeat = None
@@ -394,6 +398,8 @@ def _run_resume_job(job: Job, run_id: str, domains: list[str]) -> None:
     except asyncio.CancelledError:
         if not job.ownership_lost.is_set():
             job.publish(worker_id, status="error", error="Research job was cancelled and can be retried.")
+    except (GeminiQuotaBlocked, GeminiRetryLater) as exc:
+        _handle_gemini_pause(job, worker_id, conn, exc)
     except DiscoveryError as exc:
         job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
@@ -416,13 +422,17 @@ def _run_qualify_job(job: Job, run_id: str, req: QualifyRequest) -> None:
         job.publish(worker_id, status="running")
 
         def progress(done: int, total: int, domain: str) -> None:
+            _ensure_durable_job_owned(job, worker_id, conn)
             job.publish(worker_id, done=done, total=total, current_domain=domain)
 
         stats = asyncio.run(qualify_mod.qualify_run(
             conn, run_id, tiers=req.tiers, limit_reqs=req.limit_reqs,
             force=req.force, on_progress=progress, domains=req.domains,
+            ensure_owned=lambda: _ensure_durable_job_owned(job, worker_id, conn),
         ))
         job.publish(worker_id, status="done", result=stats)
+    except (GeminiQuotaBlocked, GeminiRetryLater) as exc:
+        _handle_gemini_pause(job, worker_id, conn, exc)
     except qualify_mod.QualificationError as exc:
         job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
@@ -447,8 +457,13 @@ def _run_qualify_retry_job(job: Job, run_id: str) -> None:
         def progress(done: int, total: int, domain: str) -> None:
             job.publish(worker_id, done=done, total=total, current_domain=domain)
 
-        stats = asyncio.run(qualify_mod.retry_failed_run(conn, run_id, on_progress=progress))
+        stats = asyncio.run(qualify_mod.retry_failed_run(
+            conn, run_id, on_progress=progress,
+            ensure_owned=lambda: _ensure_durable_job_owned(job, worker_id, conn),
+        ))
         job.publish(worker_id, status="done", result=stats)
+    except (GeminiQuotaBlocked, GeminiRetryLater) as exc:
+        _handle_gemini_pause(job, worker_id, conn, exc)
     except qualify_mod.QualificationError as exc:
         job.publish(worker_id, status="error", error=str(exc))
     except Exception as exc:
@@ -576,13 +591,11 @@ def rename_run(run_id: str, req: RenameRunRequest) -> dict[str, str]:
 
 @app.post("/runs/{run_id}/resume")
 def resume_run(run_id: str, idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
-    """Continue a stalled run -- one where every provider (Gemini, and the
-    Tavily+Groq fallback) was exhausted for some companies, leaving them
-    scored at 0 with no ATS board and no firmographics. Only meaningful for a
-    run that actually has such companies; the frontend only shows this action
-    when stalled_count > 0 (see GET /runs), and this route re-checks that
-    itself rather than trusting the caller. Re-researches just those
-    companies (no re-discovery) -- see discover.resume_stalled."""
+    """Continue a stalled run when Gemini processing previously failed.
+
+    Re-enriches only the selected domains and reruns them through the scoring
+    pipeline under the same run_id. Tavily/Groq fallback processing is disabled.
+    """
     if run_id == "all":
         raise HTTPException(400, "'all' is not a real run and cannot be resumed")
     conn = db.connect()
@@ -1343,12 +1356,15 @@ def list_contacts(run_id: str) -> list[dict[str, Any]]:
 # ----------------------------------------------------------------------------
 
 def _job_snapshot(row: dict[str, Any]) -> dict[str, Any]:
-    return {
+    snapshot = {
         "job_id": row["job_id"], "kind": row["kind"], "run_id": row.get("run_id"),
         "status": row["status"], "done": row.get("done", 0), "total": row.get("total", 0),
         "current_domain": row.get("current_domain"), "result": row.get("result"),
         "error": row.get("error"),
     }
+    if row.get("quota_blocked_until") is not None:
+        snapshot["quota_blocked_until"] = row["quota_blocked_until"]
+    return snapshot
 
 
 @app.get("/jobs/{job_id}")
@@ -1387,6 +1403,39 @@ def cancel_job(job_id: str) -> dict[str, Any]:
         conn.close()
 
 
+@app.post("/jobs/{job_id}/resume")
+def resume_quota_blocked_job(job_id: str) -> dict[str, Any]:
+    conn = db.connect()
+    try:
+        row = jobs.get(conn, job_id)
+        if not row:
+            raise HTTPException(404, "job not found")
+        if row.get("status") in ("pending", "running"):
+            return _job_snapshot(row)
+        if row.get("status") != "quota_blocked" or not jobs.resume_quota_blocked(conn, job_id):
+            raise HTTPException(409, "job is not quota-blocked")
+    finally:
+        conn.close()
+    resume_global_quota()
+    return job_status(job_id)
+
+
+@app.get("/gemini-queue")
+def gemini_queue_status() -> dict[str, Any]:
+    return scheduler_status()
+
+
+@app.post("/gemini-queue/resume")
+def resume_gemini_queue() -> dict[str, Any]:
+    resumed = resume_global_quota()
+    conn = db.connect()
+    try:
+        resumed["resumed_jobs"] = jobs.resume_all_quota_blocked(conn)
+    finally:
+        conn.close()
+    return resumed
+
+
 @app.websocket("/jobs/{job_id}/ws")
 async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
     await websocket.accept()
@@ -1398,7 +1447,7 @@ async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
 
     try:
         await websocket.send_text(json.dumps(last_snapshot))
-        if last_snapshot["status"] in ("done", "error", "cancelled"):
+        if last_snapshot["status"] in ("done", "error", "cancelled", "quota_blocked"):
             return
         while True:
             await asyncio.sleep(1)
@@ -1407,7 +1456,7 @@ async def job_progress_ws(websocket: WebSocket, job_id: str) -> None:
                 continue
             last_snapshot = snap
             await websocket.send_text(json.dumps(snap))
-            if snap["status"] in ("done", "error", "cancelled"):
+            if snap["status"] in ("done", "error", "cancelled", "quota_blocked"):
                 break
     except WebSocketDisconnect:
         pass

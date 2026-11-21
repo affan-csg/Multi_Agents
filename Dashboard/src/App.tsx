@@ -189,7 +189,7 @@ function App() {
     // silently coming back with no employee/revenue data and no explanation.
     const ENRICH_FAILURE_LABEL: Record<string, string> = {
       no_api_key: "no GEMINI_API_KEY (and no GROQ_API_KEY/TAVILY_API_KEY fallback) configured",
-      quota_exhausted: "Gemini quota exhausted and Tavily+Groq fallback also failed or is unconfigured",
+      quota_exhausted: "A provider quota limit was reached — see provider usage details",
       rate_limited: "rate limited (429) — retries exhausted",
       connection_error: "connection/TLS error reaching the API",
       timeout: "request timed out",
@@ -203,6 +203,24 @@ function App() {
           .filter(([, n]) => n > 0)
           .map(([reason, n]) => `${ENRICH_FAILURE_LABEL[reason] || reason} (${n})`);
         problems.push(`Enrichment skipped for ${total} compan${total === 1 ? "y" : "ies"}: ${reasons.join(", ")}`);
+      }
+    }
+    const enrichmentSummary = r.enrichment_summary;
+    if (enrichmentSummary && typeof enrichmentSummary === "object") {
+      const entries = Object.entries(enrichmentSummary);
+      const completeCount = entries.filter(([, item]) => item.status === "complete").length;
+      if (completeCount > 0) parts.push(`${completeCount} fully enriched`);
+      const incomplete = entries.filter(([, item]) => item.status !== "complete");
+      if (incomplete.length > 0) {
+        const details = incomplete.slice(0, 8).map(([domain, item]) => {
+          const reasons = Object.entries(item.missing_fields || {})
+            .map(([field, reason]) => `${field}: ${reason}`);
+          return `${domain} (${item.status}${reasons.length ? `; ${reasons.join(", ")}` : ""})`;
+        });
+        if (incomplete.length > details.length) {
+          details.push(`${incomplete.length - details.length} more company result(s) in run details`);
+        }
+        problems.push(`Firmographic completeness: ${details.join(" | ")}`);
       }
     }
 
@@ -264,7 +282,7 @@ function App() {
     jobMonitorRef.current?.stop();
     const monitor = new JobMonitor(jobId, researchApi, (snap) => {
       setActiveJob(snap);
-      if (snap.status === "done" || snap.status === "error" || snap.status === "cancelled") {
+      if (snap.status === "done" || snap.status === "error" || snap.status === "cancelled" || snap.status === "quota_blocked") {
         setCancellingJobId((current) => current === jobId ? null : current);
         if (snap.run_id && snap.kind === "discover") setScopeRun(snap.run_id);
         researchApi.listRuns().then(setRuns).catch(() => {});
@@ -286,6 +304,10 @@ function App() {
         } else if (snap.status === "cancelled") {
           setRunError(null);
           pushToast({ tone: "success", title: `${label} cancelled`, message: "Progress and results saved before cancellation remain available." });
+        } else if (snap.status === "quota_blocked") {
+          const message = snap.error || "Gemini quota is exhausted. The job remains saved and can be resumed after quota recovery.";
+          setRunError(message);
+          pushToast({ tone: "error", title: `${label} paused by Gemini quota`, message });
         } else if (snap.kind === "discover") {
           const { tone, message } = describeDiscoverResult(snap.result);
           setRunError(null);
@@ -295,9 +317,11 @@ function App() {
           pushToast({ tone: "success", title: `${label} completed` });
         }
 
-        setTimeout(() => {
-          setActiveJob((current) => (current?.job_id === jobId ? null : current));
-        }, 5000);
+        if (snap.status !== "quota_blocked") {
+          setTimeout(() => {
+            setActiveJob((current) => (current?.job_id === jobId ? null : current));
+          }, 5000);
+        }
       }
     }, window.localStorage);
     jobMonitorRef.current = monitor;
@@ -474,6 +498,11 @@ function App() {
             regions={regions}
             onDiscover={handleDiscover}
             onCancel={handleCancelResearch}
+            onResume={(jobId) => {
+              researchApi.resumeJob(jobId).then((snapshot) => watchJob(snapshot.job_id)).catch((error) => {
+                pushToast({ tone: "error", title: "Could not resume research", message: error instanceof Error ? error.message : String(error) });
+              });
+            }}
             cancelling={cancellingJobId === activeJob?.job_id}
             activeJob={activeJob}
             error={runError}
@@ -588,7 +617,11 @@ function App() {
       )}
 
       {activeJob && (activeJob.status === "running" || activeJob.status === "pending") && (
-        <RunOverlay job={activeJob} />
+        <RunOverlay job={activeJob} onResume={() => {
+          researchApi.resumeJob(activeJob.job_id).then((snapshot) => watchJob(snapshot.job_id)).catch((error) => {
+            pushToast({ tone: "error", title: "Could not resume research", message: error instanceof Error ? error.message : String(error) });
+          });
+        }} />
       )}
 
       <ToastStack toasts={toasts} onDismiss={dismissToast} />

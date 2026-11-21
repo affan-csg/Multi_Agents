@@ -14,11 +14,13 @@ from fastapi import FastAPI, HTTPException
 
 from . import db, jobs
 from . import api as research_api
-from .diagnostics import log_event
+from . import gemini_queue
+from .diagnostics import DEFAULT_WORKER_VERSION, log_event, worker_version
 
 logger = logging.getLogger("csg.worker")
 POLL_INTERVAL_SECONDS = float(os.environ.get("RESEARCH_WORKER_POLL_SECONDS", "5"))
 WORKER_ENABLED = os.environ.get("RESEARCH_WORKER_ENABLED", "true").lower() not in {"0", "false", "no"}
+WORKER_IMPLEMENTATION = DEFAULT_WORKER_VERSION
 _WORKER_ID = jobs.worker_id()
 _STOP = threading.Event()
 _STARTED = False
@@ -62,7 +64,7 @@ def _dispatch(row: dict[str, Any]) -> None:
     elif row["kind"] == "qualify" and "tiers" in payload:
         runner = research_api._run_qualify_job
         request = research_api.QualifyRequest.model_validate(payload)
-        if row.get("status") == "running":
+        if row.get("status") in ("running", "quota_blocked"):
             request.force = False
         args = (job, row["run_id"], request)
     elif row["kind"] == "qualify":
@@ -138,6 +140,11 @@ def healthz() -> dict[str, Any]:
         "status": "ok",
         "worker_enabled": WORKER_ENABLED,
         "worker_id": _WORKER_ID,
+        "worker_version": worker_version(),
+        "worker_implementation": WORKER_IMPLEMENTATION,
+        "gemini_queue_backend": (
+            "shared_supabase" if gemini_queue.uses_shared_scheduler() else "process_local"
+        ),
         "active_job_id": _ACTIVE_JOB_ID,
         "last_scan_at": _LAST_SCAN_AT,
     }
@@ -147,6 +154,13 @@ def healthz() -> dict[str, Any]:
 def readyz() -> dict[str, str]:
     if not _STARTED or _STOP.is_set():
         raise HTTPException(status_code=503, detail="worker is not ready")
+    if WORKER_ENABLED:
+        if not gemini_queue.uses_shared_scheduler():
+            raise HTTPException(status_code=503, detail="shared Gemini scheduler is not configured")
+        try:
+            gemini_queue.scheduler_status()
+        except gemini_queue.GeminiQueueUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"status": "ready" if WORKER_ENABLED else "paused"}
 
 

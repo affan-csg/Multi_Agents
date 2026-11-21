@@ -18,6 +18,7 @@ import pytest
 
 from csg import db, discover
 from csg.dedupe import ExistingCompanies, find_duplicate_groups, normalize_domain, normalize_name
+from csg.discovery import research
 from csg.discovery.base import CompanyCandidate
 from csg.discovery.resolver import deduplicate_and_resolve
 from csg.models import Company
@@ -181,6 +182,230 @@ def test_enrichment_timeout_is_counted_and_reports_progress(monkeypatch):
     assert progress[-1][0:3] == ("enrich", 1, 1)
 
 
+def test_enrichment_timeout_cancellation_does_not_mutate_company(monkeypatch):
+    candidate = CompanyCandidate(
+        domain="slow.example", name="Slow", source="fake", discovered_at=datetime.now(),
+    )
+    checkpoints = {}
+
+    async def never_finishes(company):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(discover, "ENRICH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(discover, "enrich_company_firmographics", never_finishes)
+
+    pairs, _skipped, failures = asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", None,
+        checkpoint_load=lambda key: checkpoints.get(key),
+        checkpoint_save=lambda key, status, payload: checkpoints.update({key: {"status": status, "payload": payload}}) is None,
+        run_id="disc-cancellation-test",
+    ))
+
+    assert failures == {"timeout": 1}
+    assert pairs[0][1].employee_count is None
+    assert checkpoints["enrich:slow.example"]["status"] == "failed"
+
+
+def test_done_enrichment_checkpoint_recovers_without_api_repeat(monkeypatch):
+    candidate = CompanyCandidate(
+        domain="done.example", name="Done", source="fake", discovered_at=datetime.now(),
+    )
+    cached = Company(domain="done.example", name="Done")
+    checkpoints = {
+        "enrich:done.example": {
+            "status": "done",
+            "payload": {"company": cached.model_dump(mode="json")},
+        }
+    }
+    calls = []
+
+    async def should_not_run(company):
+        calls.append(company.domain)
+        return None
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", should_not_run)
+
+    pairs, _skipped, failures = asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", None,
+        checkpoint_load=lambda key: checkpoints.get(key),
+        checkpoint_save=lambda key, status, payload: True,
+    ))
+
+    assert calls == []
+    assert failures == {}
+    assert pairs[0][1].domain == "done.example"
+
+
+def test_nonempty_enrichment_reason_is_saved_as_failed_checkpoint(monkeypatch):
+    candidate = CompanyCandidate(
+        domain="quota.example", name="Quota", source="fake", discovered_at=datetime.now(),
+    )
+    checkpoints = {}
+
+    async def failed_enrichment(company):
+        return "quota_exhausted"
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", failed_enrichment)
+
+    asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", None,
+        checkpoint_save=lambda key, status, payload: checkpoints.update(
+            {key: {"status": status, "payload": payload}}
+        ) is None,
+    ))
+
+    assert checkpoints["enrich:quota.example"]["status"] == "failed"
+
+
+def test_mixed_enrichment_attempts_each_company_and_keeps_distinct_outcomes(monkeypatch):
+    candidates = [
+        CompanyCandidate(domain="complete.example", name="Complete", source="fake", discovered_at=datetime.now()),
+        CompanyCandidate(domain="partial.example", name="Partial", source="fake", discovered_at=datetime.now()),
+    ]
+    calls = []
+    checkpoints = {}
+
+    async def enrich(company, **_kwargs):
+        calls.append(company.domain)
+        if company.domain == "complete.example":
+            company.research_outcomes = {
+                field: {"status": "accepted_and_mapped", "criterion": criterion}
+                for field, criterion in research._FIELD_CRITERIA.items()
+            }
+            company.research_outcomes["_summary"] = {"status": "complete", "missing_fields": {}, "blocking_fields": {}}
+            return None
+        company.research_outcomes["employee_range"] = {
+            "status": "not_returned", "reason": "Gemini omitted employee_count",
+        }
+        company.research_outcomes["_summary"] = {
+            "status": "partial", "missing_fields": {"employee_range": "Gemini omitted employee_count"},
+            "blocking_fields": {"employee_range": "Gemini omitted employee_count"},
+        }
+        return "incomplete_result"
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
+
+    pairs, skipped, failures = asyncio.run(discover._enrich_all(
+        FakeConn(), candidates, "US", None,
+        checkpoint_save=lambda key, status, payload: checkpoints.update(
+            {key: {"status": status, "payload": payload}}
+        ) is None,
+        run_id="run-mixed",
+    ))
+
+    assert set(calls) == {"complete.example", "partial.example"}
+    assert skipped == 0
+    assert failures == {"incomplete_result": 1}
+    assert checkpoints["enrich:complete.example"]["status"] == "done"
+    assert checkpoints["enrich:partial.example"]["status"] == "failed"
+    assert pairs[0][1].research_outcomes["_summary"]["status"] == "complete"
+    assert pairs[1][1].research_outcomes["_summary"]["status"] == "failed"
+    assert pairs[1][1].research_outcomes["_summary"]["failure_reason"] == "incomplete_result"
+
+
+def test_resume_selection_uses_latest_failed_checkpoint_independent_of_ats():
+    from csg import db
+
+    jobs = [
+        {"job_id": "resume-job", "status": "done", "created_at": "2026-01-02"},
+        {"job_id": "original-job", "status": "done", "created_at": "2026-01-01"},
+    ]
+    checkpoints = {
+        "resume-job": [
+            {"checkpoint_key": "enrich:completed.example", "status": "done", "payload": {}},
+        ],
+        "original-job": [
+            {"checkpoint_key": "enrich:failed-with-ats.example", "status": "done",
+             "payload": {"reason": "quota_exhausted"}},
+            {"checkpoint_key": "enrich:completed.example", "status": "failed",
+             "payload": {"reason": "older failure"}},
+            {"checkpoint_key": "enrich:failed.example", "status": "failed",
+             "payload": {"reason": "request_error"}},
+        ],
+    }
+
+    class CheckpointConn:
+        def select(self, table, **params):
+            if table == "agent_jobs":
+                return jobs
+            if table == "agent_job_checkpoints":
+                return checkpoints[params["job_id"][3:]]
+            raise AssertionError(f"unexpected table: {table}")
+
+    assert db.stalled_companies(CheckpointConn(), "run-1") == [
+        "failed-with-ats.example", "failed.example",
+    ]
+
+
+def test_resume_stalled_retries_failed_only_and_preserves_success(monkeypatch):
+    failed_company = Company(domain="failed.example", name="Failed", region="US")
+    successful_company = Company(domain="success.example", name="Success", region="US")
+    successful_company.research_outcomes = {
+        field: {"status": "accepted_and_mapped", "criterion": criterion}
+        for field, criterion in research._FIELD_CRITERIA.items()
+    }
+    successful_company.research_outcomes["_summary"] = {
+        "status": "complete", "missing_fields": {}, "blocking_fields": {},
+    }
+    checkpoints = {
+        "enrich:failed.example": {
+            "status": "failed",
+            "payload": {
+                "company": failed_company.model_dump(mode="json"),
+                "reason": "quota_exhausted",
+            },
+        },
+        "enrich:success.example": {
+            "status": "done",
+            "payload": {"company": successful_company.model_dump(mode="json")},
+        },
+    }
+    provider_calls = []
+    saved = {}
+
+    class ResumeConn:
+        def commit(self):
+            pass
+
+    async def enrich(company, **_kwargs):
+        provider_calls.append(company.domain)
+        company.research_outcomes = {
+            field: {"status": "accepted_and_mapped", "criterion": criterion}
+            for field, criterion in research._FIELD_CRITERIA.items()
+        }
+        company.research_outcomes["_summary"] = {
+            "status": "complete", "missing_fields": {}, "blocking_fields": {},
+        }
+        return None
+
+    async def run_pipeline(*_args, **_kwargs):
+        return discover.pipeline.Stats()
+
+    monkeypatch.setattr(discover.db, "get_company", lambda _conn, domain: {
+        "failed.example": failed_company,
+        "success.example": successful_company,
+    }[domain])
+    monkeypatch.setattr(discover.db, "upsert_company", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
+    monkeypatch.setattr(discover.pipeline, "run", run_pipeline)
+    monkeypatch.setattr(discover.export, "to_csv", lambda *_args, **_kwargs: "csv")
+    monkeypatch.setattr(discover.export, "to_jsonl", lambda *_args, **_kwargs: "jsonl")
+
+    stats = asyncio.run(discover.resume_stalled(
+        object(), "run-1", ["failed.example", "success.example"],
+        conn=ResumeConn(),
+        checkpoint_load=lambda key: checkpoints.get(key),
+        checkpoint_save=lambda key, status, payload: saved.update(
+            {key: {"status": status, "payload": payload}}
+        ) is None,
+    ))
+
+    assert provider_calls == ["failed.example"]
+    assert saved["enrich:failed.example"]["status"] == "done"
+    assert "enrich:success.example" not in saved
+    assert stats.enriched == 1
+
+
 # --- run_discovery end to end (network edges faked) --------------------------
 
 class _Env:
@@ -209,6 +434,13 @@ class _Env:
 
         async def enrich(company):
             env.enriched.append(company.domain)
+            company.research_outcomes = {
+                field: {"status": "accepted_and_mapped", "criterion": criterion}
+                for field, criterion in research._FIELD_CRITERIA.items()
+            }
+            company.research_outcomes["_summary"] = {
+                "status": "complete", "missing_fields": {}, "blocking_fields": {},
+            }
 
         async def fake_pipeline(cfg, companies, conn_, run_id, **kw):
             env.pipeline_domains.append([c.domain for c in companies])
@@ -286,7 +518,7 @@ def test_same_company_in_two_runs_is_not_duplicated(env):
     assert env.enriched.count("acme.com") == 1
 
 
-def test_incomplete_firmographic_provenance_retries_after_cooldown():
+def test_incomplete_firmographic_provenance_is_not_skipped():
     from datetime import datetime, timedelta, timezone
 
     from csg.discover import _needs_enrichment
@@ -315,8 +547,11 @@ def test_incomplete_firmographic_provenance_retries_after_cooldown():
         ),
     )
 
-    assert not _needs_enrichment(recent)
+    assert _needs_enrichment(recent)
     assert _needs_enrichment(stale)
+    complete.research_outcomes["_summary"] = {
+        "status": "complete", "missing_fields": {}, "blocking_fields": {},
+    }
     assert not _needs_enrichment(complete)
 
 

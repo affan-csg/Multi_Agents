@@ -18,6 +18,13 @@ export interface ProvenanceValue<T> {
   confidence?: "high" | "medium" | "low";
 }
 
+export interface EnrichmentCompanySummary {
+  status: "complete" | "complete_with_gaps" | "partial" | "failed";
+  missing_fields: Record<string, string>;
+  blocking_fields: Record<string, string>;
+  failure_reason?: string;
+}
+
 export interface RunResult {
   run_id: string;
   companies: number;
@@ -47,6 +54,8 @@ export interface RunResult {
   enriched?: number;
   enrich_skipped?: number;
   enrich_failures?: Record<string, number>;
+  enrich_complete_with_gaps?: number;
+  enrichment_summary?: Record<string, EnrichmentCompanySummary>;
   exports?: Record<string, string>;
   qualify?: { qualified: number; skipped: number; errors: number; error_details: Record<string, string> } | { error: string } | null;
   contacts?: { found: number; skipped: number; errors: number; contacts_saved: number; error_details: Record<string, string> } | { error: string } | null;
@@ -86,12 +95,13 @@ export interface JobSnapshot {
   job_id: string;
   kind: "discover" | "qualify" | "contacts";
   run_id: string | null;
-  status: "pending" | "running" | "done" | "error" | "cancelled";
+  status: "pending" | "running" | "done" | "error" | "cancelled" | "quota_blocked";
   done: number;
   total: number;
   current_domain: string | null;
   result: RunResult | Record<string, unknown> | null;
   error: string | null;
+  quota_blocked_until?: string | null;
 }
 
 export interface RunSummary {
@@ -586,6 +596,9 @@ export const researchApi = {
 
   cancelJob: (jobId: string) =>
     req<JobSnapshot>(`/jobs/${jobId}/cancel`, { method: "POST" }),
+
+  resumeJob: (jobId: string) =>
+    req<JobSnapshot>(`/jobs/${jobId}/resume`, { method: "POST" }),
 
   jobSocket: (jobId: string, onMessage: (s: JobSnapshot) => void): WebSocket => {
     const wsBase = BASE.replace(/^http/, "ws");

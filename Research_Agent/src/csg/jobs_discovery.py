@@ -1,4 +1,4 @@
-"""Multi-level job discovery fallback.
+"""Multi-level first-party job discovery.
 
 ATS detection is one *method* of finding a company's open jobs, not a
 requirement for scoring one. Before this module existed, `pipeline.py` did:
@@ -15,7 +15,7 @@ trying cheaper, more reliable methods before falling through to a paid
 external search, and represents total failure as UNKNOWN rather than a
 silent zero.
 
-    ATS  ->  careers-page job scrape  ->  external web search  ->  UNKNOWN
+    ATS  ->  careers-page job scrape  ->  UNKNOWN
 
 1. ATS (`ats.detect` + `ats.fetch_postings`, unchanged) -- highest
    precision, zero incremental cost (same HTTP fetches detection already
@@ -26,13 +26,7 @@ silent zero.
    cards that don't match any known ATS pattern: plain "/careers/<slug>"
    detail links, or a JSON-LD `JobPosting` block many sites embed for SEO.
    Free (no paid API), lower structure than an ATS but still first-party.
-3. External search (`_search_jobs_external`) -- Tavily, same provider/
-   pattern as discovery's and enrichment's fallback (see
-   discovery/groq_tavily.py, discovery/research.py). Paid/quota-metered, so
-   it only runs once the free methods have both failed, and its result is
-   openly weaker evidence (a search snippet, not a first-party page) --
-   recorded as such via JobSource.
-4. UNKNOWN -- every method above failed or found nothing. The company is
+3. UNKNOWN -- every method above failed or found nothing. The company is
    NOT scored as having zero hiring need; `hiring_signal="unknown"` is
    recorded on the company row and scoring's existing missing-data handling
    (marks the dimension unavailable, rescales over what IS available -- see
@@ -63,29 +57,17 @@ import httpx
 
 from . import ats
 from .ats._common import strip_html
-from .discovery.groq_tavily import GroqTavilyProvider, _TAVILY_URL
 from .http import Fetcher
 from .models import Company, JobPosting
 from .posting_validation import is_current_validated_posting
 from .usage_tracker import classify_error, track
 
-# Tavily's free tier is per-minute metered, same shape of transient failure
-# as discovery/enrichment's own Tavily calls -- reuse the same retry budget.
+# Legacy Tavily constants and helpers are retained for reference only.
+# Active job discovery uses ATS, careers-page scraping, and UNKNOWN.
 _TAVILY_RATE_LIMIT_RETRIES = 2
 _TAVILY_RATE_LIMIT_DEFAULT_WAIT = 5.0
-
-# Transport-layer failures (DNS lookup, TCP connect, TLS handshake, read/pool
-# timeout -- classify_error's "timeout"/"connection_error" buckets) are just
-# as transient as a 429 but were previously not retried at all: one blip
-# (e.g. Windows' `[Errno 11002] getaddrinfo failed`) would burn the ONLY
-# fallback method left and drop a company straight to hiring_signal=unknown.
-# Kept small and short since this is the paid, last-resort stage of the
-# chain -- a real outage still fails fast rather than burning quota looping.
 _TAVILY_CONNECTION_ERROR_RETRIES = 2
 _TAVILY_CONNECTION_ERROR_BASE_WAIT = 2.0
-
-# How many external search results to ask Tavily for. Small -- this is a
-# fallback signal, not a primary source; keep the paid call cheap.
 _SEARCH_MAX_RESULTS = 6
 
 
@@ -316,105 +298,6 @@ async def _scrape_careers_page_jobs(
 
 
 # --------------------------------------------------------------------------
-# stage 3: external web search (Tavily)
-# --------------------------------------------------------------------------
-
-def _tavily_post_with_connection_retry(u, api_key: str, query: str) -> httpx.Response:
-    """POST to Tavily, retrying only transport-layer failures (DNS lookup,
-    TCP connect, TLS handshake, read/pool timeout -- classify_error's
-    "timeout"/"connection_error" buckets). Kept as its own bounded retry
-    loop, separate from the 429 loop in _tavily_search_sync, so a run of
-    connection errors can't eat into (or be starved by) the rate-limit
-    retry budget -- each failure mode gets its own small allowance.
-    """
-    for attempt in range(_TAVILY_CONNECTION_ERROR_RETRIES + 1):
-        try:
-            with httpx.Client() as client:
-                return client.post(_TAVILY_URL, json={
-                    "api_key": api_key,
-                    "query": query,
-                    "max_results": _SEARCH_MAX_RESULTS,
-                    "search_depth": "basic",
-                }, timeout=20.0)
-        except httpx.HTTPError as exc:
-            # e.g. Windows' `[Errno 11002] getaddrinfo failed`, a reset
-            # connection, or a connect/read timeout -- transient transport
-            # noise, not "Tavily said no". A real, sustained outage still
-            # fails fast: after the last attempt this re-raises.
-            kind = classify_error(exc)
-            if kind not in ("timeout", "connection_error") or attempt >= _TAVILY_CONNECTION_ERROR_RETRIES:
-                raise
-            u.retry_count += 1
-            wait = _TAVILY_CONNECTION_ERROR_BASE_WAIT * (2 ** attempt)
-            print(f"  [jobs_discovery] Tavily {kind}, retrying in {wait:.0f}s "
-                  f"({attempt + 1}/{_TAVILY_CONNECTION_ERROR_RETRIES})")
-            time.sleep(wait)
-    raise AssertionError("unreachable")  # loop always returns or raises
-
-
-def _tavily_search_sync(query: str, api_key: str) -> list[dict]:
-    with track("tavily", "job_search") as u:
-        for attempt in range(_TAVILY_RATE_LIMIT_RETRIES + 1):
-            r = _tavily_post_with_connection_retry(u, api_key, query)
-            if r.status_code == 429 and attempt < _TAVILY_RATE_LIMIT_RETRIES:
-                u.retry_count += 1
-                wait = GroqTavilyProvider._parse_retry_after(r) or _TAVILY_RATE_LIMIT_DEFAULT_WAIT
-                print(f"  [jobs_discovery] Tavily rate limited, waiting {wait:.0f}s "
-                      f"({attempt + 1}/{_TAVILY_RATE_LIMIT_RETRIES})")
-                time.sleep(wait)
-                continue
-            if r.status_code == 429:
-                u.mark_failure(status_code=429, error_kind="rate_limited")
-            r.raise_for_status()
-            u.status_code = r.status_code
-            return r.json().get("results", [])
-    return []
-
-
-async def _search_jobs_external(domain: str, name: Optional[str]) -> tuple[list[JobPosting], Optional[str]]:
-    """Tavily search for recent job postings when the company's own site
-    exposed nothing usable. Weakest-evidence source in the chain -- a search
-    snippet, not a first-party page -- recorded via JobSource='web_search'
-    so scoring/UI can tell it apart from a directly-confirmed posting.
-    """
-    api_key = os.environ.get("TAVILY_API_KEY")
-    if not api_key:
-        return [], "TAVILY_API_KEY not set -- external search fallback unavailable"
-
-    label = name or domain.split(".")[0]
-    query = f'"{label}" jobs OR careers OR hiring site:{domain} OR "{label}" job openings'
-
-    try:
-        results = await asyncio.to_thread(_tavily_search_sync, query, api_key)
-    except Exception as exc:
-        return [], f"external job search failed ({classify_error(exc)}): {exc}"
-
-    postings: list[JobPosting] = []
-    for i, r in enumerate(results):
-        title = (r.get("title") or "").strip()
-        url = r.get("url") or ""
-        if not title:
-            continue
-        # A plain "Careers at Acme" / "Acme - LinkedIn" search-result title
-        # is not evidence of a specific open role -- skip results that don't
-        # look like an actual job posting page, so this fallback records
-        # weak-but-real signal, not noise.
-        if not re.search(r"\b(hiring|job|career|opening|position|apply)\b", title, re.I):
-            continue
-        posting = JobPosting(
-            domain=domain, ats_provider=None, source="web_search",
-            external_id=f"search:{abs(hash(url or title))}",
-            title=title[:200], url=url or None,
-            description=strip_html(r.get("content"), limit=1000),
-        )
-        ownership = "verified" if _same_company_host(url, domain) else "inferred"
-        _mark_validation(posting, ownership=ownership, current="inferred", source_url=url or None,
-                         reason="web-search result; active status has not been confirmed")
-        postings.append(posting)
-    return postings, None
-
-
-# --------------------------------------------------------------------------
 # orchestration
 # --------------------------------------------------------------------------
 
@@ -481,31 +364,8 @@ async def discover_jobs(
         # real evidence of an empty/unreadable careers page, not a failure.
         notes.append("careers page reachable but no jobs found")
 
-    # --- 3. external search ---
-    try:
-        postings, err = await _search_jobs_external(domain, company.name)
-    except Exception as exc:
-        postings, err = [], f"external search crashed ({classify_error(exc)}): {exc}"
-
-    if postings:
-        postings = _deduplicate_postings(postings)
-        print(f"[jobs_discovery] {domain}: No ATS -> Careers page empty -> Web search -> {len(postings)} jobs found")
-        return JobDiscoveryResult(
-            postings=postings, method="web_search", source="tavily search",
-            hiring_signal="unknown",
-            ats_provider=(ats_result[0] if ats_result else None),
-            ats_token=(ats_result[1] if ats_result else None),
-            ats_detected_by=(ats_result[2] if ats_result else None),
-            careers_url=careers_url_for_scrape,
-            notes="; ".join(notes) or None,
-        )
-    if err:
-        notes.append(err)
-    else:
-        notes.append("external search found no job-like results")
-
-    # --- 4. every method exhausted -- UNKNOWN, not zero ---
-    print(f"[jobs_discovery] {domain}: All methods exhausted -> Job data unknown ({'; '.join(notes)})")
+    # --- 3. every first-party method exhausted -- UNKNOWN, not zero ---
+    print(f"[jobs_discovery] {domain}: ATS and careers page exhausted -> Job data unknown ({'; '.join(notes)})")
     return JobDiscoveryResult(
         postings=[], method="unknown", source=None, hiring_signal="unknown",
         ats_provider=(ats_result[0] if ats_result else None),
@@ -514,3 +374,17 @@ async def discover_jobs(
         careers_url=careers_url_for_scrape,
         notes="; ".join(notes),
     )
+
+
+def _tavily_post_with_connection_retry(u, api_key: str, query: str) -> httpx.Response:
+    """DISABLED legacy Tavily HTTP helper."""
+    raise RuntimeError("Tavily fallback is disabled")
+
+
+def _tavily_search_sync(query: str, api_key: str) -> list[dict]:
+    """DISABLED legacy Tavily job search helper."""
+    raise RuntimeError("Tavily fallback is disabled")
+
+
+async def _search_jobs_external(domain: str, name: Optional[str]) -> tuple[list[JobPosting], Optional[str]]:
+    ...

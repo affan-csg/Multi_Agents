@@ -3,7 +3,7 @@ import { Icon } from "./ui";
 export interface GenericJobSnapshot {
   job_id: string;
   kind: string;
-  status: "pending" | "running" | "done" | "error" | "cancelled";
+  status: "pending" | "running" | "done" | "error" | "cancelled" | "quota_blocked";
   done: number;
   total: number;
   current_domain: string | null;
@@ -55,7 +55,7 @@ function currentlyRunningLabel(job: GenericJobSnapshot): string | null {
   return null;
 }
 
-export function RunOverlay({ job }: { job: GenericJobSnapshot }) {
+export function RunOverlay({ job, onResume }: { job: GenericJobSnapshot; onResume?: () => void }) {
   const pct = job.total > 0 ? Math.round((job.done / job.total) * 100) : job.status === "pending" ? 0 : 100;
   const circumference = 2 * Math.PI * 26;
   const offset = circumference * (1 - pct / 100);
@@ -97,6 +97,9 @@ export function RunOverlay({ job }: { job: GenericJobSnapshot }) {
           <p className="run-overlay-sub">{KIND_SUB[job.kind] || ""}</p>
 
           {runningLabel && <p className="run-overlay-status">Currently running: {runningLabel}</p>}
+          {job.status === "quota_blocked" && (
+            <p className="run-overlay-status">Paused by Gemini quota. The saved job can be resumed after quota recovery.</p>
+          )}
 
           {job.kind === "discover" && (
             <div className="run-overlay-steps">
@@ -115,6 +118,11 @@ export function RunOverlay({ job }: { job: GenericJobSnapshot }) {
             </div>
           )}
 
+          {job.status === "quota_blocked" && onResume && (
+            <button type="button" className="mint" onClick={onResume}>
+              <Icon name="refresh" size={15} /> Resume research
+            </button>
+          )}
           {job.total > 0 && (
             <div className="run-overlay-count">
               {job.done} of {job.total}

@@ -1,5 +1,14 @@
 # How the agent works
 
+## Gemini queue policy
+
+AI discovery, firmographic enrichment, and qualification use Gemini 3.8 Flash
+exclusively. All Gemini calls pass through the Supabase-coordinated adaptive
+queue. Tavily/Groq and Anthropic are not automatic fallbacks. Transient rate
+limits delay and retry the existing durable job; daily/monthly quota errors
+leave it quota-blocked until provider reset or manual resume. Apply
+`migrations/011_gemini_adaptive_queue.sql` before deploying this behavior.
+
 A region goes in; a drafted, personalized outreach campaign comes out.
 Discovery, ATS detection, and scoring are deterministic-or-Gemini and always
 run. Qualify, contacts, and the Outreach hand-off cost real API quota (LLM
@@ -19,7 +28,7 @@ spend quota — see **Two ways to run it** below for the full CLI-vs-API split.
              |
              v
  [0] DISCOVER + RESEARCH ──> [1] JOB DISCOVERY ──> [2] CLASSIFY REQS ──> [3] SCORE + TIER
-     (ATS -> careers page -> web search -> unknown)
+   (ATS -> careers page -> unknown)
      (Gemini, grounded)              |                                      |
              |                       v                                      v
       companies table         job_postings table                      scores table
@@ -60,15 +69,15 @@ Pick a region → Agent does everything else, through a drafted campaign
 1. **You pick a region** (GA / East Coast / Midwest / West Coast) — in the
    UI or `csg discover [region]`.
 2. **Discover** — Gemini searches that region using queries generated live
-   from `icp.yaml` (size band, revenue floor, practice areas); falls back to
-   Tavily+Groq if every Gemini key is exhausted.
+   from `icp.yaml` (size band, revenue floor, practice areas); quota errors
+   preserve and block the durable job rather than switching providers.
 3. **Research** — each new company gets headcount/revenue/funding/industry,
    with source + confidence tracked. Already-known companies are skipped, not
-   re-billed. Same Tavily+Groq fallback as discovery if Gemini is exhausted.
+   re-billed. Gemini quota pauses preserve the in-progress job.
 4. **Job discovery** — tries ATS detection first (Greenhouse, Lever, Ashby,
    Workday, SmartRecruiters, Workable, BambooHR, Rippling); if no board is
-   found, falls back to scraping the company's own careers page, then an
-   external web search — never straight to "zero jobs" — before classifying
+   found, scrapes the company's own careers page, then records unknown —
+   never straight to "zero jobs" — before classifying
    whatever reqs were found by practice area and US/LATAM/Pakistan delivery
    fit. See **Job discovery fallback chain** below.
 5. **Score + tier** — six weighted dimensions (hiring need, fill pain,
@@ -228,7 +237,7 @@ purely because their ATS had no adapter, not because they were poor fits).
 trying cheaper, reliable methods before ever giving up:
 
 ```
-ATS  ->  careers-page job scrape  ->  external web search (Tavily)  ->  UNKNOWN
+ATS  ->  careers-page job scrape  ->  UNKNOWN
 ```
 
 1. **ATS** (unchanged) — `ats.fetch_postings()` pulls every open req from a
@@ -240,23 +249,7 @@ ATS  ->  careers-page job scrape  ->  external web search (Tavily)  ->  UNKNOWN
    `/jobs/12345-...`) or a `JobPosting` JSON-LD block (a common Google-for-
    Jobs SEO pattern many sites embed with no third-party ATS at all). Free,
    first-party, lower structure than a real ATS API.
-3. **External search** (`_search_jobs_external`) — Tavily, same provider as
-   discovery's and enrichment's own Tavily+Groq fallback (see below), plus
-   its own two retry layers so this last-resort stage isn't sunk by a single
-   blip: a 429 is retried up to `_TAVILY_RATE_LIMIT_RETRIES` times (existing
-   behavior), and — since this is the *only* method left once ATS and the
-   careers page have both failed — a transport-layer failure (DNS lookup,
-   connect/read timeout, connection reset; `classify_error` in
-   `"timeout"/"connection_error"`) is now *also* retried, up to
-   `_TAVILY_CONNECTION_ERROR_RETRIES` times with exponential backoff
-   (`_tavily_post_with_connection_retry`). The two budgets are independent
-   per HTTP attempt, so a DNS blip doesn't eat into the rate-limit retry
-   allowance or vice versa. Only runs once both free methods have failed to
-   find anything; results are filtered to titles that actually look like a
-   job ("hiring", "opening", "apply", ...), not a bare "Careers at Acme"
-   link. Paid/quota-metered, and weaker evidence than a first-party page —
-   recorded as such via `JobSource.web_search`.
-4. **UNKNOWN** — every method failed or found nothing. The company is
+3. **UNKNOWN** — every first-party method failed or found nothing. The company is
    **not** scored as having zero hiring need: `hiring_signal="unknown"` is
    recorded (distinct from `"confirmed"`, which a genuinely-empty ATS board
    or careers page also gets — a source was actually read there, it was
@@ -265,10 +258,9 @@ ATS  ->  careers-page job scrape  ->  external web search (Tavily)  ->  UNKNOWN
    honest without needing a scoring-side change.
 
 One failed stage never aborts the chain — an exception in any stage
-(ATS fetch timeout, a careers-page fetch error, a Tavily rate limit/429 or
-connection/DNS error once its own retries are exhausted) is caught,
-classified via `usage_tracker.classify_error`, appended to
-`job_discovery_notes`, and the chain moves to the next method. Every
+(ATS fetch timeout or a careers-page fetch error) is caught, classified via
+`usage_tracker.classify_error`, appended to `job_discovery_notes`, and the
+chain moves to the next method. Every
 company's `companies` row records `job_discovery_method`, `job_source`,
 `hiring_signal`, and `job_discovery_notes` — the full provenance of how (or
 whether) its job signal was found, exported to CSV/JSONL alongside the
@@ -277,8 +269,8 @@ score. Log lines during a run read like:
 ```
 [jobs_discovery] acme.com: ATS detected (greenhouse) -> 18 jobs found
 [jobs_discovery] acme.com: No ATS detected -> Careers page -> 12 jobs found
-[jobs_discovery] acme.com: No ATS -> Careers page empty -> Web search -> 7 jobs found
-[jobs_discovery] acme.com: All methods exhausted -> Job data unknown (ATS not detected; careers page reachable but no jobs found; TAVILY_API_KEY not set)
+[jobs_discovery] acme.com: ATS and careers page exhausted -> Job data unknown (ATS not detected; careers page reachable but no jobs found)
+[jobs_discovery] acme.com: All methods exhausted -> Job data unknown (ATS not detected; careers page reachable but no jobs found)
 ```
 
 A run's summary (`RunResult.job_discovery_methods` / `hiring_signal_unknown`)
@@ -461,10 +453,8 @@ Gemini call would fail with `[SSL: UNEXPECTED_EOF_WHILE_READING]` or
 `ConnectTimeout` before ever reaching a usable connection. `make_gemini_client()`
 (in [gemini_keys.py](src/csg/discovery/gemini_keys.py)) pins all outbound
 Gemini API calls to IPv4 via `httpx.HTTPTransport(local_address="0.0.0.0")`,
-bypassing the broken IPv6 route entirely. The same IPv4-pinned
-`make_ipv4_httpx_clients()` transport is used by the Tavily+Groq fallback
-(see below) for defense in depth — neither path is a single point of failure
-for the other. Both connection-level timeouts (10s connect timeout, 30s read)
+bypassing the broken IPv6 route entirely. Both connection-level timeouts
+(10s connect timeout, 30s read)
 are set tight so a dead route fails fast rather than hanging. See
 [test_gemini_keys.py](tests/test_gemini_keys.py) for the connection-error
 classification that tells these apart from quota/parse errors in logs.
@@ -480,85 +470,14 @@ failures) before treating a query as failed, since those are unrelated to
 quota and resolve on retry.
 
 **Firmographic enrichment** ([discovery/research.py](src/csg/discovery/research.py))
-retries a connection error once on the same Gemini key (2s backoff) before
-giving up and falling back to Tavily+Groq — a single transient blip should
-not immediately burn the fallback path. Then it falls back to Tavily+Groq
-for *any* Gemini call failure, not only quota exhaustion — a non-quota
-exception (network blip that outlasted the retry, an empty/malformed
-grounded-search response, a transient 5xx, a safety-filter block, ...) stops
-trying further keys (the failure isn't key-specific, so retrying the next key
-would just repeat it) and falls straight through to the same Tavily+Groq
-fallback the "all keys exhausted" path uses, rather than reporting the
-company unenriched immediately. Only if the fallback also fails is the
-company actually reported as `request_error`. This closed a real gap: earlier,
-only quota-exhaustion triggered the fallback, so a single company hitting some
-other transient Gemini error surfaced as "enrichment request failed" with no
-retry via the alternate provider even though one was configured and working.
-Logs now distinguish `"Gemini unreachable (connection/TLS error)"` from
-`"all Gemini keys exhausted"` or `"Gemini request failed"` so connectivity
-issues are diagnosable at a glance. See
-[test_enrich_firmographics.py](tests/test_enrich_firmographics.py).
-
-**The Tavily+Groq fallback itself now retries a 429**, matching
-`GroqTavilyProvider`'s discovery-side retry (see below). Seen live as
-"Enrichment skipped for 2 companies: enrichment request failed (2)" in a run
-where Gemini was fully daily-quota-exhausted (confirmed by every other
-company in that run coming back tagged `groq_tavily_search`) -- so both
-failing companies hit the fallback with `ENRICH_CONCURRENCY` other companies
-in flight at once, and Tavily's free tier is metered per-minute, not just
-per-month. A transient 429 from either Tavily or Groq used to fail the
-company on the spot; `_enrich_via_groq_tavily` now retries both calls with
-the same `Retry-After`-aware backoff `GroqTavilyProvider._groq_parse` uses,
-so a rate limit hit under concurrency is diagnosable-and-recoverable instead
-of silently burning one of the two providers this fallback exists to use.
-
-**Every enrichment/qualify failure now reports its real cause, not a generic
-bucket.** `usage_tracker.classify_error()` (see below) is the single place
-that turns any provider exception into one of `quota_exhausted`,
-`rate_limited`, `connection_error`, `timeout`, `parse_error`, or the
-catch-all `request_error` -- both `enrich_company_firmographics` /
-`_enrich_via_groq_tavily` (discovery/research.py) and `discover.py`'s own
-`except Exception` safety nets around them use it, so a run's
-`enrich_failures` tally (what the frontend renders as "Enrichment skipped
-for N companies: ...") and `qualify.py`'s per-domain `error_details` both
-name the actual failure instead of collapsing everything that isn't a JSON
-parse error into "enrichment request failed" -- which is exactly the vague
-message that made the original 429-under-fallback bug (above) hard to
-diagnose from the UI alone.
-
-**API usage/quota tracking** ([usage_tracker.py](src/csg/usage_tracker.py))
-instruments every outbound Gemini/Groq/Tavily/Hunter.io call (discovery
-search, enrichment, its Tavily+Groq fallback, qualify, and contacts.py's one
-Hunter Domain Search call site) with a `track()` context manager that
-records request count, success/failure, status code, `error_kind` (via the
-same `classify_error` above), retry count, latency, and token usage (from
-Gemini's `usage_metadata` / Groq's OpenAI-compatible `usage` object; Tavily
-and Hunter have none, both are search/lookup APIs, not token-metered) to a
-new `api_usage` table. Hunter's 429 is always tagged `quota_exhausted`, never
-`rate_limited` -- its free tier is a hard 25/month, not a per-minute window,
-so a 429 means the month's quota is gone, matching `contacts.discover_run`'s
-own "stop immediately" behavior on that error rather than implying a retry
-would help. Purely observational and best-effort: `_record_async` writes on
-a daemon thread and swallows every exception, so a DB outage or a slow write
-can never add latency to or fail an actual research/qualify/contacts call --
-see [test_usage_tracker.py](tests/test_usage_tracker.py) for the "must never
-raise" guarantee. `GET /settings/usage` aggregates it into per-provider
-totals plus a daily time series for the Settings > Usage & Quota tab. On a
-database created before this feature, the table doesn't exist yet -- the
-endpoint catches that and returns all-zero data rather than a 500; run
-[migrations/002_api_usage.sql](migrations/002_api_usage.sql) once to start
-collecting.
-
-The endpoint takes an optional `hours` (window back from now) or `since` (an
-explicit ISO timestamp, used verbatim) -- neither means **All Time**, no
-lower bound at all (`db.api_usage_all`), which is the tab's default. The
-Usage & Quota tab exposes exactly four filters over this: **Latest Research
-Run** (the frontend passes that run's own `started_at` from its already-
-loaded runs list as `since` -- this endpoint knows nothing about runs
-itself), **Last 7 Days** / **Last 30 Days** (`hours=24*7` / `24*30`), and
-**All Time** (no param). `since` wins if both are somehow passed. Every stat
-card, the requests-over-time chart, and the per-provider fact grid all read
-from the same one filtered response, so they always agree with each other.
+uses Gemini only. A connection error is retried once on the same Gemini key
+(2-second backoff). Other Gemini failures are classified by the adaptive queue
+as RPM, TPM, daily quota, monthly quota, or temporary provider capacity.
+Tavily/Groq fallback code is retained for reference but disabled and cannot
+make network calls. Quota-blocked jobs are persisted for manual resume; other
+transient failures use the queue's retry/backoff behavior. Logs distinguish
+Gemini connection/TLS failures, quota exhaustion, and request failures.
+See [test_enrich_firmographics.py](tests/test_enrich_firmographics.py).
 
 ## Contacts — [src/csg/contacts.py](src/csg/contacts.py) (costs quota)
 
@@ -797,9 +716,8 @@ itself, against a mocked transport) for what's covered.
 ## Resuming — [discover.resume_stalled()](src/csg/discover.py)
 
 A company can end up "stalled": scored, but with no ATS board found and no
-firmographics — the signature of every provider (Gemini, and the Tavily+Groq
-fallback for both discovery and enrichment) being exhausted or unreachable
-for it specifically, not a company that was genuinely researched and just
+firmographics — the signature of Gemini discovery or enrichment failure,
+not a company that was genuinely researched and just
 came up thin (see `db.stalled_companies`). This can happen mid-run if a key
 runs out of daily quota partway through a large company list.
 

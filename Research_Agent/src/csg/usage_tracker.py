@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
-from .diagnostics import log_event
+from .diagnostics import log_event, worker_version
 
 _LOCK = threading.Lock()
 
@@ -44,14 +44,20 @@ class _Usage:
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    error_details: Optional[dict[str, Any]] = None
     _start: float = field(default_factory=time.monotonic)
 
-    def mark_failure(self, status_code: Optional[int] = None, error_kind: Optional[str] = None) -> None:
+    def mark_failure(
+        self, status_code: Optional[int] = None, error_kind: Optional[str] = None,
+        error_details: Optional[dict[str, Any]] = None,
+    ) -> None:
         self.success = False
         if status_code is not None:
             self.status_code = status_code
         if error_kind is not None:
             self.error_kind = error_kind
+        if error_details is not None:
+            self.error_details = error_details
 
     def set_tokens(self, prompt: Optional[int] = None, completion: Optional[int] = None, total: Optional[int] = None) -> None:
         self.prompt_tokens = prompt
@@ -83,7 +89,10 @@ def track(
         yield usage
     except Exception as exc:
         if usage.success:  # not already marked by the caller
-            usage.mark_failure(status_code=_guess_status_code(exc), error_kind=classify_error(exc))
+            usage.mark_failure(
+                status_code=_guess_status_code(exc), error_kind=classify_error(exc),
+                error_details=_provider_error_details(exc, provider),
+            )
         raise
     finally:
         latency_ms = int((time.monotonic() - usage._start) * 1000)
@@ -107,6 +116,36 @@ def _guess_status_code(exc: Exception) -> Optional[int]:
     return None
 
 
+def _provider_error_details(exc: Exception, provider: str) -> dict[str, Any]:
+    root_exc = exc
+    while getattr(root_exc, "__cause__", None) is not None:
+        root_exc = root_exc.__cause__
+    response = getattr(root_exc, "response", None)
+    body = getattr(root_exc, "details", None)
+    if body is None:
+        body = getattr(response, "text", None)
+    if isinstance(body, str):
+        body = body[:4000]
+    headers = getattr(response, "headers", None) or {}
+    retry_after = headers.get("Retry-After") if hasattr(headers, "get") else None
+    quota_type = getattr(exc, "classification", None)
+    if provider == "gemini":
+        try:
+            from .discovery.gemini_keys import classify_gemini_error
+            quota_type = classify_gemini_error(exc)
+        except Exception:
+            pass
+    elif provider == "tavily" and _guess_status_code(exc) == 432:
+        quota_type = "provider_plan_limit"
+    return {
+        "type": type(root_exc).__name__,
+        "message": str(root_exc)[:2000],
+        "response": body,
+        "retry_after": retry_after,
+        "quota_type": quota_type,
+    }
+
+
 def classify_error(exc: Exception) -> str:
     """Best-guess classification of any provider exception into one of:
     'timeout', 'connection_error', 'quota_exhausted', 'rate_limited',
@@ -119,6 +158,13 @@ def classify_error(exc: Exception) -> str:
     through to 'other', since misclassifying a failure must never itself
     break error handling.
     """
+    classification = getattr(exc, "classification", None)
+    if classification in {"rpm", "tpm"}:
+        return "rate_limited"
+    if classification in {"daily_quota", "monthly_quota"}:
+        return "quota_exhausted"
+    if classification == "temporary_capacity":
+        return "rate_limited"
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
     status_code = status_code or getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -162,6 +208,8 @@ def _record_async(usage: _Usage, latency_ms: int) -> None:
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.total_tokens,
+        "worker_version": worker_version(),
+        "error_details": usage.error_details,
         "created_at": _utc_now_iso(),
     }
     log_event(
@@ -173,6 +221,8 @@ def _record_async(usage: _Usage, latency_ms: int) -> None:
         success=usage.success,
         status_code=usage.status_code,
         error_kind=usage.error_kind,
+        error_details=usage.error_details,
+        worker_version=row["worker_version"],
         retry_count=usage.retry_count,
         latency_ms=latency_ms,
         created_at=row["created_at"],
@@ -195,3 +245,55 @@ def _write_row(row: dict[str, Any]) -> None:
             conn.close()
     except Exception:
         pass  # usage logging must never surface an error to anything
+
+
+def record_usage(
+    provider: str,
+    call_kind: str,
+    *,
+    run_id: Optional[str] = None,
+    domain: Optional[str] = None,
+    success: bool = True,
+    status_code: Optional[int] = None,
+    error_kind: Optional[str] = None,
+    retry_count: int = 0,
+    latency_ms: Optional[int] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    error_details: Optional[dict[str, Any]] = None,
+) -> None:
+    """Record one provider outcome without affecting the provider call path."""
+    row = {
+        "provider": provider,
+        "call_kind": call_kind,
+        "run_id": run_id,
+        "domain": domain,
+        "success": success,
+        "status_code": status_code,
+        "error_kind": error_kind,
+        "retry_count": retry_count,
+        "latency_ms": latency_ms,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "worker_version": worker_version(),
+        "error_details": error_details,
+        "created_at": _utc_now_iso(),
+    }
+    log_event(
+        "provider_call",
+        provider=provider,
+        call_kind=call_kind,
+        run_id=run_id,
+        domain=domain,
+        success=success,
+        status_code=status_code,
+        error_kind=error_kind,
+        error_details=error_details,
+        worker_version=row["worker_version"],
+        retry_count=retry_count,
+        latency_ms=latency_ms,
+        created_at=row["created_at"],
+    )
+    threading.Thread(target=_write_row, args=(row,), daemon=True).start()

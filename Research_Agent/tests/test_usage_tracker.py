@@ -45,6 +45,29 @@ def captured_rows(monkeypatch):
     return rows
 
 
+def test_track_records_run_id(captured_rows):
+    with track("gemini", "enrich_firmographics", run_id="disc-regression", domain="acme.com") as u:
+        u.set_tokens(prompt=100, completion=50, total=150)
+
+    _join_background_writes()
+
+    assert captured_rows[0]["run_id"] == "disc-regression"
+
+
+def test_record_usage_records_timeout_with_run_id(captured_rows):
+    usage_tracker.record_usage(
+        "gemini", "enrich_firmographics", run_id="disc-regression",
+        domain="slow.example", success=False, error_kind="timeout", latency_ms=180000,
+    )
+
+    _join_background_writes()
+
+    assert captured_rows[0]["run_id"] == "disc-regression"
+    assert captured_rows[0]["domain"] == "slow.example"
+    assert captured_rows[0]["success"] is False
+    assert captured_rows[0]["error_kind"] == "timeout"
+
+
 def test_track_records_success(captured_rows):
     with track("gemini", "enrich_firmographics", domain="acme.com") as u:
         u.set_tokens(prompt=100, completion=50, total=150)
@@ -164,3 +187,39 @@ def test_tavily_432_is_classified_as_quota_exhaustion():
 
     assert usage_tracker._guess_status_code(exc) == 432
     assert usage_tracker.classify_error(exc) == "quota_exhausted"
+    assert usage_tracker._provider_error_details(exc, "tavily")["quota_type"] == "provider_plan_limit"
+
+
+def test_gemini_provider_error_details_keep_quota_classification():
+    class GeminiDailyQuota(Exception):
+        code = 429
+
+        def __str__(self):
+            return "RESOURCE_EXHAUSTED: daily quota exceeded"
+
+    details = usage_tracker._provider_error_details(GeminiDailyQuota(), "gemini")
+
+    assert details["quota_type"] == "daily_quota"
+    assert details["type"] == "GeminiDailyQuota"
+
+
+def test_track_persists_provider_response_details(captured_rows, monkeypatch):
+    monkeypatch.setenv("RESEARCH_WORKER_VERSION", "image-sha-123")
+    request = httpx.Request("POST", "https://api.tavily.com/search")
+    response = httpx.Response(
+        432, request=request, text="plan limit exceeded", headers={"Retry-After": "3600"},
+    )
+    exc = httpx.HTTPStatusError("plan limit", request=request, response=response)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        with track("tavily", "tavily_search", run_id="disc-test", domain="acme.example"):
+            raise exc
+
+    _join_background_writes()
+
+    row = captured_rows[0]
+    assert row["worker_version"] == "image-sha-123"
+    assert row["run_id"] == "disc-test"
+    assert row["error_details"]["type"] == "HTTPStatusError"
+    assert row["error_details"]["response"] == "plan limit exceeded"
+    assert row["error_details"]["retry_after"] == "3600"

@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 from .base import DiscoveryProvider, CompanyCandidate
 from .gemini_keys import GeminiKeyPool, is_connection_error
+from ..gemini_queue import GeminiQuotaBlocked, GeminiRetryLater, generate_content
 from ..http import Fetcher
 from ..usage_tracker import track
 
@@ -138,9 +139,11 @@ class DiscoveryError(RuntimeError):
 class WebSearchProvider(DiscoveryProvider):
     """Real discovery provider using Gemini AI with grounded search."""
 
-    def __init__(self, fetcher: Fetcher, api_key: str = None, cfg=None):
+    def __init__(self, fetcher: Fetcher, api_key: str = None, cfg=None,
+                 run_id: str | None = None):
         self.fetcher = fetcher
         self.cfg = cfg
+        self.run_id = run_id
         # A single explicit api_key (tests, callers that want one fixed key)
         # bypasses the pool entirely. Otherwise pull every GEMINI_API_KEY*
         # var from the environment so a quota-exhausted key can fail over to
@@ -171,8 +174,13 @@ class WebSearchProvider(DiscoveryProvider):
 
         def call(key: str):
             client = make_gemini_client(key)
-            with track("gemini", "discovery_search") as u:
-                response = client.models.generate_content(model=_GEMINI_MODEL, contents=contents, config=config)
+            with track("gemini", "discovery_search", run_id=self.run_id) as u:
+                response = generate_content(
+                    lambda: client.models.generate_content(
+                        model=_GEMINI_MODEL, contents=contents, config=config,
+                    ),
+                    call_kind="discovery_search", run_id=self.run_id,
+                )
                 meta = getattr(response, "usage_metadata", None)
                 if meta is not None:
                     u.set_tokens(
@@ -206,6 +214,8 @@ class WebSearchProvider(DiscoveryProvider):
                 return response
             except Exception as exc:
                 last_exc = exc
+                if isinstance(exc, (GeminiQuotaBlocked, GeminiRetryLater)):
+                    raise
                 if self._pool.should_advance(exc):
                     print(f"  [WebSearchProvider] key {attempt.index}/{attempt.total} "
                           f"quota exhausted, trying next key")

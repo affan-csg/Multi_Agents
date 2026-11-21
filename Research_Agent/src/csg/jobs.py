@@ -88,7 +88,11 @@ def recoverable(conn: SupabaseConn, limit: int = 50) -> list[dict[str, Any]]:
         TABLE, status="eq.running", lease_until=f"lt.{_iso(now)}",
         order="lease_until.asc", limit=limit,
     )
-    return [*pending, *stale]
+    unblocked = conn.select(
+        TABLE, status="eq.quota_blocked", quota_blocked_until=f"lt.{_iso(now)}",
+        order="quota_blocked_until.asc", limit=limit,
+    )
+    return [*pending, *stale, *unblocked]
 
 
 def claim(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
@@ -98,6 +102,7 @@ def claim(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
         "worker_id": worker_id,
         "started_at": _iso(now),
         "lease_until": _iso(now + timedelta(seconds=LEASE_SECONDS)),
+        "quota_blocked_until": None,
         "updated_at": _iso(now),
     }
     rows = conn.update_returning(
@@ -111,6 +116,14 @@ def claim(conn: SupabaseConn, job_id: str, worker_id: str) -> bool:
         TABLE,
         payload,
         job_id=f"eq.{job_id}", status="eq.running", lease_until=f"lt.{_iso(now)}",
+    )
+    if rows:
+        return True
+    rows = conn.update_returning(
+        TABLE,
+        payload,
+        job_id=f"eq.{job_id}", status="eq.quota_blocked",
+        quota_blocked_until=f"lt.{_iso(now)}",
     )
     return bool(rows)
 
@@ -143,6 +156,7 @@ def requeue(conn: SupabaseConn, job_id: str, worker_id: str, *, delay_seconds: f
             "worker_id": None,
             "lease_until": None,
             "error": None,
+            "quota_blocked_until": None,
             "updated_at": _iso(now + timedelta(seconds=max(0.0, delay_seconds))),
         },
         job_id=f"eq.{job_id}",
@@ -159,6 +173,10 @@ def update(conn: SupabaseConn, job_id: str, worker_id: str, **fields: Any) -> bo
     if fields.get("status") in ("done", "error"):
         fields["finished_at"] = _iso(now)
         fields["lease_until"] = None
+        fields["quota_blocked_until"] = None
+    elif fields.get("status") == "quota_blocked":
+        fields["lease_until"] = None
+        fields["worker_id"] = None
     elif fields.get("status") == "running":
         fields["lease_until"] = _iso(now + timedelta(seconds=LEASE_SECONDS))
     rows = conn.update_returning(
@@ -166,6 +184,28 @@ def update(conn: SupabaseConn, job_id: str, worker_id: str, **fields: Any) -> bo
         status="eq.running", lease_until=f"gt.{_iso(now)}",
     )
     return bool(rows)
+
+
+def resume_quota_blocked(conn: SupabaseConn, job_id: str) -> bool:
+    now = utcnow()
+    rows = conn.update_returning(
+        TABLE,
+        {"status": "pending", "worker_id": None, "lease_until": None,
+         "quota_blocked_until": None, "error": None, "updated_at": _iso(now)},
+        job_id=f"eq.{job_id}", status="eq.quota_blocked",
+    )
+    return bool(rows)
+
+
+def resume_all_quota_blocked(conn: SupabaseConn) -> int:
+    now = utcnow()
+    rows = conn.update_returning(
+        TABLE,
+        {"status": "pending", "worker_id": None, "lease_until": None,
+         "quota_blocked_until": None, "error": None, "updated_at": _iso(now)},
+        status="eq.quota_blocked",
+    )
+    return len(rows)
 
 
 def get_checkpoint(conn: SupabaseConn, job_id: str, checkpoint_key: str) -> Optional[dict[str, Any]]:

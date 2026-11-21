@@ -19,6 +19,7 @@ interface Props {
   error: string | null;
   onDiscover: (req: DiscoverRequest) => void;
   onCancel: () => void;
+    onResume: (jobId: string) => void;
   cancelling: boolean;
   /** Bumped by the parent after a run completes successfully, so this form
    * clears back to defaults for the next run instead of showing stale
@@ -26,7 +27,7 @@ interface Props {
   resetKey?: number;
 }
 
-export function RunConfig({ regions, activeJob, error, onDiscover, onCancel, cancelling, resetKey }: Props) {
+export function RunConfig({ regions, activeJob, error, onDiscover, onCancel, onResume, cancelling, resetKey }: Props) {
   const [label, setLabel] = useState("");
   const [region, setRegion] = useState<string | null>(null);
   const [limit, setLimit] = useState("100");
@@ -42,6 +43,7 @@ export function RunConfig({ regions, activeJob, error, onDiscover, onCancel, can
 
   const running = activeJob?.status === "running" || activeJob?.status === "pending";
   const cancelled = activeJob?.status === "cancelled";
+    const quotaBlocked = activeJob?.status === "quota_blocked";
   const activeRegion = region ?? regions?.active ?? null;
   const selectedRegion = regions?.regions.find((r) => r.key === activeRegion) ?? null;
 
@@ -329,10 +331,12 @@ export function RunConfig({ regions, activeJob, error, onDiscover, onCancel, can
           <div className="summary-ready">
             <div className="summary-ready-title">
               <Icon name="sparkle" size={15} />
-              {running ? "Run in progress" : cancelled ? "Research cancelled" : "Ready to run"}
+              {running ? "Run in progress" : cancelled ? "Research cancelled" : quotaBlocked ? "Gemini quota pause" : "Ready to run"}
             </div>
             <p>
-              {cancelled
+              {quotaBlocked
+                ? `This job is saved. Resume after Gemini quota reset${activeJob?.quota_blocked_until ? ` at ${new Date(activeJob.quota_blocked_until).toLocaleString()}` : " or after reviewing quota status"}.`
+                : cancelled
                 ? "Results saved before cancellation remain available to review."
                 : running
                 ? backendStage === "outreach"
@@ -349,7 +353,12 @@ export function RunConfig({ regions, activeJob, error, onDiscover, onCancel, can
             </p>
           </div>
 
-          {running && activeJob?.kind === "discover" ? (
+          {quotaBlocked && activeJob ? (
+            <button type="button" className="mint" onClick={() => onResume(activeJob.job_id)}>
+              <Icon name="refresh" size={15} />
+              Resume research
+            </button>
+          ) : running && activeJob?.kind === "discover" ? (
             <button type="button" className="danger" onClick={onCancel} disabled={cancelling}>
               <Icon name="close" size={15} />
               {cancelling ? "Cancelling…" : "Cancel research"}

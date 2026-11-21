@@ -41,22 +41,15 @@ See [WORKFLOW.md](WORKFLOW.md) for how the pipeline works end to end.
    - `RESEARCH_SUPABASE_URL` / `RESEARCH_SUPABASE_SERVICE_KEY` — required for everything.
    - `GEMINI_API_KEY` — **required for `csg discover`** (company discovery and
      firmographic research). Also used by `csg qualify`.
-     **Multi-key failover**: add `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`, etc.
-     to automatically roll over to the next key when one's daily quota is
-     exhausted — see [src/csg/discovery/gemini_keys.py](src/csg/discovery/gemini_keys.py).
+    Additional `GEMINI_API_KEY_n` values may be configured, but quota errors
+    pause the shared queue rather than switching provider or rotating keys.
      Note grounded search (what discovery uses to find real companies) has
      its own, much tighter free-tier daily quota than plain text generation —
      a key that answers a simple prompt fine can still be out of grounded-search
      quota.
-   - `ANTHROPIC_API_KEY` — alternative LLM for `csg qualify`. Gemini is tried
-     first if both are set.
-   - `TAVILY_API_KEY` / `GROQ_API_KEY` — optional fallback discovery backend.
-     If every `GEMINI_API_KEY*` is exhausted, `csg discover` automatically
-     retries via Tavily (web search) + Groq (parses results into companies,
-     no built-in search of its own) instead of failing the run — see
-     [src/csg/discovery/groq_tavily.py](src/csg/discovery/groq_tavily.py).
-     Both keys have free tiers; only needed once Gemini's discovery quota
-     runs out.
+   - `GEMINI_QUEUE_START_RPM` — optional initial shared request rate (default
+     `0.5` RPM); successful calls gradually raise it and rate-limit responses
+     lower it. The limit is coordinated across API and worker instances.
    - `HUNTER_API_KEY` — only needed for `csg contacts` (contact discovery).
      Every saved contact is guaranteed to have a verified email (Hunter
      entries without one are discarded at parse time); LinkedIn is carried
@@ -192,12 +185,12 @@ their own `run_id` column.
 
 ## Resuming a stalled run
 
-If every provider (Gemini, and the Tavily+Groq fallback) is exhausted while a
-run is in progress, some companies can be left scored with no ATS board and
-no firmographics — a "stalled" company (see `db.stalled_companies`). The
-Settings page's run list shows a **Resume research (N)** action on any run
-that has these; it re-researches only the stalled domains (no re-discovery)
-rather than requiring a whole new run. See
+If Gemini is unavailable, the job is preserved and either delayed for a
+transient rate limit or marked `quota_blocked` for daily/monthly exhaustion.
+Inspect the shared controller at `GET /gemini-queue`; resume blocked work with
+`POST /gemini-queue/resume` or `POST /jobs/{job_id}/resume` after reviewing
+quota reset status. A stalled run can still be resumed for only its incomplete
+domains (no re-discovery). See
 [WORKFLOW.md](WORKFLOW.md#resuming--discoverresume_stalled) for the mechanics.
 
 ## Outreach hand-off
@@ -446,6 +439,9 @@ live in [migrations/](migrations/):
   This migration is required for global company de-duplication across runs
   to work — without it, matching existing companies and saving the match
   records will fail. See **Global company de-duplication** below.
+- [011_gemini_adaptive_queue.sql](migrations/011_gemini_adaptive_queue.sql) —
+  adds shared Gemini admission state and durable quota-blocked job deadlines.
+  Apply this migration before deploying the adaptive queue code.
 
 Earlier migrations, kept in `scratchpad/` as a record:
 - [migration_add_fk_cascades.sql](scratchpad/migration_add_fk_cascades.sql) —
@@ -461,22 +457,13 @@ run against the live project.
 
 ## Known limitations
 
-- **Gemini's grounded-search quota is tight and shared across all
-  `GEMINI_API_KEY*` keys** — the `google_search` tool discovery uses to find
-  real companies has its own, much lower free-tier daily cap than plain text
-  generation, separate from the qualify/enrichment quota. A key that answers
-  a simple prompt fine can still be out of grounded-search quota. Multi-key
-  failover (`GEMINI_API_KEY_2`, `_3`, ...) rotates through every configured
-  key before giving up (see test_gemini_keys.py), and once every key is
-  exhausted, both discovery **and** firmographic enrichment automatically
-  fall back to Tavily (search) + Groq (parses results into the same
-  structured shape a Gemini call would have produced) rather than failing —
-  see [src/csg/discovery/groq_tavily.py](src/csg/discovery/groq_tavily.py)
-  and [src/csg/discovery/research.py](src/csg/discovery/research.py). A
-  company is only reported as a genuine enrichment failure if *both*
-  providers fail (e.g. `TAVILY_API_KEY`/`GROQ_API_KEY` also unset) — surfaced
-  in the run result as `enrich_failures` and a clear Dashboard toast, not a
-  silent per-company skip.
+- **Gemini quota and queue** — Discovery, enrichment, and qualification use
+  Gemini 3.8 Flash through the shared adaptive queue. The controller starts
+  at `GEMINI_QUEUE_START_RPM` (default `0.5`), learns from successful calls,
+  and backs off on RPM/TPM/capacity errors. Daily/monthly quota exhaustion
+  preserves the durable job as `quota_blocked`; inspect `GET /gemini-queue`
+  and resume via `POST /gemini-queue/resume` or `POST /jobs/{job_id}/resume`.
+  Tavily, Groq, and Anthropic are not automatic AI fallbacks.
 - **ATS detection has real, structural coverage gaps**, not just missed
   edge cases: iCIMS, Taleo, and Jobvite have no reliable public,
   unauthenticated API to detect against (confirmed by direct research, not
@@ -499,7 +486,7 @@ run against the live project.
   `"unknown"`) end-to-end specifically so this distinction survives instead
   of collapsing into an ambiguous zero. See
   [src/csg/jobs_discovery.py](src/csg/jobs_discovery.py)'s module docstring
-  for the full ATS → careers-page → web-search → UNKNOWN fallback chain.
+  for the ATS → careers-page → UNKNOWN chain.
 - **No automated end-to-end test.** A full run makes real HTTP calls to live
   career-site ATS boards and, for `qualify`/discovery/enrichment, real LLM
   API calls — see [WORKFLOW.md](WORKFLOW.md) before wiring one up. Playwright

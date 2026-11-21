@@ -5,11 +5,7 @@ this module runs strictly after a company is already scored, and only turns
 the arithmetic score + open reqs into a human-readable pain_summary and
 recommended_angle. It never re-scores or overrides a tier.
 
-Two backends, selected at runtime by whichever key is present in the
-environment. Gemini is currently tried first (see _select_backend) since it
-has a free tier and the Anthropic account on file has no credit balance:
-    - Gemini (gemini-3.8-flash)   -- Google Cloud Agent Platform Express Mode
-  - Anthropic (Claude Opus 5)   -- paid, no free tier
+Gemini 3.8 Flash is the sole supported qualification backend.
 
 Costs real tokens/quota either way -- callers should scope runs to qualifying
 tiers (default A/B) rather than the full funnel.
@@ -32,15 +28,12 @@ from pydantic import BaseModel
 from . import db
 from .config import asset_path
 from .db import SupabaseConn
+from .gemini_queue import GeminiQuotaBlocked, GeminiRetryLater, generate_content
 from .usage_tracker import classify_error, track
 
 PROMPT_PATH = asset_path("prompts", "qualify.md")
-ANTHROPIC_MODEL = "claude-opus-5"
 GEMINI_MODEL = "gemini-3.8-flash"
-MAX_CONCURRENCY = 4
-# Gemini's free tier is rate-limited per-minute (as low as 5 req/min depending
-# on model/account) -- run qualification serially against it so parallel
-# workers don't all 429 at once. Anthropic has no such default constraint.
+# Requests are centrally paced by gemini_queue across all Research workers.
 GEMINI_MAX_CONCURRENCY = 1
 MAX_RETRIES = 4
 BASE_RETRY_DELAY = 20.0
@@ -103,42 +96,8 @@ class _Backend(Protocol):
     def is_retryable(self, exc: Exception) -> bool: ...
 
 
-class _AnthropicBackend:
-    def __init__(self, api_key: str) -> None:
-        import anthropic
-        self.model = ANTHROPIC_MODEL
-        self.max_concurrency = MAX_CONCURRENCY
-        self._anthropic = anthropic
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
-
-    async def complete(self, prompt: str, *, run_id: str | None = None, domain: str | None = None) -> _Qualification:
-        with track("anthropic", "qualify", run_id=run_id, domain=domain):
-            response = await self._client.messages.parse(
-                model=self.model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-                output_format=_Qualification,
-            )
-        return response.parsed_output
-
-    async def close(self) -> None:
-        await self._client.close()
-
-    def is_retryable(self, exc: Exception) -> bool:
-        if isinstance(exc, self._anthropic.RateLimitError):
-            return True
-        # 5xx: transient server-side overload, distinct from 4xx client errors.
-        return isinstance(exc, self._anthropic.APIStatusError) and exc.status_code >= 500
-
-
 class _GeminiBackend:
-    """Rotates through every GEMINI_API_KEY* in .env on daily-quota
-    exhaustion (see discovery/gemini_keys.py). `is_retryable` reports False
-    for daily-quota errors -- that tells `_complete_with_retry` not to
-    backoff-retry the same key, but `complete()` itself already advanced to
-    the next key before raising, so the *next* call from the caller's own
-    retry loop lands on a fresh key rather than repeating the exhausted one.
-    """
+    """Gemini qualification adapter; quota control lives in gemini_queue."""
 
     def __init__(self, api_key: str) -> None:
         from google import genai
@@ -167,8 +126,11 @@ class _GeminiBackend:
             try:
                 with track("gemini", "qualify", run_id=run_id, domain=domain) as u:
                     response = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=self.model, contents=prompt, config=config,
+                        generate_content,
+                        lambda: client.models.generate_content(
+                            model=self.model, contents=prompt, config=config,
+                        ),
+                        call_kind="qualify", run_id=run_id, domain=domain,
                     )
                     meta = getattr(response, "usage_metadata", None)
                     if meta is not None:
@@ -179,6 +141,8 @@ class _GeminiBackend:
                         )
             except Exception as exc:
                 last_exc = exc
+                if isinstance(exc, (GeminiQuotaBlocked, GeminiRetryLater)):
+                    raise
                 if self._is_daily_quota_exhausted(exc):
                     print(f"[qualify] Gemini key {attempt.index}/{attempt.total} "
                           f"quota exhausted, trying next key", file=sys.stderr)
@@ -226,9 +190,6 @@ class _GeminiBackend:
 
 
 def _select_backend() -> _Backend:
-    # Gemini first for now (free tier; Anthropic key on file has no credit) --
-    # flip this order back once the Anthropic account is funded.
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     gemini_key = os.environ.get("GEMINI_API_KEY")
 
     if gemini_key:
@@ -240,17 +201,8 @@ def _select_backend() -> _Backend:
                 "Run `pip install -e .`."
             ) from exc
 
-    if anthropic_key:
-        try:
-            return _AnthropicBackend(anthropic_key)
-        except ImportError as exc:
-            raise QualificationError(
-                "ANTHROPIC_API_KEY is set but the 'anthropic' package is not installed. "
-                "Run `pip install -e .`."
-            ) from exc
-
     raise QualificationError(
-        "no LLM API key found. Set ANTHROPIC_API_KEY or GEMINI_API_KEY in .env "
+        "no Gemini API key found. Set GEMINI_API_KEY in .env "
         "(see .env.example) before running `csg qualify`."
     )
 
@@ -261,10 +213,8 @@ def backend_name() -> str:
     or hold a live connection just to report a name."""
     if os.environ.get("GEMINI_API_KEY"):
         return GEMINI_MODEL
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return ANTHROPIC_MODEL
     raise QualificationError(
-        "no LLM API key found. Set ANTHROPIC_API_KEY or GEMINI_API_KEY in .env "
+        "no Gemini API key found. Set GEMINI_API_KEY in .env "
         "(see .env.example) before running `csg qualify`."
     )
 
@@ -430,6 +380,8 @@ async def qualify_run(
                 conn.commit()
                 stats["qualified"] += 1
             except Exception as exc:
+                if isinstance(exc, (GeminiQuotaBlocked, GeminiRetryLater)):
+                    raise
                 if ensure_owned:
                     ensure_owned()
                 stats["errors"] += 1

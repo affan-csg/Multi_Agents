@@ -6,7 +6,7 @@ GEMINI_API_KEY (discovery and firmographic research are LLM-backed); the
 scoring that follows is deterministic and free.
 
 `report`/`show`/`export`/`suppress` read what a run produced -- no API calls.
-`qualify` needs ANTHROPIC_API_KEY or GEMINI_API_KEY (see qualify.py), and
+`qualify` needs GEMINI_API_KEY (see qualify.py), and
 `contacts` spends Hunter.io quota. Both are explicit, never automatic.
 """
 
@@ -441,8 +441,8 @@ def qualify(
 ) -> None:
     """Step 4: LLM pass over scored prospects -- adds pain_summary + recommended_angle.
 
-    Uses Gemini (GEMINI_API_KEY) if set, else Claude (ANTHROPIC_API_KEY). Costs
-    real tokens/quota, so this asks for confirmation first (skip with --yes).
+    Uses Gemini 3.8 Flash (GEMINI_API_KEY). Costs real tokens/quota, so this
+    asks for confirmation first (skip with --yes).
     Already-qualified domains are skipped unless --force is passed. Re-export
     afterward with `csg export` to include qualification fields in the JSONL
     handoff.

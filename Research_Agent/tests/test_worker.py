@@ -219,6 +219,14 @@ def test_completed_enrichment_checkpoint_is_reused_after_restart(monkeypatch):
 
     async def enrich(company):
         provider_calls.append(company.domain)
+        from csg.discovery import research
+        company.research_outcomes = {
+            field: {"status": "accepted_and_mapped", "criterion": criterion}
+            for field, criterion in research._FIELD_CRITERIA.items()
+        }
+        company.research_outcomes["_summary"] = {
+            "status": "complete", "missing_fields": {}, "blocking_fields": {},
+        }
         return None
 
     monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
@@ -322,14 +330,22 @@ def test_recovery_pipeline_skips_domains_already_scored(monkeypatch):
     assert conn.upserts == []
 
 
-def test_interrupted_enrichment_is_not_replayed_after_worker_restart(monkeypatch):
+def test_interrupted_enrichment_is_retried_after_worker_restart(monkeypatch):
     candidate = CompanyCandidate(
         domain="acme.example",
         name="Acme",
         source="test",
         discovered_at=datetime.now(timezone.utc),
     )
-    saved = {"status": "started", "payload": {}}
+    prior = Company(
+        domain="acme.example", name="Acme",
+        employee_count={
+            "value": 50, "source": "gemini_grounded_search",
+            "url": "https://acme.example/about", "method": "estimated",
+            "confidence": "high",
+        },
+    )
+    saved = {"status": "started", "payload": {"company": prior.model_dump(mode="json")}}
     provider_calls = []
 
     class EmptyCompanyConn:
@@ -338,6 +354,15 @@ def test_interrupted_enrichment_is_not_replayed_after_worker_restart(monkeypatch
 
     async def enrich(company):
         provider_calls.append(company.domain)
+        assert company.employee_count.value == 50
+        from csg.discovery import research
+        company.research_outcomes = {
+            field: {"status": "accepted_and_mapped", "criterion": criterion}
+            for field, criterion in research._FIELD_CRITERIA.items()
+        }
+        company.research_outcomes["_summary"] = {
+            "status": "complete", "missing_fields": {}, "blocking_fields": {},
+        }
         return None
 
     monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
@@ -348,9 +373,10 @@ def test_interrupted_enrichment_is_not_replayed_after_worker_restart(monkeypatch
         checkpoint_save=lambda _key, status, payload: saved.update(status=status, payload=payload) is None,
     ))
 
-    assert provider_calls == []
-    assert result[2] == {"interrupted": 1}
-    assert saved["status"] == "failed"
+    assert provider_calls == ["acme.example"]
+    assert result[2] == {}
+    assert saved["status"] == "done"
+    assert saved["payload"]["company"]["employee_count"]["value"] == 50
 
 
 def test_worker_health_and_readiness_are_available():
@@ -359,6 +385,45 @@ def test_worker_health_and_readiness_are_available():
     assert health["worker_id"]
     with pytest.raises(Exception) as exc_info:
         worker.readyz()
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+
+def test_worker_health_reports_build_and_shared_scheduler(monkeypatch):
+    monkeypatch.setenv("RESEARCH_WORKER_VERSION", "image-sha-123")
+    monkeypatch.setattr(worker.gemini_queue, "uses_shared_scheduler", lambda: True)
+
+    health = worker.healthz()
+
+    assert health["worker_version"] == "image-sha-123"
+    assert health["gemini_queue_backend"] == "shared_supabase"
+    assert health["worker_implementation"] == "gemini-only-shared-queue-v1"
+
+
+def test_enabled_worker_is_not_ready_without_shared_scheduler(monkeypatch):
+    monkeypatch.setattr(worker, "_STARTED", True)
+    monkeypatch.setattr(worker, "_STOP", threading.Event())
+    monkeypatch.setattr(worker, "WORKER_ENABLED", True)
+    monkeypatch.setattr(worker.gemini_queue, "uses_shared_scheduler", lambda: False)
+
+    with pytest.raises(Exception) as exc_info:
+        worker.readyz()
+
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+
+def test_enabled_worker_readiness_requires_reachable_shared_scheduler(monkeypatch):
+    monkeypatch.setattr(worker, "_STARTED", True)
+    monkeypatch.setattr(worker, "_STOP", threading.Event())
+    monkeypatch.setattr(worker, "WORKER_ENABLED", True)
+    monkeypatch.setattr(worker.gemini_queue, "uses_shared_scheduler", lambda: True)
+    monkeypatch.setattr(
+        worker.gemini_queue, "scheduler_status",
+        lambda: (_ for _ in ()).throw(worker.gemini_queue.GeminiQueueUnavailable("scheduler offline")),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        worker.readyz()
+
     assert getattr(exc_info.value, "status_code", None) == 503
 
 

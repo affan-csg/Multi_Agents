@@ -36,6 +36,7 @@ instead of looking identical to an ordinary quota/parse failure. Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -58,8 +59,8 @@ def make_ipv4_httpx_clients() -> tuple:
     both are present, so every call times out or drops mid-handshake on
     those networks even though the key/quota/target are all fine. Pinning
     the outbound connection to IPv4 sidesteps that broken route entirely.
-    Shared by make_gemini_client and the Tavily+Groq fallback so neither
-    path is a single point of failure for the other.
+    Shared by Gemini-backed discovery and enrichment calls to avoid broken
+    IPv6 routes without introducing another AI provider.
     """
     import httpx
 
@@ -210,37 +211,61 @@ def is_daily_quota_exhausted(exc: Exception) -> bool:
     burning a key). Handles both the google-genai SDK's APIError shape and
     the raw httpx/ClientError shape web_search.py currently sees.
     """
-    status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    message = str(exc)
-    if status != 429 and "RESOURCE_EXHAUSTED" not in message and "429" not in message:
-        return False
+    return classify_gemini_error(exc) == "daily_quota"
 
-    # `exc.details` on google.genai's APIError is the raw parsed response
-    # body, which the SDK itself accesses two different ways in different
-    # places (see APIError._get_code/_get_status/_get_message): sometimes
-    # top-level, sometimes nested under "error". Match that same lookup here
-    # instead of assuming one shape.
+
+def _error_details(exc: Exception) -> dict:
     details = getattr(exc, "details", None)
-    body = details if isinstance(details, dict) else {}
-    error_body = body.get("error", body) if isinstance(body.get("error"), dict) else body
+    if isinstance(details, dict):
+        return details
+    text = str(exc)
+    start = text.find("{")
+    if start < 0:
+        return {}
+    try:
+        parsed, _ = json.JSONDecoder().raw_decode(text[start:])
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
-    for d in error_body.get("details", []) or []:
-        for violation in d.get("violations", []) or []:
-            if "PerDay" in (violation.get("quotaId") or ""):
-                return True
-            if "PerMinute" in (violation.get("quotaId") or ""):
-                # An explicit per-minute violation is the one case worth
-                # trusting over the message text: it recovers in seconds, so
-                # retrying the same key (the caller's own backoff) is right.
-                return False
 
-    # No explicit per-minute violation ruled it out above, so fall back to
-    # the message text. Google's 429 responses don't reliably include a
-    # QuotaFailure/violations block even for genuine daily-quota errors --
-    # the `details` list is sometimes just a generic rpc.Help link -- so
-    # "resource_exhausted" / "exceeded your current quota" in the message is
-    # the more reliable signal in practice (confirmed against a live 429).
-    lowered = message.lower()
-    if "resource_exhausted" in lowered or "exceeded your current quota" in lowered:
-        return True
-    return False
+def classify_gemini_error(exc: Exception) -> str:
+    """Classify Gemini quota and overload errors for queue control.
+
+    Structured quota IDs take precedence over message heuristics because
+    Gemini can return a generic RESOURCE_EXHAUSTED message for several
+    distinct limits. Unknown 429s are treated as temporary capacity, not as
+    a reason to rotate keys or switch providers.
+    """
+    status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    status = status or getattr(response, "status_code", None)
+    body = _error_details(exc)
+    error_body = body.get("error", body)
+    quota_ids: list[str] = []
+    for detail in error_body.get("details", []) or []:
+        if not isinstance(detail, dict):
+            continue
+        for violation in detail.get("violations", []) or []:
+            if isinstance(violation, dict):
+                quota_id = violation.get("quotaId") or violation.get("quota_id")
+                if quota_id:
+                    quota_ids.append(str(quota_id).lower())
+    quota_text = " ".join(quota_ids)
+    message = f"{exc} {error_body.get('message', '')}".lower()
+
+    if "month" in quota_text or "monthly" in message or "per month" in message:
+        return "monthly_quota"
+    if "day" in quota_text or "daily" in message or "per day" in message:
+        return "daily_quota"
+    if ("token" in quota_text or "token" in message) and (
+        "minute" in quota_text or "minute" in message
+    ):
+        return "tpm"
+    if "minute" in quota_text or "requests per minute" in message or "rpm" in message:
+        return "rpm"
+    if "exceeded your current quota" in message or "quota exceeded" in message:
+        return "daily_quota"
+    if status in (429, 503) or "resource_exhausted" in message:
+        return "temporary_capacity"
+    return "other"

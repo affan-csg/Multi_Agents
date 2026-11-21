@@ -608,14 +608,49 @@ def latest_run_id(conn: SupabaseConn) -> Optional[str]:
 
 
 def stalled_companies(conn: SupabaseConn, run_id: str) -> list[str]:
-    """Domains this run scored that never got real data: no ATS board found
-    AND no firmographics either -- the signature of every provider (Gemini,
-    the Tavily+Groq discovery/enrichment fallback) being exhausted or
-    unreachable for that company, not a company that was genuinely researched
-    and just turned out thin. These are what a "resume" re-run should retry;
-    a company that was actually checked and came up empty should not be
-    re-fetched every time someone clicks resume.
+    """Return domains whose latest enrichment checkpoint records a failure.
+
+    ATS discovery is independent of firmographic enrichment, so it must not
+    exclude a company from resume. Successful checkpoints remain untouched.
+    Older runs without enrichment checkpoints retain the conservative legacy
+    heuristic.
     """
+    jobs = conn.select(
+        "agent_jobs", run_id=f"eq.{run_id}",
+        select="job_id,status,created_at", order="created_at.desc", limit=1000,
+    )
+    latest: dict[str, tuple[dict[str, Any], str]] = {}
+    found_checkpoints = False
+    for job in jobs:
+        job_id = job.get("job_id")
+        if not job_id:
+            continue
+        checkpoints = conn.select(
+            "agent_job_checkpoints", job_id=f"eq.{job_id}",
+            select="checkpoint_key,status,payload,updated_at",
+            order="updated_at.desc", limit=10000,
+        )
+        for checkpoint in checkpoints:
+            key = checkpoint.get("checkpoint_key") or ""
+            if not key.startswith("enrich:"):
+                continue
+            found_checkpoints = True
+            domain = key.removeprefix("enrich:")
+            latest.setdefault(domain, (checkpoint, job.get("status", "")))
+
+    if found_checkpoints:
+        failed = []
+        for domain, (checkpoint, job_status) in latest.items():
+            status = checkpoint.get("status")
+            reason = (checkpoint.get("payload") or {}).get("reason")
+            if (
+                status in {"failed", "queued"}
+                or (status == "done" and reason)
+                or (status == "started" and job_status in {"done", "error", "cancelled"})
+            ):
+                failed.append(domain)
+        return sorted(failed)
+
     scored = conn.select("scores", run_id=f"eq.{run_id}", select="domain,score")
     if not scored:
         return []
@@ -933,6 +968,10 @@ def insert_api_usage(conn: SupabaseConn, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
     conn._check(conn._client.post("/api_usage", json=rows))
+
+
+def insert_diagnostic_event(conn: SupabaseConn, row: dict[str, Any]) -> None:
+    conn._check(conn._client.post("/research_diagnostic_events", json=row))
 
 
 def api_usage_since(conn: SupabaseConn, since_iso: str) -> list[dict[str, Any]]:

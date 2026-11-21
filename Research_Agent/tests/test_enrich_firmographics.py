@@ -51,23 +51,55 @@ def capture_provider_usage(monkeypatch):
 
 def _fake_response(text: str) -> SimpleNamespace:
     return SimpleNamespace(text=text, candidates=[SimpleNamespace(grounding_metadata=SimpleNamespace(
-        grounding_chunks=[SimpleNamespace(web=SimpleNamespace(uri="https://acme.com"))],
+        grounding_chunks=[SimpleNamespace(web=SimpleNamespace(uri="https://acme.com/about"))],
+        grounding_supports=[SimpleNamespace(
+            segment=SimpleNamespace(text=text), grounding_chunk_indices=[0],
+        )],
     ))])
 
 
 _FIRMOGRAPHICS_JSON = (
-    '{"official_website": "https://acme.com", "official_website_source_url": "https://acme.com", '
-    '"official_website_excerpt": "Acme official website", '
+    '{"official_website": "https://acme.com", "official_website_source_url": "https://acme.com/about", '
+    '"official_website_excerpt": "Acme official website is https://acme.com.", '
     '"headquarters": {"city": "Austin", "state": "TX", "country": "United States"}, '
-    '"headquarters_source_url": "https://acme.com", "headquarters_excerpt": "Headquartered in Austin, TX", '
-    '"company_type": "smb", "company_type_source_url": "https://acme.com", '
+    '"headquarters_source_url": "https://acme.com/about", '
+    '"headquarters_excerpt": "Headquartered in Austin TX United States", '
+    '"company_type": "small business", "company_type_source_url": "https://acme.com/about", '
     '"company_type_excerpt": "Acme is a small business", "employee_count": 500, '
-    '"employee_count_source_url": "https://acme.com", "employee_count_excerpt": "Acme has 500 employees", '
-    '"revenue": "$50M", "revenue_source_url": "https://acme.com", '
+    '"employee_count_source_url": "https://acme.com/about", "employee_count_excerpt": "Acme has 500 employees", '
+    '"revenue": "$50M", "revenue_source_url": "https://acme.com/about", '
     '"revenue_excerpt": "Annual revenue is $50M", "funding": null, '
-    '"industry": "Software", "description": "A company.", '
-    '"hq_location": "Austin, TX", "founded_year": 2015}'
+    '"funding_source_url": null, "funding_excerpt": null, '
+    '"industry": "Software", "industry_source_url": "https://acme.com/about", '
+    '"industry_excerpt": "Acme is a software company", '
+    '"description": "Acme provides workflow software", "description_source_url": "https://acme.com/about", '
+    '"description_excerpt": "Acme provides workflow software", '
+    '"employee_range": "500 employees", "employee_range_source_url": "https://acme.com/about", '
+    '"employee_range_excerpt": "Acme has 500 employees", '
+    '"services": "Acme provides software implementation services", '
+    '"services_source_url": "https://acme.com/about", '
+    '"services_excerpt": "Acme provides software implementation services", '
+    '"leadership": [], "hiring_service_fit": null, "hiring_service_fit_source_url": null, '
+    '"hiring_service_fit_excerpt": null, "classification_evidence": [], "research_evidence": []}'
 )
+
+
+def _fully_populated_response_text() -> str:
+    data = json.loads(_FIRMOGRAPHICS_JSON)
+    data.update({
+        "funding": "$10M Series A",
+        "funding_source_url": "https://acme.com/about",
+        "funding_excerpt": "Acme raised a $10M Series A round",
+        "leadership": [{
+            "name": "A. Example", "title": "CEO",
+            "source_url": "https://acme.com/about",
+            "excerpt": "A. Example is the CEO of Acme",
+        }],
+        "hiring_service_fit": "Acme lists engineering roles",
+        "hiring_service_fit_source_url": "https://acme.com/about",
+        "hiring_service_fit_excerpt": "Acme lists engineering roles",
+    })
+    return json.dumps(data)
 
 
 def _tavily_groq_transport(handler):
@@ -171,12 +203,10 @@ def test_non_quota_gemini_failure_falls_back_to_tavily_groq(
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason is None  # fallback succeeded -> enrichment overall succeeded
-    assert company.employee_count.value == 500
-    assert company.employee_count.source == "groq_tavily_search"
+    assert reason == "request_error"
+    assert company.employee_count is None
     assert [row["provider"] for row in capture_provider_usage].count("gemini") == 1
-    assert any(row["provider"] == "tavily" and row["success"] for row in capture_provider_usage)
-    assert any(row["provider"] == "groq" and row["success"] for row in capture_provider_usage)
+    assert not any(row["provider"] in {"tavily", "groq"} for row in capture_provider_usage)
 
 
 def test_fallback_passes_tavily_raw_page_content_to_groq(gemini_keys, monkeypatch):
@@ -214,13 +244,11 @@ def test_fallback_passes_tavily_raw_page_content_to_groq(gemini_keys, monkeypatc
     _patch_httpx_client(monkeypatch, handler)
     company = _company()
 
-    assert asyncio.run(research.enrich_company_firmographics(company)) is None
-    assert received == {"tavily_raw_requested": True, "groq_received_raw": True}
+    assert asyncio.run(research.enrich_company_firmographics(company)) == "request_error"
+    assert received == {"tavily_raw_requested": False, "groq_received_raw": False}
 
 
-def test_quota_exhausted_still_falls_back_to_tavily_groq(gemini_keys, monkeypatch, capture_provider_usage):
-    """Same fallback path the quota-exhaustion case already used before this
-    fix -- must still work identically afterwards."""
+def test_quota_exhaustion_blocks_without_fallback(gemini_keys, monkeypatch, capture_provider_usage):
     class QuotaError(Exception):
         code = 429
         def __str__(self):
@@ -236,14 +264,12 @@ def test_quota_exhausted_still_falls_back_to_tavily_groq(gemini_keys, monkeypatc
                 raise QuotaError()
 
     monkeypatch.setattr("google.genai.Client", FakeClient)
-    _patch_httpx_client(monkeypatch, _successful_fallback_handler)
+    monkeypatch.setattr(research, "_enrich_via_groq_tavily", lambda *_: pytest.fail("fallback called"))
 
     company = _company()
-    reason = asyncio.run(research.enrich_company_firmographics(company))
-
-    assert reason is None
-    assert company.employee_count.value == 500
-    assert company.employee_count.value == 500
+    with pytest.raises(Exception, match="quota-blocked"):
+        asyncio.run(research.enrich_company_firmographics(company))
+    assert company.employee_count is None
     gemini_usage = [row for row in capture_provider_usage if row["provider"] == "gemini"]
     assert len(gemini_usage) == 1
     assert gemini_usage[0]["success"] is False
@@ -277,7 +303,80 @@ def test_gemini_success_never_touches_fallback(gemini_keys, monkeypatch):
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
+    assert reason == "complete_with_gaps"
+    assert company.research_outcomes["_summary"]["status"] == "complete_with_gaps"
+    assert "funding" in company.research_outcomes["_summary"]["missing_fields"]
+
+
+def test_full_grounded_response_is_complete(gemini_keys, monkeypatch):
+    class FakeClient:
+        def __init__(self, api_key, http_options=None, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**_kwargs):
+                return _fake_response(_fully_populated_response_text())
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+    company = _company()
+
+    reason = asyncio.run(research.enrich_company_firmographics(company, run_id="run-full"))
+
     assert reason is None
+    assert company.research_outcomes["_summary"]["status"] == "complete"
+    assert company.employee_count.value == 500
+    assert company.revenue.value == "$50M"
+    assert company.funding.value == "$10M Series A"
+    assert company.website.url == "https://acme.com/about"
+
+
+def test_omitted_required_key_is_partial_and_keeps_valid_facts(gemini_keys, monkeypatch):
+    data = json.loads(_fully_populated_response_text())
+    data.pop("leadership")
+
+    class FakeClient:
+        def __init__(self, api_key, http_options=None, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**_kwargs):
+                return _fake_response(json.dumps(data))
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+    company = _company()
+
+    reason = asyncio.run(research.enrich_company_firmographics(company, run_id="run-partial"))
+
+    assert reason == "incomplete_result"
+    assert company.employee_count.value == 500
+    assert company.research_outcomes["_summary"]["status"] == "partial"
+    assert "response_schema" in company.research_outcomes["_summary"]["blocking_fields"]
+
+
+def test_explicit_null_is_reported_as_terminal_missing_information(gemini_keys, monkeypatch):
+    data = json.loads(_fully_populated_response_text())
+    data.update({"funding": None, "funding_source_url": None, "funding_excerpt": None})
+
+    class FakeClient:
+        def __init__(self, api_key, http_options=None, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**_kwargs):
+                return _fake_response(json.dumps(data))
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+    company = _company()
+
+    reason = asyncio.run(research.enrich_company_firmographics(company))
+
+    assert reason == "complete_with_gaps"
+    assert company.research_outcomes["funding"]["status"] == "searched_but_not_found"
+    assert "explicitly returned no reliable information" in company.research_outcomes["funding"]["reason"]
+    assert company.research_outcomes["_summary"]["status"] == "complete_with_gaps"
 
 
 def test_gemini_ungrounded_claim_triggers_fallback(gemini_keys, monkeypatch):
@@ -316,8 +415,8 @@ def test_gemini_ungrounded_claim_triggers_fallback(gemini_keys, monkeypatch):
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason is None
-    assert called["count"] == 1
+    assert reason == "ungrounded_response"
+    assert called["count"] == 0
 
 
 @pytest.mark.parametrize("response_text", ["", "not json"])
@@ -341,8 +440,9 @@ def test_empty_or_malformed_gemini_response_triggers_fallback(gemini_keys, monke
     monkeypatch.setattr(research, "_enrich_via_groq_tavily", fake_fallback)
     company = _company()
 
-    assert asyncio.run(research.enrich_company_firmographics(company)) is None
-    assert called["count"] == 1
+    reason = asyncio.run(research.enrich_company_firmographics(company))
+    assert reason in {"empty_response", "parse_error"}
+    assert called["count"] == 0
     assert company.employee_count is None
 
 
@@ -456,13 +556,12 @@ def test_fallback_failure_preserves_existing_values_evidence_and_reports_fields(
     )
     before = company.model_dump(mode="json")
 
-    assert asyncio.run(research.enrich_company_firmographics(company)) is None
+    assert asyncio.run(research.enrich_company_firmographics(company)) == "request_error"
     after = company.model_dump(mode="json")
     assert after["website"] == before["website"]
     assert after["employee_count"] == before["employee_count"]
     assert after["research_evidence"] == before["research_evidence"]
-    assert company.research_outcomes["services"]["reason"] == "Tavily returned no source URLs for this field"
-    assert company.research_outcomes["services"]["status"] == "searched_but_not_found"
+    assert company.research_outcomes["services"] == before["research_outcomes"]["services"]
 
 
 def test_empty_groq_response_preserves_data_and_reports_parse_failure(gemini_keys, monkeypatch):
@@ -494,9 +593,11 @@ def test_empty_groq_response_preserves_data_and_reports_parse_failure(gemini_key
         employee_count={"value": 42, "source": "manual", "method": "reported", "confidence": "high"},
     )
 
-    assert asyncio.run(research.enrich_company_firmographics(company)) == "parse_error"
+    assert asyncio.run(research.enrich_company_firmographics(company)) == "request_error"
     assert company.employee_count.value == 42
-    assert company.research_outcomes["employee_range"]["reason"] == "provider response could not be parsed"
+    assert company.research_outcomes["employee_range"]["reason"] == (
+        "provider call has not returned usable research results"
+    )
 
 
 def test_firmographic_source_urls_must_match_returned_sources():
@@ -590,16 +691,42 @@ def test_real_sailpoint_result_preserves_public_company_type_and_provenance():
     assert company.company_type.value == "Public Company"
 
 
-def test_gemini_grounding_url_is_saved_with_fact_provenance(gemini_keys, monkeypatch):
-    source_url = "https://acme.com/about"
-    response = SimpleNamespace(
-        text=(
-            '{"employee_count": 500, "employee_count_source_url": "' + source_url + '", '
-            '"revenue": null, "funding": null, "industry": "Software", '
-            '"description": "A company.", "hq_location": null, "founded_year": null}'
-        ),
+def test_grounding_metadata_accepts_object_and_dictionary_shapes():
+    object_response = SimpleNamespace(
         candidates=[SimpleNamespace(grounding_metadata=SimpleNamespace(
-            grounding_chunks=[SimpleNamespace(web=SimpleNamespace(uri=source_url))],
+            grounding_chunks=[SimpleNamespace(web=SimpleNamespace(uri="https://www.acme.com:443/about/"))],
+            grounding_supports=[SimpleNamespace(
+                segment=SimpleNamespace(text="Acme has 500 employees."), grounding_chunk_indices=[0],
+            )],
+        ))],
+    )
+    dict_response = {
+        "candidates": [{"groundingMetadata": {"groundingChunks": [
+            {"web": {"uri": "https://acme.com/about"}},
+        ], "groundingSupports": [{
+            "segment": {"text": "Acme has 500 employees."}, "groundingChunkIndices": [0],
+        }]}}],
+    }
+
+    object_urls = research._extract_gemini_grounding_urls(object_response)
+    dict_urls = research._extract_gemini_grounding_urls(dict_response)
+
+    assert "https://acme.com/about" in object_urls
+    assert "https://acme.com/about" in dict_urls
+    assert research._normalize_grounding_url("https://www.acme.com:443/about/") == "https://acme.com/about"
+    assert research._extract_gemini_grounding_supports(object_response) == {
+        "https://acme.com/about": ["Acme has 500 employees."],
+    }
+    assert research._extract_gemini_grounding_supports(dict_response) == {
+        "https://acme.com/about": ["Acme has 500 employees."],
+    }
+
+
+def test_grounding_rejects_model_url_without_metadata(gemini_keys, monkeypatch):
+    response = SimpleNamespace(
+        text='{"employee_count": 500, "employee_count_source_url": "https://model-only.example/about"}',
+        candidates=[SimpleNamespace(grounding_metadata=SimpleNamespace(
+            grounding_chunks=[SimpleNamespace(web=SimpleNamespace(uri="https://acme.com/about"))],
         ))],
     )
 
@@ -615,9 +742,49 @@ def test_gemini_grounding_url_is_saved_with_fact_provenance(gemini_keys, monkeyp
     monkeypatch.setattr("google.genai.Client", FakeClient)
 
     company = _company()
+    assert asyncio.run(research.enrich_company_firmographics(company)) == "ungrounded_response"
+    assert company.employee_count is None
+
+
+def test_grounding_url_without_support_association_is_rejected(gemini_keys, monkeypatch):
+    response = _fake_response(_fully_populated_response_text())
+    response.candidates[0].grounding_metadata.grounding_supports = []
+
+    class FakeClient:
+        def __init__(self, api_key, http_options=None, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**_kwargs):
+                return response
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+    company = _company()
+
+    result = asyncio.run(research.enrich_company_firmographics(company))
+
+    assert result == "ungrounded_response"
+    assert company.research_outcomes["_summary"]["status"] == "partial"
+
+
+def test_gemini_grounding_url_is_saved_with_fact_provenance(gemini_keys, monkeypatch):
+    source_url = "https://acme.com/about"
+    class FakeClient:
+        def __init__(self, api_key, http_options=None, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**kwargs):
+                return _fake_response(_FIRMOGRAPHICS_JSON)
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+
+    company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason is None
+    assert reason == "complete_with_gaps"
     assert company.employee_count.url == source_url
     assert company.employee_count.fetched_at
 
@@ -651,7 +818,7 @@ def test_transient_connection_error_retries_same_key_before_fallback(gemini_keys
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason is None
+    assert reason == "complete_with_gaps"
     assert calls["n"] == 2
     assert company.employee_count.source == "gemini_grounded_search"
 
@@ -684,8 +851,7 @@ def test_non_quota_failure_then_fallback_also_fails_reports_request_error(
     gemini_rows = [row for row in capture_provider_usage if row["provider"] == "gemini"]
     tavily_rows = [row for row in capture_provider_usage if row["provider"] == "tavily"]
     assert gemini_rows and gemini_rows[0]["success"] is False
-    assert tavily_rows and tavily_rows[0]["success"] is False
-    assert tavily_rows[0]["status_code"] == 500
+    assert not tavily_rows
 
 
 def test_fallback_rate_limit_exhausted_reports_rate_limited_not_request_error(gemini_keys, monkeypatch):
@@ -717,7 +883,7 @@ def test_fallback_rate_limit_exhausted_reports_rate_limited_not_request_error(ge
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "rate_limited"
+    assert reason == "request_error"
 
 
 def test_fallback_connection_error_reports_connection_error_not_request_error(gemini_keys, monkeypatch):
@@ -744,7 +910,7 @@ def test_fallback_connection_error_reports_connection_error_not_request_error(ge
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "connection_error"
+    assert reason == "request_error"
 
 
 def test_no_gemini_key_goes_straight_to_fallback(monkeypatch):
@@ -759,8 +925,8 @@ def test_no_gemini_key_goes_straight_to_fallback(monkeypatch):
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason is None
-    assert company.employee_count.source == "groq_tavily_search"
+    assert reason == "no_api_key"
+    assert company.employee_count is None
 
 
 def test_no_gemini_and_no_fallback_keys_reports_quota_exhausted(monkeypatch):
@@ -773,7 +939,7 @@ def test_no_gemini_and_no_fallback_keys_reports_quota_exhausted(monkeypatch):
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "quota_exhausted"
+    assert reason == "no_api_key"
 
 
 def test_tavily_432_stops_later_fallback_calls(monkeypatch):
@@ -791,10 +957,10 @@ def test_tavily_432_stops_later_fallback_calls(monkeypatch):
     first_reason = asyncio.run(research._enrich_via_groq_tavily(_company("first.example"), limited))
     second_reason = asyncio.run(research._enrich_via_groq_tavily(_company("second.example"), limited))
 
-    assert first_reason == "quota_exhausted"
-    assert second_reason == "quota_exhausted"
-    assert limited.is_set()
-    assert len(requests) == 1
+    assert first_reason == "fallback_disabled"
+    assert second_reason == "fallback_disabled"
+    assert limited.is_set() is False
+    assert requests == []
 
 
 def test_tavily_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
@@ -840,10 +1006,8 @@ def test_tavily_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason is None
-    # One retry for the first targeted search plus six other field searches.
-    assert calls["tavily"] == 8
-    assert company.employee_count.source == "groq_tavily_search"
+    assert reason == "request_error"
+    assert calls["tavily"] == 0
 
 
 def test_groq_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
@@ -882,9 +1046,8 @@ def test_groq_rate_limit_retries_before_succeeding(gemini_keys, monkeypatch):
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason is None
-    assert calls["groq"] == 2
-    assert company.employee_count.source == "groq_tavily_search"
+    assert reason == "request_error"
+    assert calls["groq"] == 0
 
 
 def test_gemini_transient_429_retries_once_on_same_key(gemini_keys, monkeypatch):
@@ -913,7 +1076,7 @@ def test_gemini_transient_429_retries_once_on_same_key(gemini_keys, monkeypatch)
     monkeypatch.setattr(research, "_enrich_via_groq_tavily", lambda *_: pytest.fail("unexpected fallback"))
 
     company = _company()
-    assert asyncio.run(research.enrich_company_firmographics(company)) is None
+    assert asyncio.run(research.enrich_company_firmographics(company)) == "complete_with_gaps"
     assert calls["count"] == 2
     assert company.employee_count.value == 500
 
@@ -942,9 +1105,10 @@ def test_daily_quota_advances_key_without_retrying_exhausted_key(gemini_keys, mo
     monkeypatch.setattr("google.genai.Client", FakeClient)
 
     company = _company()
-    assert asyncio.run(research.enrich_company_firmographics(company)) is None
-    assert calls == ["test-key-1", "test-key-2"]
-    assert company.employee_count.value == 500
+    with pytest.raises(Exception, match="quota-blocked"):
+        asyncio.run(research.enrich_company_firmographics(company))
+    assert calls == ["test-key-1"]
+    assert company.employee_count is None
 
 
 def test_field_evidence_outcomes_preserve_manual_facts_and_deduplicate():

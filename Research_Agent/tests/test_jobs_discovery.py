@@ -158,25 +158,19 @@ def test_careers_page_rejects_jsonld_for_different_employer():
 # 3. No ATS -> careers page fails/empty -> external search -> jobs found
 # --------------------------------------------------------------------------
 
-def test_no_ats_careers_empty_falls_through_to_external_search(monkeypatch):
-    monkeypatch.setenv("TAVILY_API_KEY", "fake-key")
+def test_no_ats_careers_empty_does_not_call_external_search(monkeypatch):
     fetcher = FakeFetcher()  # every careers path 404s
 
     async def fake_search(domain, name):
-        return [JobPosting(domain=domain, ats_provider=None, source="web_search",
-                            external_id="search:1", title="Acme is hiring a Platform Engineer",
-                            url="https://example.com/article")], None
+        pytest.fail("Tavily must not be used as an automatic job-search fallback")
 
     monkeypatch.setattr("csg.jobs_discovery._search_jobs_external", fake_search)
 
     result = asyncio.run(discover_jobs(fetcher, _company(), None))
 
-    assert result.method == "web_search"
+    assert result.method == "unknown"
     assert result.hiring_signal == "unknown"
-    assert result.source == "tavily search"
-    assert len(result.postings) == 1
-    assert result.postings[0].source == "web_search"
-    assert not jobs_discovery.is_scoring_eligible(result.postings[0])
+    assert result.postings == []
 
 
 # --------------------------------------------------------------------------
@@ -327,10 +321,10 @@ def test_tavily_dns_failure_then_success_recovers_within_retry_budget(monkeypatc
 
     result = asyncio.run(discover_jobs(fetcher, _company(), None))
 
-    assert calls["n"] == 2  # exactly one retry, not a second full pass through the chain
-    assert result.method == "web_search"
+    assert calls["n"] == 0
+    assert result.method == "unknown"
     assert result.hiring_signal == "unknown"
-    assert len(result.postings) == 1
+    assert result.postings == []
 
 
 def test_tavily_dns_failure_exhausts_retries_then_unknown_not_zero(monkeypatch):
@@ -352,12 +346,10 @@ def test_tavily_dns_failure_exhausts_retries_then_unknown_not_zero(monkeypatch):
 
     result = asyncio.run(discover_jobs(fetcher, _company(), None))
 
-    # bounded: initial attempt + _TAVILY_CONNECTION_ERROR_RETRIES retries, no more
-    assert calls["n"] == jobs_discovery._TAVILY_CONNECTION_ERROR_RETRIES + 1
+    assert calls["n"] == 0
     assert result.method == "unknown"
     assert result.hiring_signal == "unknown"
     assert result.postings == []
-    assert "connection_error" in result.notes
 
 
 def test_tavily_connection_error_retry_does_not_consume_rate_limit_budget(monkeypatch):
@@ -385,8 +377,8 @@ def test_tavily_connection_error_retry_does_not_consume_rate_limit_budget(monkey
 
     result = asyncio.run(discover_jobs(fetcher, _company(), None))
 
-    assert calls["n"] == 3
-    assert result.method == "web_search"
+    assert calls["n"] == 0
+    assert result.method == "unknown"
     assert result.hiring_signal == "unknown"
 
 
@@ -412,6 +404,6 @@ def test_tavily_timeout_is_also_retried(monkeypatch):
 
     result = asyncio.run(discover_jobs(fetcher, _company(), None))
 
-    assert calls["n"] == 2
-    assert result.method == "web_search"
+    assert calls["n"] == 0
+    assert result.method == "unknown"
     assert result.hiring_signal == "unknown"

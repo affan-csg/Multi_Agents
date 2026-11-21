@@ -204,4 +204,20 @@ describe("JobMonitor", () => {
     expect(storage.getItem(ACTIVE_RESEARCH_JOB_KEY)).toBeNull();
     expect(jobSocket).not.toHaveBeenCalled();
   });
+
+  it("treats quota-blocked jobs as terminal while preserving their snapshot", async () => {
+    vi.useFakeTimers();
+    const jobStatus = vi.fn().mockResolvedValue(snapshot("quota_blocked"));
+    const jobSocket = vi.fn();
+    const onSnapshot = vi.fn();
+    const storage = new MemoryStorage();
+
+    const monitor = new JobMonitor("job-1", { jobStatus, jobSocket }, onSnapshot, storage);
+    monitor.start();
+    await flushPromises();
+
+    expect(onSnapshot).toHaveBeenCalledWith(expect.objectContaining({ status: "quota_blocked" }));
+    expect(storage.getItem(ACTIVE_RESEARCH_JOB_KEY)).toBeNull();
+    expect(jobSocket).not.toHaveBeenCalled();
+  });
 });

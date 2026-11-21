@@ -4,9 +4,8 @@ Uses Google's Gemini API with grounded search to look up real company
 data: employee count, revenue, funding, industry, and description.
 All data is returned with strict provenance tracking.
 
-Falls back to Tavily search + Groq parsing (same pair used as the discovery
-fallback in groq_tavily.py) when every Gemini key is exhausted or missing,
-so a Gemini daily-quota outage doesn't leave every company unenriched.
+Tavily/Groq enrichment fallback code remains in this module for reference
+only and is disabled; Gemini is the sole external AI/research provider.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from .gemini_keys import (
     GeminiKeyPool, is_connection_error, is_daily_quota_exhausted,
     make_ipv4_async_httpx_client,
 )
-from .groq_tavily import GroqTavilyProvider, _GROQ_URL, _GROQ_MODEL, _TAVILY_URL
+from ..gemini_queue import GeminiQuotaBlocked, GeminiRetryLater, generate_content
 from ..models import Company, ProvenanceValue, provenance_value
 from ..diagnostics import log_event
 from ..usage_tracker import track
@@ -52,7 +51,28 @@ _FIELD_CRITERIA = {
     "leadership": "company_leadership",
     "services": "company_services",
     "hiring_service_fit": "company_hiring_fit",
+    "revenue": "company_revenue",
+    "funding": "company_funding",
+    "industry": "company_industry",
+    "description": "company_description",
 }
+_REQUIRED_RESPONSE_FIELDS = (
+    "official_website", "headquarters", "company_type", "employee_count",
+    "revenue", "funding", "industry", "description", "employee_range",
+    "services", "leadership", "hiring_service_fit", "classification_evidence",
+    "research_evidence",
+)
+_REQUIRED_RESPONSE_KEYS = frozenset({
+    *_REQUIRED_RESPONSE_FIELDS,
+    "official_website_source_url", "official_website_excerpt",
+    "headquarters_source_url", "headquarters_excerpt",
+    "company_type_source_url", "company_type_excerpt",
+    "employee_count_source_url", "employee_count_excerpt",
+    "revenue_source_url", "revenue_excerpt", "funding_source_url", "funding_excerpt",
+    "industry_source_url", "industry_excerpt", "description_source_url", "description_excerpt",
+    "employee_range_source_url", "employee_range_excerpt", "services_source_url", "services_excerpt",
+    "hiring_service_fit_source_url", "hiring_service_fit_excerpt",
+})
 _FALLBACK_QUERIES = (
     ("official_website", "{name} {domain} official company website about"),
     ("headquarters", "{name} {domain} headquarters city country official"),
@@ -61,6 +81,10 @@ _FALLBACK_QUERIES = (
     ("leadership", "{name} {domain} leadership CEO CTO talent acquisition executives"),
     ("services", "{name} {domain} services products what the company offers"),
     ("hiring_service_fit", "{name} {domain} careers open engineering data jobs contractors staffing services"),
+    ("revenue", "{name} {domain} reported revenue annual revenue financial results"),
+    ("funding", "{name} {domain} funding investment financing"),
+    ("industry", "{name} {domain} industry products market"),
+    ("description", "{name} {domain} company overview what the company does"),
 )
 
 
@@ -82,6 +106,12 @@ def _has_source_excerpt(source_url: str, excerpt: Any, source_content: dict[str,
 
 def _claim_matches_excerpt(claim: dict[str, Any], excerpt: str) -> bool:
     normalized_excerpt = _normalized_source_text(excerpt)
+    aliases = {
+        "public company": ("public company", "publicly traded company"),
+        "private company": ("private company", "privately held company"),
+        "smb": ("smb", "small business", "small-to-medium business"),
+        "system_integrator": ("system integrator", "systems integrator", "systems integration provider"),
+    }
     values: list[str] = []
 
     def collect(value: Any) -> None:
@@ -95,9 +125,12 @@ def _claim_matches_excerpt(claim: dict[str, Any], excerpt: str) -> bool:
             values.append(str(value).strip())
 
     collect(claim)
-    return bool(values) and all(
-        _normalized_source_text(value) in normalized_excerpt for value in values
-    )
+    def supported(value: str) -> bool:
+        normalized = _normalized_source_text(value)
+        alternatives = aliases.get(normalized, (value,))
+        return any(_normalized_source_text(item) in normalized_excerpt for item in alternatives)
+
+    return bool(values) and all(supported(value) for value in values)
 
 
 def _is_manually_approved(value: ProvenanceValue | None) -> bool:
@@ -116,6 +149,37 @@ def _mark_research_not_searched(company: Company, reason: str) -> None:
             "status": "not_searched", "criterion": criterion,
             "checked_at": now, "reason": reason,
         })
+
+
+def enrichment_completeness(company: Company) -> dict[str, Any]:
+    """Summarize terminal field outcomes without treating unavailable facts as successes."""
+    missing: dict[str, str] = {}
+    blocking: dict[str, str] = {}
+    response_missing = company.research_outcomes.get("_missing_response_fields") or []
+    if response_missing:
+        reason = "Gemini omitted required response keys: " + ", ".join(response_missing)
+        blocking["response_schema"] = reason
+        missing["response_schema"] = reason
+    for field in _FIELD_CRITERIA:
+        outcome = company.research_outcomes.get(field)
+        if not isinstance(outcome, dict):
+            blocking[field] = "No research outcome was recorded"
+            continue
+        status = outcome.get("status")
+        if status == "accepted_and_mapped":
+            continue
+        reason = outcome.get("reason")
+        if status == "searched_but_not_found":
+            missing[field] = reason or "No reliable information was returned"
+            continue
+        blocking[field] = reason or {
+            "not_returned": "The provider omitted this required field",
+            "found_but_rejected": "The returned claim failed validation",
+            "not_searched": "The field was not searched",
+        }.get(status, f"Research outcome is incomplete ({status or 'missing status'})")
+        missing[field] = blocking[field]
+    status = "partial" if blocking else ("complete_with_gaps" if missing else "complete")
+    return {"status": status, "missing_fields": missing, "blocking_fields": blocking}
 
 
 def _is_gemini_transient_rate_limit(exc: Exception) -> bool:
@@ -177,8 +241,6 @@ Research this company and return ONLY a valid JSON object with these fields:
   "description": "<1-2 sentence description of what the company does>",
         "description_source_url": "URL supporting description or null",
         "description_excerpt": "exact supporting excerpt from that source or null",
-  "hq_location": "<city, state or null>",
-    "founded_year": <number or null>,
     "employee_range": "exact source wording or null",
     "employee_range_source_url": "exact supporting URL or null",
     "employee_range_excerpt": "exact supporting excerpt from that source or null",
@@ -190,7 +252,7 @@ Research this company and return ONLY a valid JSON object with these fields:
     "hiring_service_fit_source_url": "exact supporting URL or null",
     "hiring_service_fit_excerpt": "exact supporting excerpt from that source or null",
     "research_evidence": [
-        {{"field": "leadership|services|hiring_service_fit|employee_range", "criterion": "company_leadership|company_services|company_hiring_fit|automatic_company_size", "claim": {{}}, "source_name": "source title", "source_url": "exact URL", "excerpt": "exact supporting excerpt", "confidence": "high|medium|low", "evidence_type": "direct|inferred"}}
+        {{"field": "leadership|services|hiring_service_fit|employee_range|industry|description", "criterion": "company_leadership|company_services|company_hiring_fit|automatic_company_size|company_industry|company_description", "claim": {{}}, "source_name": "source title", "source_url": "exact URL", "excerpt": "exact supporting excerpt", "confidence": "high|medium|low", "evidence_type": "direct|inferred"}}
     ],
     "classification_evidence": [
         {{"category": "startup|smb|system_integrator", "supports": true, "fact": "short exact fact", "why": "why this supports or contradicts the category", "source_name": "source title", "source_url": "exact supporting URL", "excerpt": "exact supporting excerpt", "confidence": "high|medium|low", "evidence_type": "direct|inferred"}}
@@ -223,10 +285,15 @@ Important rules:
 def _apply_firmographics(
     company: Company, data: dict[str, Any], source: str, allowed_source_urls: set[str] | None = None,
     searched_fields: set[str] | None = None, source_content: dict[str, str] | None = None,
+    strict_response: bool = False, grounding_supports: dict[str, list[str]] | None = None,
 ) -> None:
     """Apply supported facts and retain a field-level account of each result."""
     now = _utc_now_iso()
-    allowed_source_urls = allowed_source_urls or set()
+    allowed_source_urls = {
+        canonical
+        for url in (allowed_source_urls or set())
+        if (canonical := _normalize_grounding_url(url)) is not None
+    }
     source_content = source_content or {}
     searched_fields = set(_FIELD_CRITERIA) if searched_fields is None else searched_fields
     outcomes = {
@@ -236,11 +303,32 @@ def _apply_firmographics(
     accepted_fields: set[str] = set()
     rejection_reasons: dict[str, str] = {}
 
+    for outcome_field, company_field in (
+        ("official_website", "website"),
+        ("headquarters", "headquarters"),
+        ("company_classification", "company_type"),
+        ("employee_range", "employee_count"),
+        ("revenue", "revenue"),
+        ("funding", "funding"),
+    ):
+        prior = getattr(company, company_field)
+        if prior is not None and _normalize_grounding_url(getattr(prior, "url", None)):
+            accepted_fields.add(outcome_field)
+    for item in company.research_evidence:
+        if isinstance(item, dict) and item.get("field") in _FIELD_CRITERIA:
+            accepted_fields.add(str(item["field"]))
+    for outcome_field, value in (("industry", company.industry), ("description", company.description)):
+        if value:
+            accepted_fields.add(outcome_field)
+
     def fact_source_url(field: str) -> str | None:
         candidate = data.get(f"{field}_source_url")
         if field == "employee_count" and candidate is None:
             candidate = data.get("employee_range_source_url")
-        if not isinstance(candidate, str) or candidate not in allowed_source_urls:
+        if not isinstance(candidate, str):
+            return None
+        canonical_candidate = _normalize_grounding_url(candidate)
+        if canonical_candidate is None or canonical_candidate not in allowed_source_urls:
             return None
         try:
             parsed_url = httpx.URL(candidate)
@@ -249,9 +337,22 @@ def _apply_firmographics(
             return None
 
     def fact_source_is_valid(field: str, source_url: str) -> bool:
-        if source != "groq_tavily_search":
+        if source not in {"gemini_grounded_search", "groq_tavily_search"}:
             return True
-        return _has_source_excerpt(source_url, data.get(f"{field}_excerpt"), source_content)
+        excerpt = data.get(f"{field}_excerpt")
+        claim = data.get(field)
+        if field == "employee_count" and claim is None:
+            claim = data.get("employee_range")
+        if not _claim_matches_excerpt({field: claim}, str(excerpt or "")):
+            return False
+        if source == "gemini_grounded_search":
+            canonical = _normalize_grounding_url(source_url)
+            segments = (grounding_supports or {}).get(canonical or "", [])
+            if not any(_claim_matches_excerpt({field: claim}, segment) for segment in segments):
+                return False
+        if source == "groq_tavily_search":
+            return _has_source_excerpt(source_url, excerpt, source_content)
+        return True
 
     def save_fact(field: str, value: Any, source_field: str, outcome_field: str, *, method: str = "reported",
                   confidence: str = "high") -> bool:
@@ -260,7 +361,8 @@ def _apply_firmographics(
             return False
         if not source_url:
             candidate = data.get(f"{source_field}_source_url")
-            if isinstance(candidate, str) and candidate in allowed_source_urls:
+            candidate_canonical = _normalize_grounding_url(candidate)
+            if candidate_canonical is not None and candidate_canonical in allowed_source_urls:
                 try:
                     parsed_url = httpx.URL(candidate)
                     valid_url = parsed_url.scheme in {"http", "https"} and bool(parsed_url.host)
@@ -272,12 +374,11 @@ def _apply_firmographics(
             rejection_reasons[outcome_field] = "supporting URL missing or not present in provider results"
             return False
         if not fact_source_is_valid(source_field, source_url):
-            rejection_reasons[outcome_field] = "supporting excerpt missing or not found in cited source content"
+            rejection_reasons[outcome_field] = "supporting excerpt does not contain the claim or is not in cited source content"
             return False
         existing = getattr(company, field)
-        if existing is not None and _is_manually_approved(existing):
+        if existing is not None:
             accepted_fields.add(outcome_field)
-            rejection_reasons[outcome_field] = "existing manually verified value preserved"
             return True
         setattr(company, field, ProvenanceValue(
             value=value, source=source, url=source_url,
@@ -348,7 +449,12 @@ def _apply_firmographics(
             except Exception:
                 rejection_reasons["company_classification"] = "classification evidence URL is not a valid HTTP(S) URL"
                 continue
-            if source_url not in allowed_source_urls:
+            canonical_source_url = _normalize_grounding_url(source_url)
+            allowed_canonical = {
+                normalized for url in allowed_source_urls
+                if (normalized := _normalize_grounding_url(url)) is not None
+            }
+            if canonical_source_url is None or canonical_source_url not in allowed_canonical:
                 rejection_reasons["company_classification"] = "classification evidence URL not present in provider results"
                 continue
             excerpt = item.get("excerpt")
@@ -360,6 +466,12 @@ def _apply_firmographics(
             if not _claim_matches_excerpt({"fact": fact}, str(excerpt or "")):
                 rejection_reasons["company_classification"] = "classification claim is not represented in its supporting excerpt"
                 continue
+            if source == "gemini_grounded_search":
+                canonical = _normalize_grounding_url(source_url)
+                segments = (grounding_supports or {}).get(canonical or "", [])
+                if not any(_claim_matches_excerpt({"fact": fact}, segment) for segment in segments):
+                    rejection_reasons["company_classification"] = "grounding support does not associate the claim with its cited source"
+                    continue
             if not isinstance(item.get("supports"), bool):
                 continue
             evidence_type = str(item.get("evidence_type") or "").lower()
@@ -401,22 +513,36 @@ def _apply_firmographics(
     # --- Revenue ---
     rev = _parse_revenue(data.get("revenue") or "")
     revenue_url = fact_source_url("revenue")
-    if rev and company.revenue is None and revenue_url and fact_source_is_valid("revenue", revenue_url):
+    if rev and company.revenue is not None:
+        accepted_fields.add("revenue")
+    elif rev and revenue_url and fact_source_is_valid("revenue", revenue_url):
         company.revenue = ProvenanceValue(
             value=rev, source=source, url=fact_source_url("revenue"),
             fetched_at=now, method="estimated",
             confidence="medium" if "$" in rev else "low",
         )
+        accepted_fields.add("revenue")
+    elif rev and not revenue_url:
+        rejection_reasons["revenue"] = "supporting URL missing or not present in provider results"
+    elif rev and revenue_url and not fact_source_is_valid("revenue", revenue_url):
+        rejection_reasons["revenue"] = "supporting excerpt does not contain the claim or is not in cited source content"
 
     # --- Funding ---
     funding = data.get("funding")
     if funding and str(funding).lower() not in ("null", "none", "n/a", "unknown"):
         funding_url = fact_source_url("funding")
-        if company.funding is None and funding_url and fact_source_is_valid("funding", funding_url):
+        if company.funding is not None:
+            accepted_fields.add("funding")
+        elif funding_url and fact_source_is_valid("funding", funding_url):
             company.funding = ProvenanceValue(
                 value=str(funding), source=source, url=funding_url,
                 fetched_at=now, confidence="medium",
             )
+            accepted_fields.add("funding")
+        elif not funding_url:
+            rejection_reasons["funding"] = "supporting URL missing or not present in provider results"
+        elif not fact_source_is_valid("funding", funding_url):
+            rejection_reasons["funding"] = "supporting excerpt does not contain the claim or is not in cited source content"
 
     accepted_research: list[dict[str, Any]] = []
     research_evidence = list(data.get("research_evidence") or []) if isinstance(data.get("research_evidence"), list) else []
@@ -425,6 +551,8 @@ def _apply_firmographics(
                            data.get("employee_range_source_url") or data.get("employee_count_source_url")),
         "services": (data.get("services"), data.get("services_source_url")),
         "hiring_service_fit": (data.get("hiring_service_fit"), data.get("hiring_service_fit_source_url")),
+        "industry": (data.get("industry"), data.get("industry_source_url")),
+        "description": (data.get("description"), data.get("description_source_url")),
     }
     for field, (value, source_url) in field_sources.items():
         if value in (None, "", [], {}) or any(
@@ -463,7 +591,7 @@ def _apply_firmographics(
             continue
         field = str(item.get("field") or "").strip()
         claim = item.get("claim")
-        if field in {"employee_range", "leadership", "services", "hiring_service_fit"} and isinstance(claim, dict):
+        if field in {"employee_range", "leadership", "services", "hiring_service_fit", "industry", "description"} and isinstance(claim, dict):
             claims_by_field.setdefault(field, set()).add(json.dumps(claim, sort_keys=True, default=str))
     if isinstance(leadership, list):
         for person in leadership:
@@ -486,7 +614,7 @@ def _apply_firmographics(
             claim = item.get("claim")
             source_url = item.get("source_url")
             excerpt = str(item.get("excerpt") or "").strip()
-            if field not in {"employee_range", "leadership", "services", "hiring_service_fit"}:
+            if field not in {"employee_range", "leadership", "services", "hiring_service_fit", "industry", "description"}:
                 continue
             if field in conflicting_fields:
                 continue
@@ -503,7 +631,10 @@ def _apply_firmographics(
             except Exception:
                 rejection_reasons[field] = "source URL is not a valid HTTP(S) URL"
                 continue
-            if source_url not in allowed_source_urls:
+            if _normalize_grounding_url(source_url) not in {
+                normalized for url in allowed_source_urls
+                if (normalized := _normalize_grounding_url(url)) is not None
+            }:
                 rejection_reasons[field] = "source URL not present in provider results"
                 continue
             if not isinstance(claim, dict) or not claim or not excerpt:
@@ -517,6 +648,12 @@ def _apply_firmographics(
             if not _claim_matches_excerpt(claim, excerpt):
                 rejection_reasons[field] = "claim is not represented in its supporting excerpt"
                 continue
+            if source == "gemini_grounded_search":
+                canonical = _normalize_grounding_url(source_url)
+                segments = (grounding_supports or {}).get(canonical or "", [])
+                if not any(_claim_matches_excerpt(claim, segment) for segment in segments):
+                    rejection_reasons[field] = "grounding support does not associate the claim with its cited source"
+                    continue
             evidence_type = str(item.get("evidence_type") or "inferred").lower()
             if evidence_type not in {"direct", "inferred"}:
                 evidence_type = "inferred"
@@ -549,17 +686,26 @@ def _apply_firmographics(
     # --- Industry ---
     industry = data.get("industry")
     industry_url = fact_source_url("industry")
-    if (not company.industry and industry and str(industry).lower() not in ("null", "none", "n/a")
-            and industry_url and fact_source_is_valid("industry", industry_url)):
-        company.industry = str(industry)
+    if industry and str(industry).lower() not in ("null", "none", "n/a") and not industry_url:
+        rejection_reasons["industry"] = "supporting URL missing or not present in provider results"
+    elif industry and industry_url and not fact_source_is_valid("industry", industry_url):
+        rejection_reasons["industry"] = "supporting excerpt does not contain the claim or is not in cited source content"
+    elif industry and industry_url:
+        if not company.industry:
+            company.industry = str(industry)
+        accepted_fields.add("industry")
 
     # --- Description ---
     desc = data.get("description")
     description_url = fact_source_url("description")
-    if (desc and str(desc).lower() not in ("null", "none") and description_url
-            and fact_source_is_valid("description", description_url)):
+    if desc and str(desc).lower() not in ("null", "none") and not description_url:
+        rejection_reasons["description"] = "supporting URL missing or not present in provider results"
+    elif desc and description_url and not fact_source_is_valid("description", description_url):
+        rejection_reasons["description"] = "supporting excerpt does not contain the claim or is not in cited source content"
+    elif desc and description_url:
         if not company.description:
             company.description = str(desc)
+        accepted_fields.add("description")
 
     # Keep the legacy display field populated from the researched HQ envelope.
     if company.headquarters:
@@ -575,9 +721,35 @@ def _apply_firmographics(
         "leadership": data.get("leadership"),
         "services": data.get("services"),
         "hiring_service_fit": data.get("hiring_service_fit"),
+        "revenue": data.get("revenue"),
+        "funding": data.get("funding"),
+        "industry": data.get("industry"),
+        "description": data.get("description"),
+    }
+    response_fields = {
+        "official_website": "official_website",
+        "headquarters": "headquarters",
+        "employee_range": "employee_range",
+        "company_classification": "company_type",
+        "leadership": "leadership",
+        "services": "services",
+        "hiring_service_fit": "hiring_service_fit",
+        "revenue": "revenue",
+        "funding": "funding",
+        "industry": "industry",
+        "description": "description",
     }
     for field in _FIELD_CRITERIA:
         if field not in searched_fields:
+            continue
+        response_key = response_fields[field]
+        if strict_response and response_key not in data and not (
+            field == "employee_range" and "employee_count" in data
+        ):
+            outcomes[field] = {
+                "status": "not_returned", "criterion": _FIELD_CRITERIA[field],
+                "checked_at": now, "reason": "Gemini omitted required response field",
+            }
             continue
         present = value_fields[field] not in (None, "", [], {})
         status = "accepted_and_mapped" if field in accepted_fields else (
@@ -586,6 +758,8 @@ def _apply_firmographics(
         outcome = {"status": status, "criterion": _FIELD_CRITERIA[field], "checked_at": now}
         if field in rejection_reasons:
             outcome["reason"] = rejection_reasons[field]
+        elif status == "searched_but_not_found":
+            outcome["reason"] = "Gemini explicitly returned no reliable information for this field"
         evidence_ids = [item["evidence_key"] for item in accepted_research if item["field"] == field]
         if evidence_ids:
             outcome["evidence_keys"] = evidence_ids
@@ -596,6 +770,132 @@ def _apply_firmographics(
             f"emp={provenance_value(company.employee_count) or '?'}, "
             f"rev={provenance_value(company.revenue) or '?'}, "
           f"industry={company.industry or '?'}")
+
+
+def _normalize_grounding_url(value: Any) -> Optional[str]:
+    """Canonicalize a grounding URL without inventing or weakening provenance."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        parsed = httpx.URL(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.host:
+            return None
+        host = parsed.host.lower().removeprefix("www.")
+        port = parsed.port
+        if (parsed.scheme == "http" and port == 80) or (parsed.scheme == "https" and port == 443):
+            port = None
+        netloc = host if port is None else f"{host}:{port}"
+        path = parsed.path or ""
+        if path != "/":
+            path = path.rstrip("/")
+        else:
+            path = ""
+        canonical = f"{parsed.scheme}://{netloc}{path}"
+        if parsed.query:
+            canonical += f"?{parsed.query}"
+        return canonical
+    except Exception:
+        return None
+
+
+def _grounding_value(container: Any, *names: str) -> Any:
+    if isinstance(container, dict):
+        for name in names:
+            if name in container:
+                return container[name]
+        return None
+    for name in names:
+        value = getattr(container, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_gemini_grounding_urls(response: Any) -> dict[str, str]:
+    """Extract actual HTTP(S) grounding URIs from object or dictionary SDK shapes."""
+    actual_urls: dict[str, str] = {}
+
+    def add_uri(value: Any) -> None:
+        canonical = _normalize_grounding_url(value)
+        if canonical:
+            actual_urls.setdefault(canonical, str(value).strip())
+
+    candidates = _grounding_value(response, "candidates") or []
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+    if not isinstance(candidates, (list, tuple)):
+        candidates = []
+
+    containers: list[Any] = [response]
+    containers.extend(candidates)
+    for container in containers:
+        metadata = _grounding_value(container, "grounding_metadata", "groundingMetadata")
+        if metadata is None:
+            continue
+        chunks = _grounding_value(metadata, "grounding_chunks", "groundingChunks") or []
+        if isinstance(chunks, dict):
+            chunks = [chunks]
+        if not isinstance(chunks, (list, tuple)):
+            continue
+        for chunk in chunks:
+            web = _grounding_value(chunk, "web")
+            if web is None:
+                continue
+            add_uri(_grounding_value(web, "uri", "url"))
+    return actual_urls
+
+
+def _extract_gemini_grounding_supports(response: Any) -> dict[str, list[str]]:
+    """Map grounded source URLs to answer segments Google associates with them."""
+    supports_by_url: dict[str, list[str]] = {}
+    candidates = _grounding_value(response, "candidates") or []
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+    if not isinstance(candidates, (list, tuple)):
+        candidates = []
+    for container in [response, *candidates]:
+        metadata = _grounding_value(container, "grounding_metadata", "groundingMetadata")
+        if metadata is None:
+            continue
+        chunks = _grounding_value(metadata, "grounding_chunks", "groundingChunks") or []
+        if isinstance(chunks, dict):
+            chunks = [chunks]
+        if not isinstance(chunks, (list, tuple)):
+            continue
+        urls_by_index: dict[int, str] = {}
+        for index, chunk in enumerate(chunks):
+            web = _grounding_value(chunk, "web")
+            uri = _grounding_value(web, "uri", "url") if web is not None else None
+            canonical = _normalize_grounding_url(uri)
+            if canonical:
+                urls_by_index[index] = canonical
+        supports = _grounding_value(metadata, "grounding_supports", "groundingSupports") or []
+        if isinstance(supports, dict):
+            supports = [supports]
+        if not isinstance(supports, (list, tuple)):
+            continue
+        for support in supports:
+            segment = _grounding_value(support, "segment")
+            segment_text = _grounding_value(segment, "text")
+            if not isinstance(segment_text, str) or not segment_text.strip():
+                continue
+            chunk_indices = _grounding_value(
+                support, "grounding_chunk_indices", "groundingChunkIndices",
+            ) or []
+            if not isinstance(chunk_indices, (list, tuple)):
+                continue
+            for index in chunk_indices:
+                if isinstance(index, int) and index in urls_by_index:
+                    supports_by_url.setdefault(urls_by_index[index], []).append(segment_text.strip())
+    return supports_by_url
+
+
+def _grounding_actual_url(url: Any, grounding_urls: dict[str, str]) -> Optional[str]:
+    canonical = _normalize_grounding_url(url)
+    return grounding_urls.get(canonical) if canonical else None
 
 
 def _extract_json_object(raw_text: str) -> dict[str, Any]:
@@ -609,35 +909,53 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
     return json.loads(raw_text)
 
 
-def _gemini_fallback_required(data: dict[str, Any] | None, grounding_urls: set[str]) -> bool:
-    """Return True if the Gemini answer contains unsupported or ungrounded claims.
-
-    Evidence standards stay strict: anything that lacks a valid, grounded source URL
-    is treated as unusable and the code immediately falls back to the provider pair that
-    does source-aware extraction.
-    """
-    if not isinstance(data, dict):
-        return True
-    if not data:
+def _gemini_fallback_required(
+    data: dict[str, Any] | None,
+    grounding_urls: set[str],
+    grounding_supports: dict[str, list[str]] | None = None,
+) -> bool:
+    """Return True if any non-null Gemini claim lacks grounded, claim-bearing evidence."""
+    if not isinstance(data, dict) or not data:
         return True
 
-    for field in (
-        "official_website",
-        "headquarters",
-        "company_type",
-        "employee_count",
-        "revenue",
-        "funding",
-        "employee_range",
-        "services",
-        "hiring_service_fit",
-    ):
-        if data.get(field) in (None, "", [], {}, "null", "N/A", "n/a", "unknown"):
+    def cited_url_is_grounded(value: Any) -> bool:
+        canonical = _normalize_grounding_url(value)
+        return canonical is not None and canonical in grounding_urls
+
+    def claim_is_supported(url: Any, claim: dict[str, Any]) -> bool:
+        canonical = _normalize_grounding_url(url)
+        if canonical is None:
+            return False
+        segments = (grounding_supports or {}).get(canonical, [])
+        return any(_claim_matches_excerpt(claim, segment) for segment in segments)
+
+    scalar_claims = (
+        ("official_website", "official_website_source_url", "official_website_excerpt"),
+        ("headquarters", "headquarters_source_url", "headquarters_excerpt"),
+        ("company_type", "company_type_source_url", "company_type_excerpt"),
+        ("employee_count", "employee_count_source_url", "employee_count_excerpt"),
+        ("revenue", "revenue_source_url", "revenue_excerpt"),
+        ("funding", "funding_source_url", "funding_excerpt"),
+        ("industry", "industry_source_url", "industry_excerpt"),
+        ("description", "description_source_url", "description_excerpt"),
+        ("employee_range", "employee_range_source_url", "employee_range_excerpt"),
+        ("services", "services_source_url", "services_excerpt"),
+        ("hiring_service_fit", "hiring_service_fit_source_url", "hiring_service_fit_excerpt"),
+    )
+    for field, url_key, excerpt_key in scalar_claims:
+        claim = data.get(field)
+        source_url = data.get(url_key)
+        if field == "employee_range" and claim is None:
+            claim = data.get("employee_count")
+        if field == "employee_range" and not source_url:
+            source_url = data.get("employee_count_source_url")
+        if claim in (None, "", [], {}, "null", "N/A", "n/a", "unknown"):
             continue
-        source_url = data.get(f"{field}_source_url")
-        if not isinstance(source_url, str) or not source_url.strip():
+        if not cited_url_is_grounded(source_url):
             return True
-        if source_url not in grounding_urls:
+        if not _claim_matches_excerpt({field: claim}, str(data.get(excerpt_key) or "")):
+            return True
+        if not claim_is_supported(source_url, {field: claim}):
             return True
 
     for item in data.get("classification_evidence") or []:
@@ -645,21 +963,21 @@ def _gemini_fallback_required(data: dict[str, Any] | None, grounding_urls: set[s
             continue
         if item.get("supports") is not True and item.get("supports") is not False:
             return True
-        source_url = item.get("source_url")
-        if not isinstance(source_url, str) or not source_url.strip():
+        if not cited_url_is_grounded(item.get("source_url")) or not _claim_matches_excerpt(
+            {"fact": item.get("fact")},
+            str(item.get("excerpt") or ""),
+        ):
             return True
-        if source_url not in grounding_urls:
+        if not claim_is_supported(item.get("source_url"), {"fact": item.get("fact")}):
             return True
 
     for item in data.get("research_evidence") or []:
         if not isinstance(item, dict):
             continue
-        source_url = item.get("source_url")
-        if source_url is None:
+        if (not cited_url_is_grounded(item.get("source_url"))
+            or not _claim_matches_excerpt(item.get("claim") or {}, str(item.get("excerpt") or ""))):
             return True
-        if not isinstance(source_url, str) or not source_url.strip():
-            return True
-        if source_url not in grounding_urls:
+        if not claim_is_supported(item.get("source_url"), item.get("claim") or {}):
             return True
 
     leadership = data.get("leadership")
@@ -668,10 +986,16 @@ def _gemini_fallback_required(data: dict[str, Any] | None, grounding_urls: set[s
             if not isinstance(person, dict):
                 continue
             if person.get("name") or person.get("title"):
-                source_url = person.get("source_url")
-                if not isinstance(source_url, str) or not source_url.strip():
+                if (not cited_url_is_grounded(person.get("source_url"))
+                        or not _claim_matches_excerpt(
+                            {key: person.get(key) for key in ("name", "title") if person.get(key)},
+                            str(person.get("excerpt") or ""),
+                        )):
                     return True
-                if source_url not in grounding_urls:
+                if not claim_is_supported(
+                    person.get("source_url"),
+                    {key: person.get(key) for key in ("name", "title") if person.get(key)},
+                ):
                     return True
     return False
 
@@ -688,19 +1012,18 @@ _TAVILY_RATE_LIMIT_DEFAULT_WAIT = 5.0
 async def _enrich_via_groq_tavily(
     company: Company, tavily_plan_limited: Optional[asyncio.Event] = None,
 ) -> Optional[str]:
-    """Fallback firmographic enrichment via Tavily search + Groq parsing.
+    """DISABLED legacy Tavily/Groq fallback; retained but cannot execute."""
+    # Tavily/Groq fallback intentionally disabled. Gemini failures are handled
+    # by the queue and returned to durable job state for retry/manual resume.
+    now = _utc_now_iso()
+    for field, criterion in _FIELD_CRITERIA.items():
+        outcome = company.research_outcomes.setdefault(field, {
+            "status": "not_searched", "criterion": criterion, "checked_at": now,
+        })
+        outcome["reason"] = "Tavily/Groq fallback is disabled; Gemini processing is required"
+    return "fallback_disabled"
 
-    Used when the Gemini key pool is missing or every key's daily quota is
-    exhausted. Mirrors GroqTavilyProvider's discovery fallback: Tavily does
-    the web search, Groq (no built-in search) turns the snippets into the
-    same structured JSON shape enrich_company_firmographics expects.
-
-    Both calls retry on a 429 (rate limit, not quota exhaustion) with the
-    same backoff GroqTavilyProvider uses for discovery -- without this, this
-    fallback had zero resilience of its own, so a concurrent-run rate limit
-    on either provider surfaced immediately as "enrichment request failed"
-    even though the correct response was just to wait and retry.
-    """
+    # --- legacy implementation retained below for reference ---
     if tavily_plan_limited is not None and tavily_plan_limited.is_set():
         now = _utc_now_iso()
         for field, criterion in _FIELD_CRITERIA.items():
@@ -740,7 +1063,16 @@ async def _enrich_via_groq_tavily(
                             "include_raw_content": "markdown",
                         }, timeout=20.0)
                         if r.status_code == 432:
-                            u.mark_failure(status_code=432, error_kind="quota_exhausted")
+                            u.mark_failure(
+                                status_code=432,
+                                error_kind="quota_exhausted",
+                                error_details={
+                                    "type": "TavilyPlanLimit",
+                                    "message": "Tavily returned HTTP 432",
+                                    "response": r.text[:4000],
+                                    "quota_type": "provider_plan_limit",
+                                },
+                            )
                             if tavily_plan_limited is not None:
                                 tavily_plan_limited.set()
                         if r.status_code in {429, 500, 502, 503, 504} and attempt < _TAVILY_RATE_LIMIT_RETRIES:
@@ -898,31 +1230,22 @@ async def _enrich_via_groq_tavily(
 
 
 async def enrich_company_firmographics(
-    company: Company, tavily_plan_limited: Optional[asyncio.Event] = None,
+    company: Company,
+    run_id: Optional[str] = None,
 ) -> Optional[str]:
     """Enrich a company with real firmographic data via Gemini API.
 
-    Falls back to Tavily+Groq (see _enrich_via_groq_tavily) if no Gemini key
-    is configured or every key's daily quota is exhausted, so a Gemini
-    outage doesn't leave every company unenriched. Only if that fallback is
-    also unavailable/fails does this mark the company unresearched -- a
-    failed enrichment must not fail the whole discovery run. Returns a short
-    failure-reason string (e.g. "no_api_key", "quota_exhausted",
-    "parse_error") the caller can tally, so a systemic problem shows up as a
-    clear run-level warning instead of N silent per-company skips buried in
-    server logs. Returns None on success.
+    Gemini is the sole external AI/research provider. Its adaptive queue and
+    retry/backoff handling classify failures by RPM, TPM, daily quota, monthly
+    quota, or temporary capacity. Quota-blocked jobs remain persistent and can
+    be resumed manually. Tavily/Groq fallback code is retained but disabled.
+    Returns a short failure-reason string or None on success.
     """
     _mark_research_not_searched(company, "provider call has not returned usable research results")
     pool = GeminiKeyPool.from_env()
 
-    async def fallback() -> Optional[str]:
-        if tavily_plan_limited is None:
-            return await _enrich_via_groq_tavily(company)
-        return await _enrich_via_groq_tavily(company, tavily_plan_limited)
-
     if not pool:
-        print(f"  [WARN] No GEMINI_API_KEY set, trying Tavily+Groq fallback for {company.domain}")
-        return await fallback()
+        return "no_api_key"
 
     prompt = _PROMPT_TEMPLATE.format(
         domain=company.domain,
@@ -933,19 +1256,20 @@ async def enrich_company_firmographics(
         from .gemini_keys import make_gemini_client
 
         def _call_with_connection_retry(key: str):
-            with track("gemini", "enrich_firmographics", domain=company.domain) as u:
+            with track("gemini", "enrich_firmographics", run_id=run_id, domain=company.domain) as u:
                 connection_retries = 0
-                rate_limit_retries = 0
                 while True:
                     try:
                         client = make_gemini_client(key)
-                        response = client.models.generate_content(
-                            model=_GEMINI_MODEL,
-                            contents=prompt,
-                            config={
-                                "temperature": 0.1,
-                                "tools": [{"google_search": {}}],
-                            },
+                        response = generate_content(
+                            lambda: client.models.generate_content(
+                                model=_GEMINI_MODEL,
+                                contents=prompt,
+                                config={"temperature": 0.1, "tools": [{"google_search": {}}]},
+                            ),
+                            call_kind="enrich_firmographics",
+                            run_id=run_id,
+                            domain=company.domain,
                         )
                         meta = getattr(response, "usage_metadata", None)
                         if meta is not None:
@@ -963,14 +1287,6 @@ async def enrich_company_firmographics(
                             connection_retries += 1
                             _time.sleep(_CONNECTION_ERROR_RETRY_DELAY)
                             continue
-                        if (_is_gemini_transient_rate_limit(exc)
-                                and rate_limit_retries < _GEMINI_RATE_LIMIT_RETRIES):
-                            u.retry_count += 1
-                            rate_limit_retries += 1
-                            print(f"  [WARN] transient Gemini rate limit for {company.domain}, "
-                                  "waiting briefly before one retry")
-                            _time.sleep(_GEMINI_RATE_LIMIT_RETRY_DELAY)
-                            continue
                         raise
 
         response = None
@@ -981,6 +1297,8 @@ async def enrich_company_firmographics(
                 break
             except Exception as exc:
                 last_exc = exc
+                if isinstance(exc, (GeminiQuotaBlocked, GeminiRetryLater)):
+                    raise
                 if pool.should_advance(exc):
                     pool.mark_exhausted(attempt.key)
                     continue
@@ -989,54 +1307,69 @@ async def enrich_company_firmographics(
                 # tool, transient 5xx, safety-filter block, ...) is not
                 # specific to this one key -- trying the next configured key
                 # would just repeat the same failure, so stop the key loop
-                # here and fall through to the Tavily+Groq fallback below
-                # exactly the same way quota-exhaustion does, rather than
-                # giving up on this company outright.
+                # and return a resumable provider failure.
                 break
         if response is None:
-            if last_exc and pool.should_advance(last_exc):
-                reason = "all Gemini keys exhausted"
-            elif last_exc and is_connection_error(last_exc):
-                reason = "Gemini unreachable (connection/TLS error, not a quota or request issue)"
-            else:
-                reason = "Gemini request failed"
-            print(f"  [WARN] {reason} for {company.domain}, trying Tavily+Groq fallback: {last_exc}")
-            return await fallback()
+            from ..usage_tracker import classify_error
+            classified = classify_error(last_exc) if last_exc is not None else "other"
+            reason = {
+                "quota_exhausted": "all Gemini keys exhausted",
+                "connection_error": "Gemini unreachable (connection/TLS error, not a quota or request issue)",
+                "timeout": "Gemini request timed out",
+                "rate_limited": "Gemini rate limit retries exhausted",
+            }.get(classified, "Gemini request failed")
+            print(f"  [WARN] {reason} for {company.domain}: {last_exc}")
+            return classified if classified in {
+                "quota_exhausted", "connection_error", "timeout", "rate_limited",
+            } else "request_error"
 
         raw_text = (getattr(response, "text", "") or "").strip()
         if not raw_text:
-            print(f"  [WARN] Empty Gemini response for {company.domain}, trying Tavily+Groq fallback")
-            return await fallback()
+            return "empty_response"
 
         data = _extract_json_object(raw_text)
-        grounding_urls: set[str] = set()
-        candidates = getattr(response, "candidates", None) or []
-        for candidate in candidates:
-            metadata = getattr(candidate, "grounding_metadata", None)
-            for chunk in getattr(metadata, "grounding_chunks", None) or []:
-                web = getattr(chunk, "web", None)
-                uri = getattr(web, "uri", None)
-                if uri:
-                    grounding_urls.add(uri)
+        grounding_started = _time.monotonic()
+        grounding_map = _extract_gemini_grounding_urls(response)
+        grounding_urls = set(grounding_map)
+        grounding_supports = _extract_gemini_grounding_supports(response)
+        log_event(
+            "gemini_response_processing",
+            domain=company.domain,
+            run_id=run_id,
+            grounding_url_count=len(grounding_urls),
+            processing_ms=int((_time.monotonic() - grounding_started) * 1000),
+        )
 
-        if _gemini_fallback_required(data, grounding_urls):
-            print(f"  [WARN] Gemini response for {company.domain} lacked valid grounding URLs, trying Tavily+Groq fallback")
+        grounding_invalid = _gemini_fallback_required(data, grounding_urls, grounding_supports)
+        if grounding_invalid:
+            print(f"  [WARN] Gemini response for {company.domain} had an ungrounded claim")
             log_event(
                 "gemini_grounding_rejected",
                 domain=company.domain,
                 grounding_url_count=len(grounding_urls),
                 reason="missing_or_unverified_grounding",
             )
-            return await fallback()
-
         _apply_firmographics(
             company, data, source="gemini_grounded_search", allowed_source_urls=grounding_urls,
+            strict_response=True, grounding_supports=grounding_supports,
         )
+        missing_response_fields = sorted(_REQUIRED_RESPONSE_KEYS - data.keys())
+        company.research_outcomes["_missing_response_fields"] = missing_response_fields
+        completeness = enrichment_completeness(company)
+        company.research_outcomes["_summary"] = completeness
+        if grounding_invalid:
+            return "ungrounded_response"
+        if completeness["status"] == "partial":
+            return "incomplete_result"
+        if completeness["status"] == "complete_with_gaps":
+            return "complete_with_gaps"
         return None
 
     except json.JSONDecodeError as e:
-        print(f"  [WARN] Could not parse Gemini response for {company.domain}: {e}; trying Tavily+Groq fallback")
-        return await fallback()
+        print(f"  [WARN] Could not parse Gemini response for {company.domain}: {e}")
+        return "parse_error"
+    except (GeminiQuotaBlocked, GeminiRetryLater):
+        raise
     except Exception as e:
         # Reachable only for a failure outside the key-attempt loop itself
         # (e.g. _extract_json_object/_apply_firmographics raising on a
