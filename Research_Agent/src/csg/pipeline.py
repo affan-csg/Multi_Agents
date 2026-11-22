@@ -64,6 +64,8 @@ class Stats:
     no_reqs: int = 0
     reqs_fetched: int = 0
     disqualified: int = 0
+    failed: int = 0
+    company_outcomes: list[dict[str, object]] = field(default_factory=list)
     scored: int = 0
     tiers: dict[str, int] = field(default_factory=lambda: {"A": 0, "B": 0, "C": 0, "D": 0})
     dq_reasons: dict[str, int] = field(default_factory=dict)
@@ -133,6 +135,14 @@ async def _process_one(
         db.upsert_postings(conn, postings)
         stats.reqs_fetched += len(postings)
     scoring_postings = [p for p in postings if db.is_validated_current_posting(p)]
+    job_data_reason = None
+    if not scoring_postings:
+        if job_result.hiring_signal == "unknown":
+            job_data_reason = "no_confirmed_job_signal"
+        elif not postings:
+            job_data_reason = "no_open_postings"
+        else:
+            job_data_reason = "no_validated_current_postings"
 
     if job_result.hiring_signal == "unknown":
         company.status = "no_ats" if not ats_result else "no_reqs"
@@ -168,11 +178,31 @@ async def _process_one(
         stats.disqualified += 1
         key = (result.dq_reason or "").split("(")[0].strip()
         stats.dq_reasons[key] = stats.dq_reasons.get(key, 0) + 1
+        stats.company_outcomes.append({
+            "domain": company.domain,
+            "outcome": "disqualified",
+            "reason": result.dq_reason or "icp_disqualification",
+            "job_data_available": bool(scoring_postings),
+            "job_data_reason": job_data_reason,
+            "job_discovery_method": job_result.method,
+            "hiring_signal": job_result.hiring_signal,
+            "posting_count": len(scoring_postings),
+        })
     else:
         company.status = "scored"
         db.upsert_company(conn, company)
         stats.scored += 1
         stats.tiers[result.tier] += 1
+        stats.company_outcomes.append({
+            "domain": company.domain,
+            "outcome": "scored",
+            "reason": "score_created",
+            "job_data_available": bool(scoring_postings),
+            "job_data_reason": job_data_reason,
+            "job_discovery_method": job_result.method,
+            "hiring_signal": job_result.hiring_signal,
+            "posting_count": len(scoring_postings),
+        })
 
     # Contact discovery deliberately does NOT run here. Hunter's free tier is a
     # hard 25 domain searches per MONTH, and this function runs concurrently
@@ -220,11 +250,21 @@ async def run(
         if ensure_owned:
             ensure_owned()
         if c.domain in already_scored:
+            stats.company_outcomes.append({
+                "domain": c.domain,
+                "outcome": "skipped",
+                "reason": "already_scored_in_this_run",
+            })
             continue
         if c.domain in suppressed:
             c.status = "suppressed"
             db.upsert_company(conn, c)
             stats.suppressed += 1
+            stats.company_outcomes.append({
+                "domain": c.domain,
+                "outcome": "skipped",
+                "reason": "suppressed",
+            })
             continue
         db.upsert_company(conn, c)
         work.append(c)
@@ -254,7 +294,15 @@ async def run(
                 except Exception as exc:  # keep one bad domain from killing the run
                     if ensure_owned:
                         ensure_owned()
-                    db.set_status(conn, c.domain, "error", f"{type(exc).__name__}: {exc}")
+                    error_detail = f"{type(exc).__name__}: {exc}"
+                    db.set_status(conn, c.domain, "error", error_detail)
+                    stats.failed += 1
+                    stats.company_outcomes.append({
+                        "domain": c.domain,
+                        "outcome": "failed",
+                        "reason": "pipeline_error",
+                        "error": error_detail[:1000],
+                    })
                     conn.commit()
                 done += 1
                 if on_progress:

@@ -155,7 +155,13 @@ def enrichment_completeness(company: Company) -> dict[str, Any]:
     """Summarize terminal field outcomes without treating unavailable facts as successes."""
     missing: dict[str, str] = {}
     blocking: dict[str, str] = {}
-    response_missing = company.research_outcomes.get("_missing_response_fields") or []
+    response_missing_data = company.research_outcomes.get("_missing_response_fields") or {}
+    if isinstance(response_missing_data, dict):
+        response_missing = response_missing_data.get("missing") or []
+    elif isinstance(response_missing_data, list):
+        response_missing = response_missing_data
+    else:
+        response_missing = []
     if response_missing:
         reason = "Gemini omitted required response keys: " + ", ".join(response_missing)
         blocking["response_schema"] = reason
@@ -204,6 +210,35 @@ def _parse_number(text: str) -> Optional[int]:
         return int(float(text))
     except ValueError:
         return None
+
+
+def _employee_range_bounds(value: Any) -> tuple[float, float] | None:
+    if isinstance(value, dict):
+        bounds = [_employee_range_bounds(item) for item in value.values()]
+        numeric_bounds = [item for item in bounds if item is not None]
+        if numeric_bounds:
+            return min(item[0] for item in numeric_bounds), max(item[1] for item in numeric_bounds)
+        return None
+    if isinstance(value, (list, tuple)):
+        bounds = [_employee_range_bounds(item) for item in value]
+        numeric_bounds = [item for item in bounds if item is not None]
+        if numeric_bounds:
+            return min(item[0] for item in numeric_bounds), max(item[1] for item in numeric_bounds)
+        return None
+    if not isinstance(value, (int, float, str)) or isinstance(value, bool):
+        return None
+    text = str(value).lower().replace(",", "")
+    matches = re.findall(r"\d+(?:\.\d+)?\s*k?", text)
+    numbers = [float(_parse_number(item.strip())) for item in matches if _parse_number(item.strip()) is not None]
+    if not numbers:
+        return None
+    has_range_marker = re.search(r"\d[^\s]*(?:-|\bto\b)\s*\d", text) is not None
+    if len(numbers) > 1 and has_range_marker:
+        return min(numbers), max(numbers)
+    number = numbers[0]
+    if "+" in text:
+        return number, float("inf")
+    return number, number
 
 
 def _parse_revenue(text: str) -> Optional[str]:
@@ -296,6 +331,7 @@ def _apply_firmographics(
     }
     source_content = source_content or {}
     searched_fields = set(_FIELD_CRITERIA) if searched_fields is None else searched_fields
+    initial_employee_count = company.employee_count
     outcomes = {
         field: {"status": "not_searched", "criterion": criterion, "checked_at": now}
         for field, criterion in _FIELD_CRITERIA.items()
@@ -600,7 +636,27 @@ def _apply_firmographics(
             claim = {key: person[key] for key in ("name", "title") if person.get(key)}
             if claim:
                 claims_by_field.setdefault("leadership", set()).add(json.dumps(claim, sort_keys=True, default=str))
-    conflicting_fields = {field for field, claims in claims_by_field.items() if len(claims) > 1}
+    conflicting_fields: set[str] = set()
+    multi_value_fields = {"leadership", "services"}
+    for field, claims in claims_by_field.items():
+        if len(claims) < 2 or field in multi_value_fields:
+            continue
+        if field == "employee_range":
+            bounds = [
+                _employee_range_bounds(json.loads(claim))
+                for claim in claims
+            ]
+            comparable = [item for item in bounds if item is not None]
+            if any(
+                left[1] < right[0] or right[1] < left[0]
+                for index, left in enumerate(comparable)
+                for right in comparable[index + 1:]
+            ):
+                conflicting_fields.add(field)
+            continue
+        conflicting_fields.add(field)
+    if "employee_range" in conflicting_fields:
+        company.employee_count = initial_employee_count
     for field in conflicting_fields:
         rejection_reasons[field] = "conflicting claims supplied for the same field"
 
@@ -891,6 +947,36 @@ def _extract_gemini_grounding_supports(response: Any) -> dict[str, list[str]]:
                 if isinstance(index, int) and index in urls_by_index:
                     supports_by_url.setdefault(urls_by_index[index], []).append(segment_text.strip())
     return supports_by_url
+
+
+def _gemini_grounding_shape(response: Any) -> dict[str, Any]:
+    """Return non-sensitive response-shape counts to diagnose SDK/provider changes."""
+    candidates = _grounding_value(response, "candidates") or []
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+    if not isinstance(candidates, (list, tuple)):
+        candidates = []
+    containers = [response, *candidates]
+    metadata_values = [
+        _grounding_value(container, "grounding_metadata", "groundingMetadata")
+        for container in containers
+    ]
+    metadata_values = [metadata for metadata in metadata_values if metadata is not None]
+    chunk_count = 0
+    support_count = 0
+    for metadata in metadata_values:
+        chunks = _grounding_value(metadata, "grounding_chunks", "groundingChunks") or []
+        supports = _grounding_value(metadata, "grounding_supports", "groundingSupports") or []
+        chunk_count += len(chunks) if isinstance(chunks, (list, tuple, dict)) else 0
+        support_count += len(supports) if isinstance(supports, (list, tuple, dict)) else 0
+    return {
+        "response_type": type(response).__name__,
+        "candidate_count": len(candidates),
+        "grounding_metadata_count": len(metadata_values),
+        "grounding_metadata_types": sorted({type(value).__name__ for value in metadata_values}),
+        "grounding_chunk_count": chunk_count,
+        "grounding_support_count": support_count,
+    }
 
 
 def _grounding_actual_url(url: Any, grounding_urls: dict[str, str]) -> Optional[str]:
@@ -1332,11 +1418,13 @@ async def enrich_company_firmographics(
         grounding_map = _extract_gemini_grounding_urls(response)
         grounding_urls = set(grounding_map)
         grounding_supports = _extract_gemini_grounding_supports(response)
+        grounding_shape = _gemini_grounding_shape(response)
         log_event(
             "gemini_response_processing",
             domain=company.domain,
             run_id=run_id,
             grounding_url_count=len(grounding_urls),
+            **grounding_shape,
             processing_ms=int((_time.monotonic() - grounding_started) * 1000),
         )
 
@@ -1347,6 +1435,7 @@ async def enrich_company_firmographics(
                 "gemini_grounding_rejected",
                 domain=company.domain,
                 grounding_url_count=len(grounding_urls),
+                **grounding_shape,
                 reason="missing_or_unverified_grounding",
             )
         _apply_firmographics(
@@ -1354,7 +1443,9 @@ async def enrich_company_firmographics(
             strict_response=True, grounding_supports=grounding_supports,
         )
         missing_response_fields = sorted(_REQUIRED_RESPONSE_KEYS - data.keys())
-        company.research_outcomes["_missing_response_fields"] = missing_response_fields
+        company.research_outcomes["_missing_response_fields"] = {
+            "missing": missing_response_fields,
+        }
         completeness = enrichment_completeness(company)
         company.research_outcomes["_summary"] = completeness
         if grounding_invalid:

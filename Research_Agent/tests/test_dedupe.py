@@ -21,7 +21,7 @@ from csg.dedupe import ExistingCompanies, find_duplicate_groups, normalize_domai
 from csg.discovery import research
 from csg.discovery.base import CompanyCandidate
 from csg.discovery.resolver import deduplicate_and_resolve
-from csg.models import Company
+from csg.models import Company, ProvenanceValue
 
 KEYS = {
     "companies": ("domain",),
@@ -303,6 +303,58 @@ def test_mixed_enrichment_attempts_each_company_and_keeps_distinct_outcomes(monk
     assert pairs[1][1].research_outcomes["_summary"]["failure_reason"] == "incomplete_result"
 
 
+def test_partial_firmographics_are_checkpointed_and_available_on_retry(monkeypatch):
+    candidate = CompanyCandidate(
+        domain="partial.example", name="Partial", source="fake", discovered_at=datetime.now(),
+    )
+    checkpoints = {}
+    calls = []
+
+    async def enrich(company):
+        calls.append(company.domain)
+        if len(calls) == 1:
+            company.employee_count = ProvenanceValue(
+                value=500, source="gemini_grounded_search",
+                url="https://partial.example/about", method="estimated", confidence="medium",
+            )
+            company.research_evidence.append({
+                "evidence_key": "valid-evidence", "field": "employee_range",
+                "source_url": "https://partial.example/about",
+            })
+            company.research_outcomes["employee_range"] = {
+                "status": "accepted_and_mapped", "criterion": "automatic_company_size",
+            }
+        else:
+            assert company.employee_count is not None
+            assert company.employee_count.value == 500
+            assert company.research_evidence[0]["evidence_key"] == "valid-evidence"
+        return "ungrounded_response"
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
+
+    def save(key, status, payload):
+        checkpoints[key] = {"status": status, "payload": payload}
+        return True
+
+    first = asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", None,
+        checkpoint_save=save, run_id="partial-resume",
+    ))
+    assert first[2] == {"ungrounded_response": 1}
+    checkpoint_company = checkpoints["enrich:partial.example"]["payload"]["company"]
+    assert checkpoint_company["employee_count"]["value"] == 500
+    assert checkpoint_company["research_evidence"][0]["evidence_key"] == "valid-evidence"
+
+    second = asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", None,
+        checkpoint_load=lambda key: checkpoints.get(key),
+        checkpoint_save=save, run_id="partial-resume",
+    ))
+    assert calls == ["partial.example", "partial.example"]
+    assert second[0][0][1].employee_count.value == 500
+    assert second[0][0][1].research_evidence[0]["evidence_key"] == "valid-evidence"
+
+
 def test_resume_selection_uses_latest_failed_checkpoint_independent_of_ats():
     from csg import db
 
@@ -514,6 +566,12 @@ def test_same_company_in_two_runs_is_not_duplicated(env):
     assert env.companies[0]["region"] == "GA" and env.companies[0]["status"] == "scored"  # not reset
     assert b.duplicates_existing == 1
     assert b.existing_matches == [{"domain": "acme.com", "matched_by": "domain"}]
+    assert b.as_dict()["company_outcomes"] == [{
+        "domain": "acme.com",
+        "outcome": "duplicate",
+        "reason": "qualified_in_prior_run",
+        "matched_by": "domain",
+    }]
     assert [s["run_id"] for s in env.conn.tables["scores"]] == ["disc-A"]
     assert env.enriched.count("acme.com") == 1
 

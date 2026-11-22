@@ -25,6 +25,19 @@ export interface EnrichmentCompanySummary {
   failure_reason?: string;
 }
 
+export interface CompanyRunOutcome {
+  domain: string;
+  outcome: "duplicate" | "scored" | "disqualified" | "skipped" | "failed";
+  reason: string;
+  matched_by?: "domain" | "name";
+  error?: string;
+  job_data_available?: boolean;
+  job_data_reason?: string | null;
+  job_discovery_method?: "ats" | "careers_page" | "web_search" | "unknown" | null;
+  hiring_signal?: "confirmed" | "unknown" | null;
+  posting_count?: number;
+}
+
 export interface RunResult {
   run_id: string;
   companies: number;
@@ -63,6 +76,10 @@ export interface RunResult {
   auto_qualify_skipped_tier?: number;
   qualification_failure_count?: number;
   qualification_failure_reasons?: Record<string, number>;
+  duplicates_existing?: number;
+  existing_matches?: Array<{ domain: string; matched_by: "domain" | "name" }>;
+  company_outcomes?: CompanyRunOutcome[];
+  scoring_failures?: number;
 }
 
 export interface Region {

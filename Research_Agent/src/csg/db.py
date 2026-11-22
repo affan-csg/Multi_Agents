@@ -339,7 +339,10 @@ def _row_to_company(row: dict[str, Any]) -> Company:
         classification_evidence=(row.get("classification_evidence")
                      or _PENDING_CLASSIFICATION_EVIDENCE.get(row["domain"], [])),
         research_evidence=row.get("research_evidence") or [],
-        research_outcomes=row.get("research_outcomes") or {},
+        research_outcomes=(
+            row.get("research_outcomes")
+            if row.get("research_outcomes") is not None else {}
+        ),
         description=row.get("description"), region=row.get("region"),
         industry=row.get("industry"), hq_state=row.get("hq_state"),
         ats_provider=row.get("ats_provider"), ats_token=row.get("ats_token"),

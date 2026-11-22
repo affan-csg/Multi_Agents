@@ -215,6 +215,36 @@ def test_company_claim_and_upsert_use_non_null_evidence_defaults(conn):
     assert updated["research_outcomes"] == {}
 
 
+@pytest.mark.parametrize(
+    ("stored_value", "expected"),
+    [
+        ({}, {}),
+        ({"_missing_response_fields": {"missing": ["leadership"]}},
+         {"_missing_response_fields": {"missing": ["leadership"]}}),
+        (None, {}),
+        ({"_missing_response_fields": ["leadership", "services"]},
+         {"_missing_response_fields": {"missing": ["leadership", "services"]}}),
+        ({"_missing_response_fields": None},
+         {"_missing_response_fields": {"legacy_value": None}}),
+        ([], {"_legacy_research_outcomes": {"value": []}}),
+    ],
+)
+def test_research_outcomes_shapes_round_trip_without_losing_legacy_values(conn, stored_value, expected):
+    conn.tables["companies"] = [{
+        "domain": "acme.com",
+        "first_seen": "2026-11-22T00:00:00Z",
+        "research_outcomes": stored_value,
+    }]
+    company = db.get_company(conn, "acme.com")
+    assert company is not None
+
+    serialized = company.model_dump(mode="json")
+    assert serialized["research_outcomes"] == expected
+    db.upsert_company(conn, company)
+    assert conn.tables["companies"][0]["research_outcomes"] == expected
+    assert db.get_company(conn, "acme.com").research_outcomes == expected
+
+
 def test_posting_classification_survives_the_round_trip(conn):
     """The bug: pipeline set these, saved, re-read -- and got None back, so the
     CSG Delivery Fit dimension scored zero for every company."""

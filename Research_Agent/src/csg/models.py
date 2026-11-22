@@ -112,6 +112,24 @@ class Company(BaseModel):
     hiring_signal: Optional[HiringSignal] = None
     job_discovery_notes: Optional[str] = None  # failure reason when hiring_signal == "unknown"
 
+    @field_validator("research_outcomes", mode="before")
+    @classmethod
+    def _normalize_research_outcomes(cls, value: Any) -> Any:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            return {"_legacy_research_outcomes": {"value": value}}
+        outcomes = dict(value)
+        missing_fields = outcomes.get("_missing_response_fields")
+        if isinstance(missing_fields, list):
+            outcomes["_missing_response_fields"] = {"missing": missing_fields}
+        elif missing_fields is None:
+            if "_missing_response_fields" in outcomes:
+                outcomes["_missing_response_fields"] = {"legacy_value": None}
+        elif not isinstance(missing_fields, dict):
+            outcomes["_missing_response_fields"] = {"legacy_value": missing_fields}
+        return outcomes
+
     @field_validator("website", "headquarters", "company_type", "employee_count", "revenue", "funding", mode="before")
     @classmethod
     def _wrap_provenance(cls, v: Any) -> Any:

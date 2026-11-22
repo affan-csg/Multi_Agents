@@ -46,7 +46,14 @@ CREATE TABLE IF NOT EXISTS companies (
     funding         JSONB,         -- provenance envelope (see above)
     classification_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
     research_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
-    research_outcomes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    research_outcomes JSONB NOT NULL DEFAULT '{}'::jsonb
+        CHECK (
+            jsonb_typeof(research_outcomes) = 'object'
+            AND (
+                NOT (research_outcomes ? '_missing_response_fields')
+                OR jsonb_typeof(research_outcomes->'_missing_response_fields') = 'object'
+            )
+        ),
     description     TEXT,
     region          TEXT,          -- discovery region, e.g. 'GA', 'East Coast'
     industry        TEXT,

@@ -38,6 +38,7 @@ import { Analytics as OutreachAnalytics } from "./pages/outreach/Analytics";
 import { Learning as OutreachLearning } from "./pages/outreach/Learning";
 import { useRoute } from "./router";
 import { getStoredActiveResearchJobId, JobMonitor } from "./jobMonitor";
+import { formatCompanyOutcome } from "./discoverOutcome";
 import "./App.css";
 
 type PendingAction = { kind: "qualify" | "contacts"; domains?: string[] };
@@ -224,13 +225,19 @@ function App() {
       }
     }
 
-    // A run can succeed end-to-end and still score nothing new -- most
-    // commonly because these companies were already scored in a previous run
-    // (discovery re-surfaced the same candidates) or none had ATS/job data
-    // worth a high score. Call that out instead of it reading as silent
-    // failure when the Companies tab for this run turns up empty.
-    if (r.scored === 0 && (r.discovered ?? 0) > 0) {
-      problems.push("No companies were newly scored in this run -- they may already be scored from an earlier run, or none had usable job data.");
+    const companyOutcomes = Array.isArray(r.company_outcomes) ? r.company_outcomes : [];
+    if (companyOutcomes.length > 0) {
+      for (const outcome of companyOutcomes.slice(0, 5)) {
+        const formatted = formatCompanyOutcome(outcome);
+        (formatted.tone === "error" ? problems : parts).push(formatted.message);
+      }
+      if (companyOutcomes.length > 5) {
+        parts.push(`${companyOutcomes.length - 5} more company outcomes in run details`);
+      }
+    } else if (r.existing_matches?.length) {
+      parts.push(`${r.existing_matches.length} existing compan${r.existing_matches.length === 1 ? "y" : "ies"} matched and not reprocessed`);
+    } else if (r.scored === 0 && (r.discovered ?? 0) > 0) {
+      problems.push("No per-company processing outcomes were returned; inspect the run records for the precise reason.");
     }
 
     // Fill Pain / Hiring Need / Buying Signals / CSG Delivery Fit are entirely

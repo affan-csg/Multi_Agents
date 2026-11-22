@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from csg import discover
+from csg import discover, gemini_queue
 from csg.discovery import research
 from csg.models import Company
 from csg import usage_tracker
@@ -36,6 +36,15 @@ def _company(domain: str = "acme.com") -> Company:
 @pytest.fixture(autouse=True)
 def capture_provider_usage(monkeypatch):
     rows = []
+    monkeypatch.setattr(gemini_queue, "_reserve", lambda: {
+        "wait_seconds": 0, "current_rpm": 1, "queue_depth": 0, "blocked_reason": None,
+    })
+    monkeypatch.setattr(gemini_queue, "_record", lambda *_args, **_kwargs: {
+        "current_rpm": 1, "queue_depth": 0,
+    })
+    monkeypatch.setattr(gemini_queue.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gemini_queue, "log_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(research, "log_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         usage_tracker,
         "_record_async",
@@ -325,10 +334,14 @@ def test_full_grounded_response_is_complete(gemini_keys, monkeypatch):
 
     assert reason is None
     assert company.research_outcomes["_summary"]["status"] == "complete"
+    assert company.research_outcomes["_missing_response_fields"] == {"missing": []}
     assert company.employee_count.value == 500
     assert company.revenue.value == "$50M"
     assert company.funding.value == "$10M Series A"
     assert company.website.url == "https://acme.com/about"
+    assert company.employee_count.url == "https://acme.com/about"
+    assert company.headquarters.url == "https://acme.com/about"
+    assert company.revenue.url == "https://acme.com/about"
 
 
 def test_omitted_required_key_is_partial_and_keeps_valid_facts(gemini_keys, monkeypatch):
@@ -352,6 +365,9 @@ def test_omitted_required_key_is_partial_and_keeps_valid_facts(gemini_keys, monk
     assert reason == "incomplete_result"
     assert company.employee_count.value == 500
     assert company.research_outcomes["_summary"]["status"] == "partial"
+    assert company.research_outcomes["_missing_response_fields"] == {
+        "missing": ["leadership"],
+    }
     assert "response_schema" in company.research_outcomes["_summary"]["blocking_fields"]
 
 
@@ -508,7 +524,7 @@ def test_fallback_evidence_normalizes_unicode_and_whitespace_but_requires_verbat
     assert "excerpt not found" in unsupported.research_outcomes["services"]["reason"]
 
 
-def test_conflicting_fallback_claims_are_rejected_as_a_group():
+def test_multiple_grounded_fallback_service_claims_are_retained():
     company = _company()
     source_url = "https://acme.com/services"
     research._apply_firmographics(
@@ -523,9 +539,8 @@ def test_conflicting_fallback_claims_are_rejected_as_a_group():
         source_content={source_url: "We provide service A. We provide service B."},
         searched_fields={"services"},
     )
-    assert company.research_evidence == []
-    assert company.research_outcomes["services"]["status"] == "found_but_rejected"
-    assert company.research_outcomes["services"]["reason"] == "conflicting claims supplied for the same field"
+    assert len(company.research_evidence) == 2
+    assert company.research_outcomes["services"]["status"] == "accepted_and_mapped"
 
 
 def test_fallback_failure_preserves_existing_values_evidence_and_reports_fields(gemini_keys, monkeypatch):
@@ -720,6 +735,148 @@ def test_grounding_metadata_accepts_object_and_dictionary_shapes():
     assert research._extract_gemini_grounding_supports(dict_response) == {
         "https://acme.com/about": ["Acme has 500 employees."],
     }
+
+
+def test_grounding_metadata_accepts_installed_google_genai_response_models():
+    from google.genai import types
+
+    metadata = types.GroundingMetadata(
+        grounding_chunks=[types.GroundingChunk(
+            web=types.GroundingChunkWeb(uri="https://acme.com/about"),
+        )],
+        grounding_supports=[types.GroundingSupport(
+            segment=types.Segment(text="Acme employs 500 people."),
+            grounding_chunk_indices=[0],
+        )],
+    )
+    response = types.GenerateContentResponse(candidates=[
+        types.Candidate(grounding_metadata=metadata),
+    ])
+
+    assert research._extract_gemini_grounding_urls(response) == {
+        "https://acme.com/about": "https://acme.com/about",
+    }
+    assert research._extract_gemini_grounding_supports(response) == {
+        "https://acme.com/about": ["Acme employs 500 people."],
+    }
+    assert research._gemini_grounding_shape(response) == {
+        "response_type": "GenerateContentResponse",
+        "candidate_count": 1,
+        "grounding_metadata_count": 1,
+        "grounding_metadata_types": ["GroundingMetadata"],
+        "grounding_chunk_count": 1,
+        "grounding_support_count": 1,
+    }
+
+
+def test_multiple_grounded_services_and_leaders_are_not_conflicts():
+    url = "https://acme.com/about"
+    leadership = [
+        {"name": "Alex Kim", "title": "CEO", "source_url": url,
+         "excerpt": "Alex Kim is Acme's CEO."},
+        {"name": "Sam Lee", "title": "CTO", "source_url": url,
+         "excerpt": "Sam Lee is Acme's CTO."},
+    ]
+    data = {
+        "services": ["identity security", "compliance automation"],
+        "services_source_url": url,
+        "services_excerpt": "Acme provides identity security and compliance automation.",
+        "leadership": leadership,
+        "research_evidence": [
+            {
+                "field": "services", "criterion": "company_services",
+                "claim": {"service": "identity security"}, "source_url": url,
+                "excerpt": "Acme provides identity security.",
+            },
+            {
+                "field": "services", "criterion": "company_services",
+                "claim": {"service": "compliance automation"}, "source_url": url,
+                "excerpt": "Acme provides compliance automation.",
+            },
+        ],
+    }
+    supports = {url: [
+        data["services_excerpt"],
+        "Acme provides identity security.",
+        "Acme provides compliance automation.",
+        "Alex Kim is Acme's CEO.",
+        "Sam Lee is Acme's CTO.",
+    ]}
+    company = _company()
+
+    research._apply_firmographics(
+        company, data, "gemini_grounded_search", {url}, grounding_supports=supports,
+    )
+
+    assert company.research_outcomes["services"]["status"] == "accepted_and_mapped"
+    assert company.research_outcomes["leadership"]["status"] == "accepted_and_mapped"
+    assert len([item for item in company.research_evidence if item["field"] == "services"]) == 2
+    assert len([item for item in company.research_evidence if item["field"] == "leadership"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("evidence_range", "evidence_excerpt", "expected_status"),
+    [
+        ("400-600 employees", "Acme employs 400-600 employees.", "accepted_and_mapped"),
+        ("1,200 employees", "Acme employs 1,200 people.", "found_but_rejected"),
+    ],
+)
+def test_employee_range_claims_use_numeric_compatibility(
+    evidence_range, evidence_excerpt, expected_status,
+):
+    url = "https://acme.com/about"
+    data = {
+        "employee_count": 500,
+        "employee_count_source_url": url,
+        "employee_count_excerpt": "Acme employs 500 people.",
+        "employee_range": "500 employees",
+        "employee_range_source_url": url,
+        "employee_range_excerpt": "Acme employs 500 people.",
+        "research_evidence": [{
+            "field": "employee_range", "criterion": "automatic_company_size",
+            "claim": {"employee_range": evidence_range}, "source_url": url,
+            "excerpt": evidence_excerpt,
+        }],
+    }
+    company = _company()
+
+    research._apply_firmographics(
+        company, data, "gemini_grounded_search", {url},
+        grounding_supports={url: [data["employee_count_excerpt"], evidence_excerpt]},
+    )
+
+    assert company.research_outcomes["employee_range"]["status"] == expected_status
+    if expected_status == "found_but_rejected":
+        assert company.employee_count is None
+        assert company.research_outcomes["employee_range"]["reason"] == (
+            "conflicting claims supplied for the same field"
+        )
+    else:
+        assert company.employee_count.value == 500
+        assert company.employee_count.url == url
+
+
+def test_opposed_hiring_service_fit_claims_remain_conflicts():
+    url = "https://acme.com/careers"
+    company = _company()
+    research._apply_firmographics(
+        company,
+        {
+            "hiring_service_fit": "Acme is open to external contractors.",
+            "research_evidence": [{
+                "field": "hiring_service_fit", "criterion": "company_hiring_fit",
+                "claim": {"hiring_service_fit": "Acme does not use external contractors."},
+                "source_url": url,
+                "excerpt": "Acme does not use external contractors.",
+            }],
+        },
+        source="test_provider", allowed_source_urls={url},
+        searched_fields={"hiring_service_fit"},
+    )
+
+    outcome = company.research_outcomes["hiring_service_fit"]
+    assert outcome["status"] == "found_but_rejected"
+    assert outcome["reason"] == "conflicting claims supplied for the same field"
 
 
 def test_grounding_rejects_model_url_without_metadata(gemini_keys, monkeypatch):
@@ -1206,7 +1363,7 @@ def test_missing_classification_citation_has_specific_rejection_reason():
     assert outcome["reason"] == "classification evidence source URL is missing"
 
 
-def test_top_level_and_structured_fallback_claim_conflict_is_rejected():
+def test_top_level_and_structured_fallback_service_claims_coexist():
     company = _company()
     source_url = "https://acme.com/services"
     research._apply_firmographics(
@@ -1226,10 +1383,9 @@ def test_top_level_and_structured_fallback_claim_conflict_is_rejected():
         source_content={source_url: "Acme provides managed hosting. Acme provides software implementation."},
         searched_fields={"services"},
     )
-    assert company.research_evidence == []
+    assert len(company.research_evidence) == 1
     outcome = company.research_outcomes["services"]
-    assert outcome["status"] == "found_but_rejected"
-    assert outcome["reason"] == "conflicting claims supplied for the same field"
+    assert outcome["status"] == "accepted_and_mapped"
 
 
 def test_found_but_rejected_records_reason_and_bad_mapping():

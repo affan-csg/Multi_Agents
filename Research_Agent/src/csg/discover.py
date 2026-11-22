@@ -131,6 +131,7 @@ class DiscoveryStats:
     auto_qualify_top_n: int = 0
     auto_qualify_skipped_tier: int = 0
     duplicates_existing: int = 0
+    company_outcomes: list[dict[str, Any]] = field(default_factory=list)
     reeligible: int = 0
     """Previously discovered companies that were never qualified (or hand-off
     eligible) and so re-entered scoring/qualification in this run."""
@@ -168,6 +169,11 @@ class DiscoveryStats:
             "enrich_complete_with_gaps": self.enrich_complete_with_gaps,
             "enrichment_summary": self.enrichment_summary,
             "duplicates_existing": self.duplicates_existing,
+            "company_outcomes": [
+                *self.company_outcomes,
+                *(self.pipeline.company_outcomes if self.pipeline else []),
+            ],
+            "scoring_failures": self.pipeline.failed if self.pipeline else 0,
             "reeligible": self.reeligible,
             "existing_matches": self.existing_matches,
             "companies": p.companies if p else 0,
@@ -593,6 +599,35 @@ async def run_discovery(
         stats.existing_matches = [{"domain": m.domain, "matched_by": m.matched_by}
                                   for m in matches.values()]
         stats.duplicates_existing = len(stats.existing_matches)
+        if matches:
+            match_domains = sorted(matches)
+            in_list = f"in.({','.join(match_domains)})"
+            qualified_domains = {
+                row["domain"] for row in conn.select(
+                    "qualifications", domain=in_list, select="domain",
+                )
+            }
+            statuses = {
+                row["domain"]: row.get("status") for row in conn.select(
+                    "companies", domain=in_list, select="domain,status",
+                )
+            }
+            suppressed_domains = set(db.load_suppression(conn))
+            for match in matches.values():
+                if match.domain in qualified_domains:
+                    reason = "qualified_in_prior_run"
+                elif statuses.get(match.domain) == "disqualified":
+                    reason = "already_disqualified"
+                elif statuses.get(match.domain) == "suppressed" or match.domain in suppressed_domains:
+                    reason = "suppressed"
+                else:
+                    reason = "already_settled"
+                stats.company_outcomes.append({
+                    "domain": match.domain,
+                    "outcome": "duplicate",
+                    "reason": reason,
+                    "matched_by": match.matched_by,
+                })
         stats.reeligible = sum(1 for _, c in pairs if c.domain in reeligible)
         stats.discovered = len(pairs) + stats.duplicates_existing
         if matches:
