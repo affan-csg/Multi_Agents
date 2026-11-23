@@ -119,7 +119,6 @@ def main() -> int:
     parser.add_argument("--artifact-ref", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--build-id", required=True)
-    parser.add_argument("--trigger-id", required=False, default="")
     parser.add_argument("--local-image", required=False)
     args = parser.parse_args()
 
@@ -151,7 +150,7 @@ def main() -> int:
             image_digest=image_digest,
             local_labels=local_labels,
         )
-        print(json.dumps({**result, "trigger_id": args.trigger_id}, sort_keys=True))
+        print(json.dumps({**result}, sort_keys=True))
         return 0
     except (ProvenanceError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
         print(f"PROVENANCE_VALIDATION_FAILED: {exc}", file=sys.stderr)

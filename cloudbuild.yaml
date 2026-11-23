@@ -11,10 +11,8 @@ steps:
           --build-arg SOURCE_COMMIT=$COMMIT_SHA \
           --build-arg BUILD_ID=$BUILD_ID \
           --build-arg BUILD_TIMESTAMP=$$BUILD_TIMESTAMP \
-          --build-arg TRIGGER_ID=$TRIGGER_ID \
           --label org.opencontainers.image.revision=$$COMMIT_SHA \
           --label com.csg.cloudbuild.id=$BUILD_ID \
-          --label com.csg.cloudbuild.trigger=$TRIGGER_ID \
           --label org.opencontainers.image.created=$$BUILD_TIMESTAMP \
           --tag $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents:$COMMIT_SHA \
           . -f Dockerfile
@@ -36,8 +34,6 @@ steps:
       - $COMMIT_SHA
       - --build-id
       - $BUILD_ID
-      - --trigger-id
-      - $TRIGGER_ID
 
   - name: gcr.io/cloud-builders/docker
     id: Verify image provenance labels
@@ -52,7 +48,6 @@ steps:
         echo "$$LABELS"
         echo "$$LABELS" | grep -F '"org.opencontainers.image.revision":"$COMMIT_SHA"'
         echo "$$LABELS" | grep -F '"com.csg.cloudbuild.id":"$BUILD_ID"'
-        echo "$$LABELS" | grep -F '"com.csg.cloudbuild.trigger":"$TRIGGER_ID"'
 
 substitutions:
   _AR_HOSTNAME: asia-northeast1-docker.pkg.dev

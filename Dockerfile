@@ -3,13 +3,11 @@ FROM python:3.12-slim
 ARG SOURCE_COMMIT=unknown
 ARG BUILD_ID=unknown
 ARG BUILD_TIMESTAMP=unknown
-ARG TRIGGER_ID=unknown
 
 LABEL org.opencontainers.image.revision="${SOURCE_COMMIT}" \
       org.opencontainers.image.source="https://github.com/affan-csg/Multi_Agents" \
       org.opencontainers.image.created="${BUILD_TIMESTAMP}" \
-      com.csg.cloudbuild.id="${BUILD_ID}" \
-      com.csg.cloudbuild.trigger="${TRIGGER_ID}"
+      com.csg.cloudbuild.id="${BUILD_ID}"
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
