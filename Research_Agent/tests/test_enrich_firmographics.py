@@ -373,7 +373,12 @@ def test_omitted_required_key_is_partial_and_keeps_valid_facts(gemini_keys, monk
 
 def test_explicit_null_is_reported_as_terminal_missing_information(gemini_keys, monkeypatch):
     data = json.loads(_fully_populated_response_text())
-    data.update({"funding": None, "funding_source_url": None, "funding_excerpt": None})
+    data.update({
+        "funding": None, "funding_source_url": None, "funding_excerpt": None,
+        "employee_count": None, "employee_count_source_url": None, "employee_count_excerpt": None,
+        "employee_range": None, "employee_range_source_url": None, "employee_range_excerpt": None,
+        "revenue": None, "revenue_source_url": None, "revenue_excerpt": None,
+    })
 
     class FakeClient:
         def __init__(self, api_key, http_options=None, **kwargs):
@@ -392,6 +397,10 @@ def test_explicit_null_is_reported_as_terminal_missing_information(gemini_keys, 
     assert reason == "complete_with_gaps"
     assert company.research_outcomes["funding"]["status"] == "searched_but_not_found"
     assert "explicitly returned no reliable information" in company.research_outcomes["funding"]["reason"]
+    assert company.research_outcomes["employee_range"]["reason"] == (
+        "Gemini returned no supported employee count or employee-range claim"
+    )
+    assert company.research_outcomes["revenue"]["reason"] == "Gemini returned no supported revenue claim"
     assert company.research_outcomes["_summary"]["status"] == "complete_with_gaps"
 
 
@@ -460,6 +469,11 @@ def test_empty_or_malformed_gemini_response_triggers_fallback(gemini_keys, monke
     assert reason in {"empty_response", "parse_error"}
     assert called["count"] == 0
     assert company.employee_count is None
+    if not response_text:
+        assert company.research_outcomes["_summary"]["status"] == "failed"
+        assert company.research_outcomes["employee_range"]["status"] == "not_returned"
+        assert company.research_outcomes["revenue"]["status"] == "not_returned"
+        assert company.research_outcomes["employee_range"]["reason"] == "Gemini returned no text content"
 
 
 @pytest.mark.parametrize(
@@ -917,12 +931,101 @@ def test_grounding_url_without_support_association_is_rejected(gemini_keys, monk
                 return response
 
     monkeypatch.setattr("google.genai.Client", FakeClient)
+    events = []
+    monkeypatch.setattr(research, "log_event", lambda event, **fields: events.append((event, fields)))
     company = _company()
 
     result = asyncio.run(research.enrich_company_firmographics(company))
 
     assert result == "ungrounded_response"
+    assert company.research_outcomes["_summary"]["status"] == "failed"
+    assert company.employee_count is None
+    assert company.revenue is None
+    assert all(
+        outcome["status"] != "accepted_and_mapped"
+        for field, outcome in company.research_outcomes.items()
+        if field in research._FIELD_CRITERIA
+    )
+    outcomes = next(fields for event, fields in events if event == "gemini_enrichment_outcomes")
+    assert outcomes["status"] == "failed"
+    assert len(outcomes["rejected_fields"]) > 0
+
+
+def test_mixed_grounded_and_ungrounded_claims_are_reported_as_partial(gemini_keys, monkeypatch, capsys):
+    data = json.loads(_fully_populated_response_text())
+    response_text = json.dumps(data)
+    response = _fake_response(response_text)
+    supported_excerpts = [
+        data[key]
+        for key in (
+            "official_website_excerpt", "headquarters_excerpt", "company_type_excerpt",
+            "employee_count_excerpt", "funding_excerpt", "industry_excerpt",
+            "description_excerpt", "employee_range_excerpt", "services_excerpt",
+            "hiring_service_fit_excerpt",
+        )
+    ]
+    supported_excerpts.extend(person["excerpt"] for person in data["leadership"])
+    response.candidates[0].grounding_metadata.grounding_supports = [
+        SimpleNamespace(segment=SimpleNamespace(text=excerpt), grounding_chunk_indices=[0])
+        for excerpt in supported_excerpts
+    ]
+    events = []
+    monkeypatch.setattr(research, "log_event", lambda event, **fields: events.append((event, fields)))
+
+    class FakeClient:
+        def __init__(self, api_key, http_options=None, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**_kwargs):
+                return response
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+    company = _company()
+
+    reason = asyncio.run(research.enrich_company_firmographics(company))
+
+    assert reason == "ungrounded_response"
     assert company.research_outcomes["_summary"]["status"] == "partial"
+    assert company.employee_count.value == 500
+    assert company.revenue is None
+    assert company.research_outcomes["revenue"]["status"] == "found_but_rejected"
+    assert "grounding" in company.research_outcomes["revenue"]["reason"]
+    outcomes = next(fields for event, fields in events if event == "gemini_enrichment_outcomes")
+    assert outcomes["status"] == "partial"
+    assert outcomes["field_outcomes"]["employee_range"]["status"] == "accepted"
+    assert outcomes["field_outcomes"]["revenue"]["status"] == "rejected"
+    assert "[OK] Enriched" not in capsys.readouterr().out
+
+
+def test_empty_response_records_candidate_and_block_diagnostics(gemini_keys, monkeypatch):
+    response = SimpleNamespace(
+        text="", candidates=[SimpleNamespace(finish_reason="SAFETY")],
+        prompt_feedback=SimpleNamespace(block_reason="SAFETY"),
+    )
+    events = []
+    monkeypatch.setattr(research, "log_event", lambda event, **fields: events.append((event, fields)))
+
+    class FakeClient:
+        def __init__(self, api_key, http_options=None, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**_kwargs):
+                return response
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+    company = _company()
+
+    assert asyncio.run(research.enrich_company_firmographics(company)) == "empty_response"
+    diagnostic = next(fields for event, fields in events if event == "gemini_empty_response")
+    assert diagnostic["candidate_count"] == 1
+    assert diagnostic["finish_reasons"] == ["SAFETY"]
+    assert diagnostic["prompt_block_reason"] == "SAFETY"
+    assert diagnostic["text_length"] == 0
+    assert company.research_outcomes["_summary"]["status"] == "failed"
 
 
 def test_gemini_grounding_url_is_saved_with_fact_provenance(gemini_keys, monkeypatch):

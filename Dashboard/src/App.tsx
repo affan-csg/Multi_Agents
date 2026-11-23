@@ -180,6 +180,9 @@ function App() {
     if (typeof r.scored === "number") {
       parts.push(`${r.scored} scored`);
     }
+    if (typeof r.enrich_partial === "number" && r.enrich_partial > 0) {
+      parts.push(`${r.enrich_partial} partially enriched`);
+    }
     if (r.tiers) {
       const ab = (r.tiers.A ?? 0) + (r.tiers.B ?? 0);
       if (ab > 0) parts.push(`${ab} Tier A/B`);
@@ -189,7 +192,7 @@ function App() {
     // a missing/exhausted API key -- surface it plainly instead of the run just
     // silently coming back with no employee/revenue data and no explanation.
     const ENRICH_FAILURE_LABEL: Record<string, string> = {
-      no_api_key: "no GEMINI_API_KEY (and no GROQ_API_KEY/TAVILY_API_KEY fallback) configured",
+      no_api_key: "no GEMINI_API_KEY configured",
       quota_exhausted: "A provider quota limit was reached — see provider usage details",
       rate_limited: "rate limited (429) — retries exhausted",
       connection_error: "connection/TLS error reaching the API",

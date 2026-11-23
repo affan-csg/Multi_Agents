@@ -67,6 +67,7 @@ export interface RunResult {
   enriched?: number;
   enrich_skipped?: number;
   enrich_failures?: Record<string, number>;
+  enrich_partial?: number;
   enrich_complete_with_gaps?: number;
   enrichment_summary?: Record<string, EnrichmentCompanySummary>;
   exports?: Record<string, string>;

@@ -340,10 +340,12 @@ def test_partial_firmographics_are_checkpointed_and_available_on_retry(monkeypat
         FakeConn(), [candidate], "GA", None,
         checkpoint_save=save, run_id="partial-resume",
     ))
-    assert first[2] == {"ungrounded_response": 1}
+    assert first[2] == {}
     checkpoint_company = checkpoints["enrich:partial.example"]["payload"]["company"]
     assert checkpoint_company["employee_count"]["value"] == 500
     assert checkpoint_company["research_evidence"][0]["evidence_key"] == "valid-evidence"
+    assert checkpoint_company["research_outcomes"]["_summary"]["status"] == "partial"
+    assert checkpoints["enrich:partial.example"]["status"] == "failed"
 
     second = asyncio.run(discover._enrich_all(
         FakeConn(), [candidate], "GA", None,
@@ -353,6 +355,7 @@ def test_partial_firmographics_are_checkpointed_and_available_on_retry(monkeypat
     assert calls == ["partial.example", "partial.example"]
     assert second[0][0][1].employee_count.value == 500
     assert second[0][0][1].research_evidence[0]["evidence_key"] == "valid-evidence"
+    assert second[0][0][1].research_outcomes["_summary"]["status"] == "partial"
 
 
 def test_resume_selection_uses_latest_failed_checkpoint_independent_of_ats():

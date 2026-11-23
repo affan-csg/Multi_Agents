@@ -28,7 +28,7 @@ from .gemini_keys import (
     make_ipv4_async_httpx_client,
 )
 from ..gemini_queue import GeminiQuotaBlocked, GeminiRetryLater, generate_content
-from ..models import Company, ProvenanceValue, provenance_value
+from ..models import Company, ProvenanceValue
 from ..diagnostics import log_event
 from ..usage_tracker import track
 
@@ -390,6 +390,24 @@ def _apply_firmographics(
             return _has_source_excerpt(source_url, excerpt, source_content)
         return True
 
+    def fact_source_rejection_reason(field: str, source_url: str) -> str:
+        excerpt = data.get(f"{field}_excerpt")
+        claim = data.get(field)
+        if field == "employee_count" and claim is None:
+            claim = data.get("employee_range")
+        if not _claim_matches_excerpt({field: claim}, str(excerpt or "")):
+            return "supporting excerpt does not contain the claim"
+        if source == "gemini_grounded_search":
+            canonical = _normalize_grounding_url(source_url)
+            segments = (grounding_supports or {}).get(canonical or "", [])
+            if not any(_claim_matches_excerpt({field: claim}, segment) for segment in segments):
+                return "grounding support does not associate the claim with its cited source"
+        if source == "groq_tavily_search" and not _has_source_excerpt(
+            source_url, excerpt, source_content,
+        ):
+            return "supporting excerpt is not present in cited source content"
+        return "supporting evidence failed validation"
+
     def save_fact(field: str, value: Any, source_field: str, outcome_field: str, *, method: str = "reported",
                   confidence: str = "high") -> bool:
         source_url = fact_source_url(source_field)
@@ -410,7 +428,7 @@ def _apply_firmographics(
             rejection_reasons[outcome_field] = "supporting URL missing or not present in provider results"
             return False
         if not fact_source_is_valid(source_field, source_url):
-            rejection_reasons[outcome_field] = "supporting excerpt does not contain the claim or is not in cited source content"
+            rejection_reasons[outcome_field] = fact_source_rejection_reason(source_field, source_url)
             return False
         existing = getattr(company, field)
         if existing is not None:
@@ -561,7 +579,7 @@ def _apply_firmographics(
     elif rev and not revenue_url:
         rejection_reasons["revenue"] = "supporting URL missing or not present in provider results"
     elif rev and revenue_url and not fact_source_is_valid("revenue", revenue_url):
-        rejection_reasons["revenue"] = "supporting excerpt does not contain the claim or is not in cited source content"
+        rejection_reasons["revenue"] = fact_source_rejection_reason("revenue", revenue_url)
 
     # --- Funding ---
     funding = data.get("funding")
@@ -578,7 +596,7 @@ def _apply_firmographics(
         elif not funding_url:
             rejection_reasons["funding"] = "supporting URL missing or not present in provider results"
         elif not fact_source_is_valid("funding", funding_url):
-            rejection_reasons["funding"] = "supporting excerpt does not contain the claim or is not in cited source content"
+            rejection_reasons["funding"] = fact_source_rejection_reason("funding", funding_url)
 
     accepted_research: list[dict[str, Any]] = []
     research_evidence = list(data.get("research_evidence") or []) if isinstance(data.get("research_evidence"), list) else []
@@ -745,7 +763,7 @@ def _apply_firmographics(
     if industry and str(industry).lower() not in ("null", "none", "n/a") and not industry_url:
         rejection_reasons["industry"] = "supporting URL missing or not present in provider results"
     elif industry and industry_url and not fact_source_is_valid("industry", industry_url):
-        rejection_reasons["industry"] = "supporting excerpt does not contain the claim or is not in cited source content"
+        rejection_reasons["industry"] = fact_source_rejection_reason("industry", industry_url)
     elif industry and industry_url:
         if not company.industry:
             company.industry = str(industry)
@@ -757,7 +775,7 @@ def _apply_firmographics(
     if desc and str(desc).lower() not in ("null", "none") and not description_url:
         rejection_reasons["description"] = "supporting URL missing or not present in provider results"
     elif desc and description_url and not fact_source_is_valid("description", description_url):
-        rejection_reasons["description"] = "supporting excerpt does not contain the claim or is not in cited source content"
+        rejection_reasons["description"] = fact_source_rejection_reason("description", description_url)
     elif desc and description_url:
         if not company.description:
             company.description = str(desc)
@@ -815,18 +833,15 @@ def _apply_firmographics(
         if field in rejection_reasons:
             outcome["reason"] = rejection_reasons[field]
         elif status == "searched_but_not_found":
-            outcome["reason"] = "Gemini explicitly returned no reliable information for this field"
+            outcome["reason"] = {
+                "employee_range": "Gemini returned no supported employee count or employee-range claim",
+                "revenue": "Gemini returned no supported revenue claim",
+            }.get(field, "Gemini explicitly returned no reliable information for this field")
         evidence_ids = [item["evidence_key"] for item in accepted_research if item["field"] == field]
         if evidence_ids:
             outcome["evidence_keys"] = evidence_ids
         outcomes[field] = outcome
     company.research_outcomes.update(outcomes)
-
-    print(f"  [OK] Enriched {company.domain}: "
-            f"emp={provenance_value(company.employee_count) or '?'}, "
-            f"rev={provenance_value(company.revenue) or '?'}, "
-          f"industry={company.industry or '?'}")
-
 
 def _normalize_grounding_url(value: Any) -> Optional[str]:
     """Canonicalize a grounding URL without inventing or weakening provenance."""
@@ -976,6 +991,30 @@ def _gemini_grounding_shape(response: Any) -> dict[str, Any]:
         "grounding_metadata_types": sorted({type(value).__name__ for value in metadata_values}),
         "grounding_chunk_count": chunk_count,
         "grounding_support_count": support_count,
+    }
+
+
+def _gemini_response_diagnostics(response: Any) -> dict[str, Any]:
+    candidates = _grounding_value(response, "candidates") or []
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+    if not isinstance(candidates, (list, tuple)):
+        candidates = []
+
+    finish_reasons = []
+    for candidate in candidates:
+        reason = _grounding_value(candidate, "finish_reason", "finishReason")
+        if reason is not None:
+            finish_reasons.append(getattr(reason, "name", str(reason)))
+    prompt_feedback = _grounding_value(response, "prompt_feedback", "promptFeedback")
+    block_reason = _grounding_value(prompt_feedback, "block_reason", "blockReason")
+    return {
+        **_gemini_grounding_shape(response),
+        "finish_reasons": finish_reasons,
+        "prompt_block_reason": (
+            getattr(block_reason, "name", str(block_reason)) if block_reason is not None else None
+        ),
+        "text_length": len(getattr(response, "text", "") or ""),
     }
 
 
@@ -1411,6 +1450,24 @@ async def enrich_company_firmographics(
 
         raw_text = (getattr(response, "text", "") or "").strip()
         if not raw_text:
+            diagnostics = _gemini_response_diagnostics(response)
+            reason = "Gemini returned no text content"
+            missing_fields = {}
+            for field, criterion in _FIELD_CRITERIA.items():
+                company.research_outcomes[field] = {
+                    "status": "not_returned", "criterion": criterion,
+                    "checked_at": _utc_now_iso(), "reason": reason,
+                }
+                missing_fields[field] = reason
+            company.research_outcomes["_summary"] = {
+                "status": "failed", "missing_fields": missing_fields,
+                "blocking_fields": missing_fields, "failure_reason": "empty_response",
+            }
+            log_event(
+                "gemini_empty_response", domain=company.domain, run_id=run_id,
+                reason=reason, **diagnostics,
+            )
+            print(f"  [FAILED] Gemini returned no text for {company.domain}")
             return "empty_response"
 
         data = _extract_json_object(raw_text)
@@ -1430,14 +1487,7 @@ async def enrich_company_firmographics(
 
         grounding_invalid = _gemini_fallback_required(data, grounding_urls, grounding_supports)
         if grounding_invalid:
-            print(f"  [WARN] Gemini response for {company.domain} had an ungrounded claim")
-            log_event(
-                "gemini_grounding_rejected",
-                domain=company.domain,
-                grounding_url_count=len(grounding_urls),
-                **grounding_shape,
-                reason="missing_or_unverified_grounding",
-            )
+            print(f"  [WARN] Gemini response for {company.domain} contained a rejected claim")
         _apply_firmographics(
             company, data, source="gemini_grounded_search", allowed_source_urls=grounding_urls,
             strict_response=True, grounding_supports=grounding_supports,
@@ -1447,13 +1497,60 @@ async def enrich_company_firmographics(
             "missing": missing_response_fields,
         }
         completeness = enrichment_completeness(company)
+        accepted_fields = sorted(
+            field for field in _FIELD_CRITERIA
+            if company.research_outcomes.get(field, {}).get("status") == "accepted_and_mapped"
+        )
+        rejected_fields = sorted(
+            field for field in _FIELD_CRITERIA
+            if company.research_outcomes.get(field, {}).get("status") == "found_but_rejected"
+        )
+        missing_fields = sorted(
+            field for field in _FIELD_CRITERIA
+            if company.research_outcomes.get(field, {}).get("status") in {
+                "not_returned", "searched_but_not_found", "not_searched",
+            }
+        )
+        field_diagnostics = {
+            field: {
+                "status": (
+                    "accepted" if outcome.get("status") == "accepted_and_mapped" else
+                    "rejected" if outcome.get("status") == "found_but_rejected" else "missing"
+                ),
+                "reason": outcome.get("reason"),
+            }
+            for field in _FIELD_CRITERIA
+            if isinstance((outcome := company.research_outcomes.get(field)), dict)
+        }
+        if grounding_invalid:
+            completeness["status"] = "partial" if accepted_fields else "failed"
+            completeness["failure_reason"] = "ungrounded_response"
         company.research_outcomes["_summary"] = completeness
+        log_event(
+            "gemini_enrichment_outcomes", domain=company.domain, run_id=run_id,
+            status=completeness["status"], grounding_rejected=grounding_invalid,
+            accepted_fields=accepted_fields, rejected_fields=rejected_fields,
+            missing_fields=missing_fields, field_outcomes=field_diagnostics,
+            grounding_url_count=len(grounding_urls), **grounding_shape,
+        )
+        if grounding_invalid:
+            log_event(
+                "gemini_grounding_rejected", domain=company.domain, run_id=run_id,
+                grounding_url_count=len(grounding_urls), **grounding_shape,
+                rejected_fields=rejected_fields,
+                reason="missing_or_unverified_grounding",
+            )
         if grounding_invalid:
             return "ungrounded_response"
         if completeness["status"] == "partial":
             return "incomplete_result"
         if completeness["status"] == "complete_with_gaps":
+            print(f"  [OK] Enriched {company.domain} with documented gaps")
             return "complete_with_gaps"
+        if completeness["status"] == "failed":
+            print(f"  [FAILED] No grounded firmographic fields accepted for {company.domain}")
+            return "incomplete_result"
+        print(f"  [OK] Enriched {company.domain}")
         return None
 
     except json.JSONDecodeError as e:

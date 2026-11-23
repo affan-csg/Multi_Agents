@@ -142,6 +142,7 @@ class DiscoveryStats:
     Outreach -- and are listed on the run's Companies tab as existing matches
     (see db.save_run_matches)."""
     enrich_failures: dict[str, int] = field(default_factory=dict)
+    enrich_partial: int = 0
     enrich_complete_with_gaps: int = 0
     enrichment_summary: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Count of enrichment failures by reason (see enrich_company_firmographics
@@ -166,6 +167,7 @@ class DiscoveryStats:
             "enriched": self.enriched,
             "enrich_skipped": self.enrich_skipped,
             "enrich_failures": self.enrich_failures,
+            "enrich_partial": self.enrich_partial,
             "enrich_complete_with_gaps": self.enrich_complete_with_gaps,
             "enrichment_summary": self.enrichment_summary,
             "duplicates_existing": self.duplicates_existing,
@@ -349,9 +351,16 @@ async def _enrich_all(
                     reason = "incomplete_result"
                 if reason:
                     if reason != "complete_with_gaps":
-                        failures[reason] = failures.get(reason, 0) + 1
+                        accepted_fields = any(
+                            outcome.get("status") == "accepted_and_mapped"
+                            for outcome in company.research_outcomes.values()
+                            if isinstance(outcome, dict)
+                        )
+                        result_status = "partial" if accepted_fields else "failed"
+                        if result_status == "failed":
+                            failures[reason] = failures.get(reason, 0) + 1
                         company.research_outcomes["_summary"] = {
-                            **completeness, "status": "failed",
+                            **completeness, "status": result_status,
                             "failure_reason": reason,
                         }
             except (GeminiQuotaBlocked, GeminiRetryLater) as exc:
@@ -564,6 +573,10 @@ async def run_discovery(
         )
         stats.enrich_skipped = skipped
         stats.enrich_failures = enrich_failures
+        stats.enrich_partial = sum(
+            summary.get("status") == "partial"
+            for summary in stats.enrichment_summary.values()
+        )
 
         if ensure_owned:
             ensure_owned()
