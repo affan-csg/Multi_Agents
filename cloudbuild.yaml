@@ -2,19 +2,22 @@ steps:
   - name: gcr.io/cloud-builders/docker
     id: Build shared image
     entrypoint: bash
+    env:
+      - COMMIT_SHA=$COMMIT_SHA
+      - BUILD_ID=$BUILD_ID
     args:
       - -c
       - |
         set -euo pipefail
         BUILD_TIMESTAMP="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         docker build --no-cache \
-          --build-arg SOURCE_COMMIT=$COMMIT_SHA \
-          --build-arg BUILD_ID=$BUILD_ID \
+          --build-arg "SOURCE_COMMIT=$$COMMIT_SHA" \
+          --build-arg "BUILD_ID=$$BUILD_ID" \
           --build-arg BUILD_TIMESTAMP=$$BUILD_TIMESTAMP \
-          --label org.opencontainers.image.revision=$$COMMIT_SHA \
-          --label com.csg.cloudbuild.id=$BUILD_ID \
-          --label org.opencontainers.image.created=$$BUILD_TIMESTAMP \
-          --tag $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents:$COMMIT_SHA \
+          --label "org.opencontainers.image.revision=$$COMMIT_SHA" \
+          --label "com.csg.cloudbuild.id=$$BUILD_ID" \
+          --label "org.opencontainers.image.created=$$BUILD_TIMESTAMP" \
+          --tag $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents:$$COMMIT_SHA \
           . -f Dockerfile
 
   - name: gcr.io/cloud-builders/docker
@@ -38,16 +41,19 @@ steps:
   - name: gcr.io/cloud-builders/docker
     id: Verify image provenance labels
     entrypoint: bash
+    env:
+      - COMMIT_SHA=$COMMIT_SHA
+      - BUILD_ID=$BUILD_ID
     args:
       - -c
       - |
         set -euo pipefail
-        IMAGE="$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents:$COMMIT_SHA"
+        IMAGE="$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents:$$COMMIT_SHA"
         docker pull "$$IMAGE"
         LABELS="$$(docker image inspect "$$IMAGE" --format '{{json .Config.Labels}}')"
         echo "$$LABELS"
-        echo "$$LABELS" | grep -F '"org.opencontainers.image.revision":"$COMMIT_SHA"'
-        echo "$$LABELS" | grep -F '"com.csg.cloudbuild.id":"$BUILD_ID"'
+        echo "$$LABELS" | grep -F "\"org.opencontainers.image.revision\":\"$$COMMIT_SHA\""
+        echo "$$LABELS" | grep -F "\"com.csg.cloudbuild.id\":\"$$BUILD_ID\""
 
 substitutions:
   _AR_HOSTNAME: asia-northeast1-docker.pkg.dev
