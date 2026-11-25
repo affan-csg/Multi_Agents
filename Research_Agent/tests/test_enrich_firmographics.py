@@ -1661,6 +1661,30 @@ def test_run_summary_presents_validation_outcomes_as_review_not_failure():
     assert result["enrichment_summary"]["wiz.io"]["status"] == "failed"
 
 
+def test_operational_failure_is_not_relabelled_by_field_validation_text():
+    result = {
+        "enrichment_summary": {
+            "slow.io": {
+                "status": "failed",
+                "failure_reason": "timeout",
+                "missing_fields": {
+                    "funding": "supporting URL missing or not present in provider results",
+                },
+                "blocking_fields": {},
+                "review_fields": {},
+            },
+        },
+        "enrich_failures": {"timeout": 1},
+    }
+
+    summary = research.present_discover_result(result)["enrichment_summary"]["slow.io"]
+
+    assert summary["status"] == "failed"
+    assert summary["failure_reason"] == "timeout"
+    assert summary["missing_fields"] == {}
+    assert summary["review_fields"] == {}
+
+
 def _legacy_checkpoint(status: str, reason: str | None, outcomes: dict) -> dict:
     return {
         "status": status,

@@ -1367,6 +1367,9 @@ def _job_snapshot(row: dict[str, Any]) -> dict[str, Any]:
         "current_domain": row.get("current_domain"),
         "result": present_discover_result(row.get("result")) if isinstance(row.get("result"), dict) else row.get("result"),
         "error": row.get("error"),
+        # Presentation metadata only: clients order overlapping poll/socket
+        # responses by this value so an old poll cannot regress the UI.
+        "updated_at": row.get("updated_at"),
     }
     if row.get("quota_blocked_until") is not None:
         snapshot["quota_blocked_until"] = row["quota_blocked_until"]
@@ -1384,7 +1387,7 @@ def job_status(job_id: str) -> dict[str, Any]:
         log_event("job_status_missing", job_id=job_id, status="not_found")
         raise HTTPException(404, "job not found")
     snap = _job_snapshot(row)
-    log_event("job_status_read", **snap, worker_id=row.get("worker_id"), lease_until=row.get("lease_until"), updated_at=row.get("updated_at"))
+    log_event("job_status_read", **snap, worker_id=row.get("worker_id"), lease_until=row.get("lease_until"))
     return snap
 
 

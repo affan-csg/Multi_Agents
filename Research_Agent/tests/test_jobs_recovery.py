@@ -192,7 +192,7 @@ def test_cancel_endpoint_returns_authoritative_cancelled_snapshot(monkeypatch):
         "job_id": "job-cancel-api", "kind": "discover", "run_id": "run-1",
         "status": "cancelled", "done": 2, "total": 10,
         "current_domain": "pipeline: example.com", "result": None,
-        "error": "Cancelled by user.",
+        "error": "Cancelled by user.", "updated_at": None,
     }
 
 
@@ -257,6 +257,7 @@ def test_job_status_uses_persisted_state_instead_of_local_snapshot(monkeypatch):
         "job_id": "job-authoritative", "kind": "discover", "run_id": "run-1",
         "status": "done", "done": 3, "total": 3, "current_domain": None,
         "result": {"scored": 3}, "error": None,
+        "updated_at": "2026-11-25T17:56:44+00:00",
     }
 
     class StatusConn:
@@ -272,6 +273,7 @@ def test_job_status_uses_persisted_state_instead_of_local_snapshot(monkeypatch):
         "job_id": "job-authoritative", "kind": "discover", "run_id": "run-1",
         "status": "done", "done": 3, "total": 3, "current_domain": None,
         "result": {"scored": 3}, "error": None,
+        "updated_at": "2026-11-25T17:56:44+00:00",
     }
 
 

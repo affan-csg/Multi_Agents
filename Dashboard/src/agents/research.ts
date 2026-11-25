@@ -123,6 +123,8 @@ export interface JobSnapshot {
   result: RunResult | Record<string, unknown> | null;
   error: string | null;
   quota_blocked_until?: string | null;
+  /** Server row version; lets the monitor discard out-of-order snapshots. */
+  updated_at?: string | null;
 }
 
 export interface RunSummary {
