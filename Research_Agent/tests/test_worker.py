@@ -571,3 +571,8 @@ def test_discover_api_enqueues_stable_run_id_without_executing(monkeypatch):
     assert captured["kind"] == "discover"
     assert captured["run_id"] == "disc-stable-id"
     assert captured["total"] == 7
+def test_worker_exposes_livez_alias_for_cloud_run():
+    # Cloud Run's front end reserves /healthz (404), so /livez must exist.
+    paths = {route.path for route in worker.app.routes}
+    assert "/healthz" in paths
+    assert "/livez" in paths

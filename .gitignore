@@ -101,3 +101,5 @@ brag-output-*/
 *.bak
 *~
 .#*
+# Claude Code editor snapshots
+.history/

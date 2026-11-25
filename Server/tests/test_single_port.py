@@ -492,3 +492,13 @@ def test_research_service_token_is_limited_to_handoff_routes(monkeypatch):
     )
     assert allowed.status_code != 401
     assert denied.status_code == 401
+
+def test_livez_alias_is_public_and_reports_configuration(monkeypatch):
+    monkeypatch.setenv("RESEARCH_SUPABASE_URL", "https://research.example")
+    monkeypatch.setenv("RESEARCH_SUPABASE_SERVICE_KEY", "research-key")
+    monkeypatch.setenv("OUTREACH_SUPABASE_URL", "https://outreach.example")
+    monkeypatch.setenv("OUTREACH_SUPABASE_SERVICE_KEY", "outreach-key")
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    response = TestClient(server_app.app).get("/livez")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "missing": []}

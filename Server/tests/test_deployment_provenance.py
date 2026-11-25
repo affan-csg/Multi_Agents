@@ -88,12 +88,14 @@ def orchestrator_kwargs():
         "worker_service": "worker",
         "api_url": "https://api",
         "worker_url": "https://worker",
-        "verify_api_fn": lambda _: True,
-        "verify_worker_fn": lambda _: True,
+        "verify_api_fn": lambda *a, **k: True,
+        "verify_worker_fn": lambda *a, **k: True,
         "deploy_fn": lambda *args, **kwargs: "api-new" if kwargs.get("worker") is False else "worker-new",
         "switch_fn": lambda *args: None,
         "rollback_fn": lambda *args: None,
         "revision_url_fn": lambda service, revision, region, project: f"https://{revision}",
+        "revision_image_digest_fn": lambda service, revision, region, project: VALID_DIGEST,
+        "revision_config_fn": lambda service, revision, region, project: {"service_account": "sa", "port": 8080, "env": [], "command": [], "args": []},
     }
 
 
@@ -141,7 +143,7 @@ def test_failed_worker_deployment_does_not_switch_any_traffic(monkeypatch):
 def test_api_verification_failure_rolls_back_nothing(monkeypatch):
     monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
     kwargs = orchestrator_kwargs()
-    kwargs["verify_api_fn"] = lambda _: False
+    kwargs["verify_api_fn"] = lambda *a, **k: False
 
     with pytest.raises(deploy.DeploymentError, match="API revision"):
         deploy.orchestrate_deployment(**kwargs)
@@ -150,7 +152,7 @@ def test_api_verification_failure_rolls_back_nothing(monkeypatch):
 def test_worker_verification_failure_does_not_switch_any_traffic(monkeypatch):
     monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
     kwargs = orchestrator_kwargs()
-    kwargs["verify_worker_fn"] = lambda _: False
+    kwargs["verify_worker_fn"] = lambda *a, **k: False
     rollbacks = []
     kwargs["rollback_fn"] = lambda *args: rollbacks.append(args)
 
@@ -187,7 +189,7 @@ def test_partial_post_rollout_verification_rolls_back_both(monkeypatch):
         return getattr(test_partial_post_rollout_verification_rolls_back_both, "calls", 0) > 0
 
     calls = {"worker": 0}
-    def verify_worker_checked(url):
+    def verify_worker_checked(url, audience=None):
         calls["worker"] += 1
         return calls["worker"] == 1
 
@@ -204,40 +206,40 @@ def test_partial_post_rollout_verification_rolls_back_both(monkeypatch):
 
 def test_worker_readiness_requires_shared_scheduler_and_readyz(monkeypatch):
     responses = {
-        "https://worker/healthz": (True, {
+        "https://worker/livez": (True, {
             "status": "ok",
             "worker_enabled": True,
             "gemini_queue_backend": "shared_supabase",
         }),
         "https://worker/readyz": (True, {"status": "ready"}),
     }
-    monkeypatch.setattr(deploy, "http_ok", lambda url, timeout=5.0: responses[url])
+    monkeypatch.setattr(deploy, "http_ok", lambda url, timeout=5.0, headers=None: responses[url])
     assert deploy.verify_worker("https://worker") is True
 
 
 def test_worker_readiness_rejects_local_queue_backend(monkeypatch):
     responses = {
-        "https://worker/healthz": (True, {
+        "https://worker/livez": (True, {
             "status": "ok",
             "worker_enabled": True,
             "gemini_queue_backend": "process_local",
         }),
         "https://worker/readyz": (True, {"status": "ready"}),
     }
-    monkeypatch.setattr(deploy, "http_ok", lambda url, timeout=5.0: responses[url])
+    monkeypatch.setattr(deploy, "http_ok", lambda url, timeout=5.0, headers=None: responses[url])
     assert deploy.verify_worker("https://worker") is False
 
 
 def test_worker_readiness_rejects_failed_readyz(monkeypatch):
     responses = {
-        "https://worker/healthz": (True, {
+        "https://worker/livez": (True, {
             "status": "ok",
             "worker_enabled": True,
             "gemini_queue_backend": "shared_supabase",
         }),
         "https://worker/readyz": (False, {"status": "not_ready"}),
     }
-    monkeypatch.setattr(deploy, "http_ok", lambda url, timeout=5.0: responses[url])
+    monkeypatch.setattr(deploy, "http_ok", lambda url, timeout=5.0, headers=None: responses[url])
     assert deploy.verify_worker("https://worker") is False
 
 
@@ -247,10 +249,52 @@ def test_revision_specific_health_checks(monkeypatch):
     checked = []
 
     kwargs = orchestrator_kwargs()
-    kwargs["verify_api_fn"] = lambda url: checked.append(("api", url)) or True
-    kwargs["verify_worker_fn"] = lambda url: checked.append(("worker", url)) or True
+    kwargs["verify_api_fn"] = lambda url, audience=None: checked.append(("api", url)) or True
+    kwargs["verify_worker_fn"] = lambda url, audience=None: checked.append(("worker", url)) or True
 
     deploy.orchestrate_deployment(**kwargs)
 
     assert ("api", "https://api-new") in checked
     assert ("worker", "https://worker-new") in checked
+
+
+def test_normalize_digest_bare_hex_provenance():
+    bare = "b" * 64
+    assert prov.normalize_digest(bare) == "sha256:" + "b" * 64
+
+
+def test_normalize_digest_invalid_provenance():
+    with pytest.raises(prov.ProvenanceError):
+        prov.normalize_digest("zzz")
+    with pytest.raises(prov.ProvenanceError):
+        prov.normalize_digest("sha256:" + "g" * 64)
+
+
+def test_build_provenance_accepts_bare_hex_digest():
+    result = prov.validate_build_provenance(
+        artifact("sha256:" + "c" * 64), build(), commit_sha=VALID_COMMIT,
+        build_id="build-123", image_digest="c" * 64,
+        local_labels={
+            "org.opencontainers.image.revision": VALID_COMMIT,
+            "com.csg.cloudbuild.id": "build-123",
+        },
+    )
+    assert result["image_digest"] == "sha256:" + "c" * 64
+
+
+def test_artifact_only_provenance_accepts_digest():
+    assert prov.validate_artifact_provenance(artifact(), image_digest=VALID_DIGEST) == {
+        "image_digest": VALID_DIGEST
+    }
+
+
+def test_artifact_only_provenance_rejects_mismatch():
+    with pytest.raises(prov.ProvenanceError, match="Resolved digest mismatch"):
+        prov.validate_artifact_provenance(
+            artifact("sha256:" + "b" * 64), image_digest=VALID_DIGEST
+        )
+
+
+def test_artifact_only_provenance_requires_a_digest():
+    with pytest.raises(prov.ProvenanceError):
+        prov.validate_artifact_provenance({"name": "no digest here"})

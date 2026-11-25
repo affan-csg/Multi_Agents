@@ -121,15 +121,15 @@ The platform's `PORT` (Railway injects it) is honored, and `CSG_API_BASE` is der
 
 Research job execution must use a separate worker service. The API service only creates durable `agent_jobs` rows and serves REST/WebSocket status; it does not execute or recover jobs. The worker polls pending and expired rows, atomically claims each row, and writes heartbeats/checkpoints through the same Research Supabase project. Its WebSocket clients remain compatible because the API streams the authoritative database snapshots.
 
-The worker image is the same root `Dockerfile`; override its command to `python -m csg.worker`. Before deployment, verify migrations 010, 011, and 012 are applied to the Research project. Migration 010 creates the durable job/checkpoint ledger, 011 creates the shared Gemini scheduler, and 012 adds provider details and persistent diagnostic events. Review each migration and target schema before applying; none is run automatically by deployment.
+The worker image is the same root `Dockerfile`; override its command to `python -m csg.worker`. Before deployment, verify migrations 010, 011, 012, and 013 are applied to the Research project. Migration 010 creates the durable job/checkpoint ledger, 011 creates the shared Gemini scheduler, and 012 adds provider details and persistent diagnostic events. Review each migration and target schema before applying; none is run automatically by deployment.
 
 Build and push one immutable image, then deploy the API and worker independently. Use separate runtime service accounts and grant each only Secret Manager access to the secrets its process needs. The deployment identity needs `roles/run.admin`, `roles/iam.serviceAccountUser` on the runtime accounts, and Artifact Registry write access to publish the image; the Cloud Run service agent needs image read access.
 
 ```powershell
-gcloud builds submit --tag asia-northeast1-docker.pkg.dev/PROJECT/agents/csg-agents:TAG .
+gcloud builds submit --tag asia-northeast1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/multi_agents/multi-agents:COMMIT_SHA .
 
 gcloud run deploy multi-agents `
-   --image asia-northeast1-docker.pkg.dev/PROJECT/agents/csg-agents:TAG `
+   --image asia-northeast1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/multi_agents/multi-agents:COMMIT_SHA `
    --region asia-northeast1 `
    --service-account csg-research-api@PROJECT.iam.gserviceaccount.com `
    --port 8080 `
@@ -147,7 +147,7 @@ gcloud run deploy multi-agents `
    --update-secrets RESEARCH_SUPABASE_URL=research-supabase-url:latest,RESEARCH_SUPABASE_SERVICE_KEY=research-supabase-service-key:latest,OUTREACH_SUPABASE_URL=outreach-supabase-url:latest,OUTREACH_SUPABASE_SERVICE_KEY=outreach-supabase-service-key:latest,DASHBOARD_PASSWORD=dashboard-password:latest,RESEARCH_OUTREACH_SERVICE_TOKEN=research-outreach-service-token:latest,GEMINI_API_KEY=gemini-api-key:latest,SMTP_PASSWORD=outreach-smtp-password:latest,IMAP_PASSWORD=outreach-imap-password:latest
 
 gcloud run deploy multi-agents-research-worker `
-   --image asia-northeast1-docker.pkg.dev/PROJECT/agents/csg-agents:TAG `
+   --image asia-northeast1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/multi_agents/multi-agents:COMMIT_SHA `
    --region asia-northeast1 `
    --service-account csg-research-worker@PROJECT.iam.gserviceaccount.com `
    --command python `
@@ -288,3 +288,47 @@ If you're running behind a reverse proxy (nginx, CloudFlare, etc.):
 - Both agents stream background-job progress over WebSockets (`/research/jobs/{id}/ws`, `/outreach/jobs/{id}/ws`), so configure the proxy to upgrade the connection.
 - Set `X-Forwarded-For`, `X-Forwarded-Proto` headers so the backend knows the real client IP and protocol.
 - The Backend's CORS is configured in [Server/app.py](Server/app.py); adjust if needed.
+
+
+## Deployment permissions and health-check authentication
+
+The deployment orchestrator (`scripts/deployment_orchestrator.py`) keeps the
+Research Worker private (`--no-allow-unauthenticated`) while still verifying
+the exact new revision before switching traffic.
+
+Prerequisites for the identity that runs the orchestrator (your gcloud user or
+the CI service account):
+
+- `roles/run.developer` (or equivalent) on both `multi-agents` and
+  `multi-agents-research-worker` to create revisions and manage traffic.
+- `roles/run.invoker` on `multi-agents-research-worker` so the identity can
+  invoke the private Worker during health checks.
+- Permission to mint ID tokens for that identity: a human user has this by
+  default; a service account needs `roles/iam.serviceAccountTokenCreator`
+  (or `roles/iam.serviceAccountUser`) on itself.
+
+Health-check authentication model:
+
+- The Worker revision URL is the **health-check target** (the exact new
+  revision is probed at `<revision-url>/livez` and `/readyz`).
+- The configured **service URL** (`--worker-url`) is used as the **ID-token
+  audience** when available; otherwise the revision URL is used as the
+  audience. Cloud Run validates the token audience against the service, so
+  providing the service URL is preferred.
+- The API is public and needs no token; its revision URL is probed at
+  `/livez`.
+- If token minting fails or the identity lacks `roles/run.invoker`, health
+  checks fail closed and the deployment aborts before any traffic switch.
+- User credentials cannot mint audience-scoped ID tokens. Set
+  `DEPLOYMENT_INVOKER_SERVICE_ACCOUNT` to the identity that must invoke the
+  private Worker (for example the API runtime account) and grant the deployer
+  `roles/iam.serviceAccountOpenIdTokenCreator` on it.
+
+### Why `/livez` instead of `/healthz`
+
+Cloud Run's front end intercepts the exact path `/healthz` and answers `404`
+before the request reaches the container (verified against both services:
+`/healthz` and `/healthz?probe=1` return 404 while `/HEALTHZ` and `/livez`
+reach the app). Both apps therefore also expose `/livez`, which deployment
+health checks use. `/healthz` remains for local use and backwards
+compatibility.

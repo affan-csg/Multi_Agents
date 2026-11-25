@@ -135,7 +135,13 @@ app = FastAPI(title="CSG Research Worker", lifespan=_lifespan)
 
 
 @app.get("/healthz")
+@app.get("/livez")
 def healthz() -> dict[str, Any]:
+    """Liveness probe.
+
+    Also served at /livez because Cloud Run's front end reserves the exact
+    path /healthz and returns 404 before the request reaches the container.
+    """
     return {
         "status": "ok",
         "worker_enabled": WORKER_ENABLED,

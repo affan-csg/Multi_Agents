@@ -205,7 +205,10 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
 # with no DASHBOARD_PASSWORD configured every protected route returns 503.
 _AUTH_PUBLIC_PATHS = {
     "/auth/login",
+    # Cloud Run's front end intercepts the exact path /healthz and answers 404
+    # before the request reaches the container, so the public probe is /livez.
     "/healthz",
+    "/livez",
     "/outreach/automation/trigger",
     # Third-party webhook (Calendly can't send our token).
     "/calendly/webhook",
@@ -344,8 +347,12 @@ def dashboard_login(body: _LoginBody):
 
 
 @app.get("/healthz")
+@app.get("/livez")
 def healthz() -> JSONResponse:
-    """Unauthenticated process/readiness probe without exposing secrets."""
+    """Unauthenticated process/readiness probe without exposing secrets.
+
+    Exposed as /livez as well because Cloud Run reserves /healthz at its edge.
+    """
     required = (
         "RESEARCH_SUPABASE_URL", "RESEARCH_SUPABASE_SERVICE_KEY",
         "OUTREACH_SUPABASE_URL", "OUTREACH_SUPABASE_SERVICE_KEY",

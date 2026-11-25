@@ -5,6 +5,7 @@ steps:
     env:
       - COMMIT_SHA=$COMMIT_SHA
       - BUILD_ID=$BUILD_ID
+      - DEPLOY_REGION=$_DEPLOY_REGION
     args:
       - -c
       - |
@@ -26,17 +27,31 @@ steps:
       - push
       - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents:$COMMIT_SHA
 
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     id: Validate shared provenance
-    entrypoint: python3
+    entrypoint: bash
+    env:
+      - COMMIT_SHA=$COMMIT_SHA
+      - BUILD_ID=$BUILD_ID
     args:
-      - scripts/validate_image_provenance.py
-      - --artifact-ref
-      - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents:$COMMIT_SHA
-      - --commit
-      - $COMMIT_SHA
-      - --build-id
-      - $BUILD_ID
+      - -c
+      - |
+        set -euo pipefail
+        # The cloud-sdk image ships gcloud but exposes no python3 in PATH;
+        # use the SDK's bundled interpreter and put gcloud on PATH.
+        export PATH="/usr/lib/google-cloud-sdk/bin:$$PATH"
+        export CLOUDSDK_CORE_PROJECT="$PROJECT_ID"
+        PYTHON=/usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3
+        # The build identity can read the Artifact Registry record but not the
+        # Cloud Build record (no cloudbuild.builds.get), so this step validates
+        # the tag -> digest mapping; the next step validates the image labels
+        # that carry COMMIT_SHA / BUILD_ID, and deploy-time verification runs
+        # the full build-record check as the deployer identity.
+        "$$PYTHON" scripts/validate_image_provenance.py \
+          --artifact-ref "$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents:$$COMMIT_SHA" \
+          --commit "$$COMMIT_SHA" \
+          --build-id "$$BUILD_ID" \
+          --skip-build-metadata
 
   - name: gcr.io/cloud-builders/docker
     id: Verify image provenance labels
@@ -60,6 +75,7 @@ substitutions:
   _AR_PROJECT_ID: csgroup-514114
   _AR_REPOSITORY: cloud-run-source-deploy
   _DEPLOY_REGION: asia-northeast1
+
 
 options:
   logging: CLOUD_LOGGING_ONLY

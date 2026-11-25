@@ -26,6 +26,8 @@ def extract_artifact_digest(artifact: dict[str, Any]) -> str:
         artifact.get("digest"),
         summary.get("digest"),
         artifact.get("imageName"),
+        artifact.get("name"),
+        artifact.get("uri"),
     )
     for candidate in candidates:
         if isinstance(candidate, str):
@@ -56,6 +58,29 @@ def extract_build_commit(build: dict[str, Any]) -> str:
     raise ProvenanceError("Cloud Build response did not contain a verified 40-character commit SHA")
 
 
+def normalize_digest(value: str) -> str:
+    if not isinstance(value, str):
+        raise ProvenanceError("digest must be a string")
+    value = value.strip()
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        return value
+    if re.fullmatch(r"[0-9a-f]{64}", value):
+        return "sha256:" + value
+    raise ProvenanceError(f"Invalid image digest: {value!r}")
+
+
+def validate_artifact_provenance(
+    artifact: dict[str, Any], *, image_digest: str | None = None
+) -> dict[str, str]:
+    """Verify the Artifact Registry record for the pushed tag resolves to a digest."""
+    actual_digest = normalize_digest(extract_artifact_digest(artifact))
+    if image_digest and normalize_digest(image_digest) != actual_digest:
+        raise ProvenanceError(
+            f"Resolved digest mismatch: requested {image_digest}, Artifact Registry reports {actual_digest}"
+        )
+    return {"image_digest": actual_digest}
+
+
 def validate_build_provenance(
     artifact: dict[str, Any],
     build: dict[str, Any],
@@ -67,13 +92,14 @@ def validate_build_provenance(
 ) -> dict[str, str]:
     if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
         raise ProvenanceError("SOURCE_COMMIT must be a full 40-character Git SHA")
-    if not DIGEST_RE.fullmatch(image_digest or extract_artifact_digest(artifact)):
-        raise ProvenanceError("IMAGE_DIGEST must be a sha256 manifest digest")
+    resolved_image_digest = normalize_digest(image_digest) if image_digest else None
+    if resolved_image_digest is None:
+        resolved_image_digest = normalize_digest(extract_artifact_digest(artifact))
 
-    actual_digest = extract_artifact_digest(artifact)
-    if image_digest and actual_digest != image_digest:
+    actual_digest = normalize_digest(extract_artifact_digest(artifact))
+    if resolved_image_digest != actual_digest:
         raise ProvenanceError(
-            f"Resolved digest mismatch: requested {image_digest}, Artifact Registry reports {actual_digest}"
+            f"Resolved digest mismatch: requested {resolved_image_digest}, Artifact Registry reports {actual_digest}"
         )
 
     build_commit = extract_build_commit(build)
@@ -120,24 +146,33 @@ def main() -> int:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--build-id", required=True)
     parser.add_argument("--local-image", required=False)
+    parser.add_argument(
+        "--skip-build-metadata",
+        action="store_true",
+        help=(
+            "Validate only the Artifact Registry record. Reading the Cloud Build record needs "
+            "cloudbuild.builds.get, which Cloud Build build identities do not have by default."
+        ),
+    )
     args = parser.parse_args()
 
     try:
-        digest_match = re.search(r"(sha256:[0-9a-f]{64})", args.artifact_ref)
         artifact_ref = args.artifact_ref
-        if digest_match:
-            image_digest = digest_match.group(1)
-        else:
-            described = _run_json([
-                "gcloud", "artifacts", "docker", "images", "describe",
-                artifact_ref, "--format=json",
-            ])
-            image_digest = extract_artifact_digest(described)
-
-        artifact = _run_json([
+        described = _run_json([
             "gcloud", "artifacts", "docker", "images", "describe",
             artifact_ref, "--format=json",
         ])
+        image_digest = extract_artifact_digest(described)
+        if args.skip_build_metadata:
+            result = {
+                "requested_commit": args.commit,
+                "requested_build_id": args.build_id,
+                **validate_artifact_provenance(described, image_digest=image_digest),
+            }
+            print(json.dumps({**result}, sort_keys=True))
+            return 0
+        artifact = described
+
         build = _run_json([
             "gcloud", "builds", "describe", args.build_id, "--format=json",
         ])
@@ -153,7 +188,10 @@ def main() -> int:
         print(json.dumps({**result}, sort_keys=True))
         return 0
     except (ProvenanceError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-        print(f"PROVENANCE_VALIDATION_FAILED: {exc}", file=sys.stderr)
+        detail = exc
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            detail = f"{exc}\n{exc.stderr.strip()}"
+        print(f"PROVENANCE_VALIDATION_FAILED: {detail}", file=sys.stderr)
         return 1
 
 
