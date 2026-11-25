@@ -106,7 +106,7 @@ describe("ResearchAssessmentPanel", () => {
       />,
     );
 
-    expect(html).toContain("Failed during research processing (quota exhausted)");
+    expect(html).toContain("Did not finish (a provider quota limit was reached)");
     expect(html).toContain("Unverified Pipeline");
   });
 

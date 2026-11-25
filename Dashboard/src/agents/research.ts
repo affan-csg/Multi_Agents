@@ -19,7 +19,7 @@ export interface ProvenanceValue<T> {
 }
 
 export interface EnrichmentCompanySummary {
-  status: "complete" | "complete_with_gaps" | "partial" | "needs_review" | "failed";
+  status: "complete" | "complete_with_gaps" | "partial" | "needs_review" | "research_incomplete" | "failed";
   missing_fields: Record<string, string>;
   blocking_fields: Record<string, string>;
   review_fields?: Record<string, string>;
@@ -71,6 +71,7 @@ export interface RunResult {
   enrich_partial?: number;
   enrich_needs_review?: number;
   enrich_complete_with_gaps?: number;
+  enrich_research_incomplete?: number;
   enrichment_summary?: Record<string, EnrichmentCompanySummary>;
   exports?: Record<string, string>;
   qualify?: { qualified: number; skipped: number; errors: number; error_details: Record<string, string> } | { error: string } | null;

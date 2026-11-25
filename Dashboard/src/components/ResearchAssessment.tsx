@@ -10,6 +10,7 @@ import {
   ASSESSMENT_HIRING_MODELS,
   formatAssessmentValue,
 } from "./assessmentFilterLogic";
+import { presentedEnrichmentStatus } from "../discoverResult";
 
 function EvidenceReferences({ ids, evidenceById }: { ids: string[]; evidenceById: Map<string, CompanyEvidence> }) {
   if (ids.length === 0) return <p className="assessment-muted">No linked evidence recorded.</p>;
@@ -81,23 +82,20 @@ const ENRICHMENT_STATUS_LABEL: Record<string, string> = {
   complete_with_gaps: "Completed with unavailable fields",
   partial: "Partially researched",
   needs_review: "Needs review",
-  failed: "Failed during research processing",
+  research_incomplete: "Research incomplete",
+  failed: "Did not finish",
 };
 
-const FIELD_LEVEL_ENRICH_FAILURES: Record<string, string> = {
-  incomplete_result: "partial",
-  ungrounded_response: "needs_review",
-  complete_with_gaps: "complete_with_gaps",
-  partial: "partial",
-  needs_review: "needs_review",
+const OPERATIONAL_REASON_LABEL: Record<string, string> = {
+  no_api_key: "no research provider key is configured",
+  quota_exhausted: "a provider quota limit was reached",
+  rate_limited: "the provider rate limit was reached",
+  connection_error: "the provider could not be reached",
+  timeout: "request timed out",
+  parse_error: "the provider response could not be parsed",
+  request_error: "the provider request failed",
+  interrupted: "research was interrupted",
 };
-
-function presentedEnrichmentStatus(status?: string, failureReason?: string): string | undefined {
-  if (status === "failed" && failureReason && FIELD_LEVEL_ENRICH_FAILURES[failureReason]) {
-    return FIELD_LEVEL_ENRICH_FAILURES[failureReason];
-  }
-  return status;
-}
 
 function FieldResearchOutcomes({
   outcomes,
@@ -107,9 +105,15 @@ function FieldResearchOutcomes({
   researchEvidence?: CompanyResearchEvidence[];
 }) {
   if ((!outcomes || Object.keys(outcomes).length === 0) && !researchEvidence?.length) return null;
+  const detail = [
+    ...RESEARCH_FIELDS.map(([field]) => outcomes?.[field]?.reason || ""),
+    ...Object.values(outcomes?._summary?.missing_fields || {}),
+    ...Object.values(outcomes?._summary?.review_fields || {}),
+  ].join(" ");
   const overallStatus = presentedEnrichmentStatus(
     outcomes?._summary?.status,
     outcomes?._summary?.failure_reason,
+    detail,
   );
   const overallReason = overallStatus === "failed" ? outcomes?._summary?.failure_reason : undefined;
   return (
@@ -117,7 +121,7 @@ function FieldResearchOutcomes({
       <h4>Field research outcomes</h4>
       {overallStatus && <p className="assessment-muted">
         Firmographic research: {ENRICHMENT_STATUS_LABEL[overallStatus] || formatAssessmentValue(overallStatus)}
-        {overallReason ? ` (${overallReason.replaceAll("_", " ")})` : ""}
+        {overallReason ? ` (${OPERATIONAL_REASON_LABEL[overallReason] || "enrichment did not finish"})` : ""}
       </p>}
       <ul className="assessment-criteria">
         {RESEARCH_FIELDS.map(([field, label]) => {

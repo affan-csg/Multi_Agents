@@ -468,11 +468,15 @@ def test_empty_or_malformed_gemini_response_triggers_fallback(gemini_keys, monke
     company = _company()
 
     reason = asyncio.run(research.enrich_company_firmographics(company))
-    assert reason in {"empty_response", "parse_error"}
+    # No usable provider output is a neutral research outcome, not a fabricated
+    # success and not a raw execution-failure code: an empty response records
+    # research_incomplete, while unparseable text is still a parse failure.
+    assert reason in {None, "parse_error"}
     assert called["count"] == 0
     assert company.employee_count is None
     if not response_text:
-        assert company.research_outcomes["_summary"]["status"] == "failed"
+        assert reason is None
+        assert company.research_outcomes["_summary"]["status"] == "research_incomplete"
         assert company.research_outcomes["employee_range"]["status"] == "not_returned"
         assert company.research_outcomes["revenue"]["status"] == "not_returned"
         assert company.research_outcomes["employee_range"]["reason"] == "Gemini returned no text content"
@@ -1100,13 +1104,14 @@ def test_empty_response_records_candidate_and_block_diagnostics(gemini_keys, mon
     monkeypatch.setattr("google.genai.Client", FakeClient)
     company = _company()
 
-    assert asyncio.run(research.enrich_company_firmographics(company)) == "empty_response"
+    assert asyncio.run(research.enrich_company_firmographics(company)) is None
     diagnostic = next(fields for event, fields in events if event == "gemini_empty_response")
     assert diagnostic["candidate_count"] == 1
     assert diagnostic["finish_reasons"] == ["SAFETY"]
     assert diagnostic["prompt_block_reason"] == "SAFETY"
     assert diagnostic["text_length"] == 0
-    assert company.research_outcomes["_summary"]["status"] == "failed"
+    assert company.research_outcomes["_summary"]["status"] == "research_incomplete"
+    assert "failure_reason" not in company.research_outcomes["_summary"]
 
 
 def test_gemini_grounding_url_is_saved_with_fact_provenance(gemini_keys, monkeypatch):
@@ -1593,3 +1598,123 @@ def test_found_but_rejected_records_reason_and_bad_mapping():
 
 def test_fallback_query_matrix_covers_each_requested_research_field():
     assert {field for field, _ in research._FALLBACK_QUERIES} == set(research._FIELD_CRITERIA)
+
+
+def test_legacy_run_without_company_summaries_shows_neutral_counts_only():
+    """A stored run from before per-company summaries must not leak raw codes."""
+    presented = research.present_discover_result({
+        "discovered": 4,
+        "scored": 4,
+        "enrich_failures": {"timeout": 1, "ungrounded_response": 3},
+    })
+
+    assert presented["enrich_failures"] == {"timeout": 1}
+    assert presented["enrich_needs_review"] == 3
+    assert "ungrounded_response" not in json.dumps(presented)
+    assert "ungrounded_response" not in json.dumps(presented.get("enrich_failures"))
+
+
+def test_run_summary_presents_validation_outcomes_as_review_not_failure():
+    result = {
+        "discovered": 4,
+        "scored": 4,
+        "enrichment_summary": {
+            "wiz.io": {
+                "status": "failed", "failure_reason": "ungrounded_response",
+                "missing_fields": {"funding": "supporting URL missing or not present in provider results"},
+                "blocking_fields": {"funding": "supporting URL missing or not present in provider results"},
+                "review_fields": {"funding": "supporting URL missing or not present in provider results"},
+            },
+            "snyk.io": {
+                "status": "failed", "failure_reason": "incomplete_result",
+                "missing_fields": {"revenue": "No reliable information was returned"},
+                "blocking_fields": {},
+            },
+            "other.io": {
+                "status": "needs_review",
+                "missing_fields": {}, "blocking_fields": {}, "review_fields": {},
+            },
+            "slow.io": {
+                "status": "failed", "failure_reason": "timeout",
+                "missing_fields": {}, "blocking_fields": {},
+            },
+        },
+        "enrich_failures": {"timeout": 1, "ungrounded_response": 3},
+    }
+
+    presented = research.present_discover_result(result)
+    summary = presented["enrichment_summary"]
+
+    assert summary["wiz.io"]["status"] == "needs_review"
+    assert summary["snyk.io"]["status"] == "partial"
+    assert summary["other.io"]["status"] == "needs_review"
+    assert summary["slow.io"]["status"] == "failed"
+    assert summary["slow.io"]["failure_reason"] == "timeout"
+    assert summary["wiz.io"]["missing_fields"] == {}
+    assert summary["wiz.io"]["blocking_fields"] == {}
+    assert "failure_reason" not in summary["wiz.io"]
+    assert presented["enrich_failures"] == {"timeout": 1}
+    assert presented["enrich_needs_review"] == 2
+    assert presented["enrich_partial"] == 1
+    assert "supporting URL" not in json.dumps(presented)
+    # Stored records are not rewritten by presentation.
+    assert result["enrichment_summary"]["wiz.io"]["status"] == "failed"
+
+
+def _legacy_checkpoint(status: str, reason: str | None, outcomes: dict) -> dict:
+    return {
+        "status": status,
+        "payload": {
+            "reason": reason,
+            "company": {"domain": "acme.com", "research_outcomes": outcomes},
+            "completeness": outcomes.get("_summary") or {},
+        },
+    }
+
+
+def test_legacy_ungrounded_checkpoint_without_usable_research_is_retried():
+    outcomes = {
+        "funding": {"status": "found_but_rejected", "reason": "supporting URL missing"},
+        "_summary": {"status": "failed", "failure_reason": "ungrounded_response"},
+    }
+
+    assert discover._enrichment_checkpoint_is_reusable(
+        _legacy_checkpoint("failed", "ungrounded_response", outcomes)
+    ) is False
+
+
+def test_legacy_ungrounded_checkpoint_with_usable_research_is_reused():
+    outcomes = {
+        "industry": {"status": "accepted_and_mapped"},
+        "funding": {"status": "found_but_rejected", "reason": "supporting URL missing"},
+        "_summary": {"status": "failed", "failure_reason": "ungrounded_response"},
+    }
+
+    assert discover._enrichment_checkpoint_is_reusable(
+        _legacy_checkpoint("failed", "ungrounded_response", outcomes)
+    ) is True
+
+
+def test_ungrounded_checkpoint_with_classified_summary_is_reused():
+    outcomes = {"revenue": {"status": "found_but_rejected", "reason": "supporting URL missing"},
+                "_summary": {"status": "needs_review"}}
+
+    assert discover._enrichment_checkpoint_is_reusable(
+        _legacy_checkpoint("failed", "ungrounded_response", outcomes)
+    ) is True
+
+
+def test_research_incomplete_checkpoint_is_never_reused():
+    outcomes = {"_summary": {"status": "research_incomplete"}}
+
+    assert discover._enrichment_checkpoint_is_reusable(
+        _legacy_checkpoint("done", None, outcomes)
+    ) is False
+
+
+def test_empty_response_checkpoint_carries_no_operational_failure_reason():
+    outcomes = {"_summary": {"status": "research_incomplete"}}
+    checkpoint = _legacy_checkpoint("done", None, outcomes)
+
+    assert checkpoint["payload"]["completeness"]["status"] == "research_incomplete"
+    assert discover._enrichment_checkpoint_is_reusable(checkpoint) is False

@@ -27,7 +27,7 @@ from . import export_excel, export_pdf
 from .ats import normalize_domain
 from .config import load_config, update_icp_basics
 from .discovery import DiscoveryError
-from .discovery.research import present_stored_enrichment_summary
+from .discovery.research import present_discover_result, present_stored_enrichment_summary
 from . import jobs
 from .diagnostics import log_event
 from .gemini_queue import GeminiQuotaBlocked, GeminiRetryLater, resume_global_quota, scheduler_status
@@ -1364,7 +1364,8 @@ def _job_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     snapshot = {
         "job_id": row["job_id"], "kind": row["kind"], "run_id": row.get("run_id"),
         "status": row["status"], "done": row.get("done", 0), "total": row.get("total", 0),
-        "current_domain": row.get("current_domain"), "result": row.get("result"),
+        "current_domain": row.get("current_domain"),
+        "result": present_discover_result(row.get("result")) if isinstance(row.get("result"), dict) else row.get("result"),
         "error": row.get("error"),
     }
     if row.get("quota_blocked_until") is not None:

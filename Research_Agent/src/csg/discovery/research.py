@@ -47,9 +47,29 @@ _FIELD_LEVEL_ENRICHMENT_REASONS = frozenset({
     "complete_with_gaps", "incomplete_result", "ungrounded_response",
     "partial", "needs_review",
 })
+_OPERATIONAL_ENRICHMENT_REASONS = frozenset({
+    "no_api_key", "quota_exhausted", "rate_limited", "connection_error",
+    "timeout", "parse_error", "request_error", "interrupted",
+})
 _TERMINAL_ENRICHMENT_STATUSES = frozenset({
     "complete", "complete_with_gaps", "partial", "needs_review",
 })
+_VALIDATION_REASON_MARKERS = (
+    "supporting url", "conflicting claims", "grounding",
+    "could not be verified", "not present in provider", "excerpt",
+)
+# Legacy runs stored field-level outcomes as failure reasons and kept no
+# per-company summary at all. Those reasons are research status, not provider
+# outages, so they are folded into the neutral count the Dashboard shows
+# instead of being repeated as raw codes in a run summary.
+_PRESENTED_FAILURE_COUNT_FIELD = {
+    "incomplete_result": "enrich_partial",
+    "partial": "enrich_partial",
+    "needs_review": "enrich_needs_review",
+    "ungrounded_response": "enrich_needs_review",
+    "complete_with_gaps": "enrich_complete_with_gaps",
+    "empty_response": "enrich_research_incomplete",
+}
 
 _FIELD_CRITERIA = {
     "official_website": "automatic_website",
@@ -199,11 +219,23 @@ def enrichment_completeness(company: Company) -> dict[str, Any]:
             "not_searched": "The field was not searched",
         }.get(status, f"Research outcome is incomplete ({status or 'missing status'})")
         missing[field] = blocking[field]
-    status = (
-        "needs_review" if review else
-        "partial" if blocking else
-        "complete_with_gaps" if missing else "complete"
+    accepted = any(
+        isinstance(company.research_outcomes.get(field), dict)
+        and company.research_outcomes[field].get("status") == "accepted_and_mapped"
+        for field in _FIELD_CRITERIA
     )
+    if review:
+        status = "needs_review"
+    elif accepted and blocking:
+        status = "partial"
+    elif accepted and missing:
+        status = "complete_with_gaps"
+    elif accepted:
+        status = "complete"
+    elif blocking or missing:
+        status = "research_incomplete"
+    else:
+        status = "complete"
     return {
         "status": status,
         "missing_fields": missing,
@@ -245,10 +277,23 @@ def present_stored_enrichment_summary(outcomes: Any) -> dict[str, Any]:
         return outcomes
     status = summary.get("status")
     reason = summary.get("failure_reason")
+    if status == "research_incomplete":
+        return outcomes
     if status in _TERMINAL_ENRICHMENT_STATUSES:
         if not is_field_level_enrichment_reason(reason) or "failure_reason" not in summary:
             return outcomes
         cleaned = {key: value for key, value in summary.items() if key != "failure_reason"}
+        return {**outcomes, "_summary": cleaned}
+    if status == "failed" and reason == "empty_response":
+        field_rows = [name for name in _FIELD_CRITERIA if isinstance(outcomes.get(name), dict)]
+        if field_rows:
+            company = Company(
+                domain="stored.example",
+                research_outcomes={key: value for key, value in outcomes.items() if key != "_summary"},
+            )
+            return {**outcomes, "_summary": enrichment_completeness(company)}
+        cleaned = {key: value for key, value in summary.items() if key != "failure_reason"}
+        cleaned["status"] = "research_incomplete"
         return {**outcomes, "_summary": cleaned}
     if status != "failed" or not is_field_level_enrichment_reason(reason):
         return outcomes
@@ -256,7 +301,7 @@ def present_stored_enrichment_summary(outcomes: Any) -> dict[str, Any]:
     if not field_rows:
         mapped = {
             "incomplete_result": "partial",
-            "ungrounded_response": "needs_review",
+            "ungrounded_response": "research_incomplete",
             "complete_with_gaps": "complete_with_gaps",
             "partial": "partial",
             "needs_review": "needs_review",
@@ -269,6 +314,107 @@ def present_stored_enrichment_summary(outcomes: Any) -> dict[str, Any]:
         research_outcomes={key: value for key, value in outcomes.items() if key != "_summary"},
     )
     return {**outcomes, "_summary": enrichment_completeness(company)}
+
+
+def _summary_reason_text(summary: dict[str, Any]) -> str:
+    chunks: list[str] = []
+    for key in ("missing_fields", "review_fields", "blocking_fields"):
+        value = summary.get(key) or {}
+        if isinstance(value, dict):
+            chunks.extend(str(item) for item in value.values())
+    return " ".join(chunks).lower()
+
+
+def present_enrichment_summary_entry(summary: Any) -> dict[str, Any]:
+    """Copy one run-summary entry into a user-facing research status.
+
+    Field-validation text stays out of this copy. Operational failures keep
+    ``status=failed`` and their reason code. The input is not mutated.
+    """
+    if not isinstance(summary, dict):
+        return {}
+    item = dict(summary)
+    status = item.get("status")
+    reason = item.get("failure_reason")
+    if status == "failed" and reason in _OPERATIONAL_ENRICHMENT_REASONS:
+        item["missing_fields"] = {}
+        item["blocking_fields"] = {}
+        item["review_fields"] = {}
+        return item
+    if status in _TERMINAL_ENRICHMENT_STATUSES or status == "research_incomplete":
+        item.pop("failure_reason", None)
+        item["missing_fields"] = {}
+        item["blocking_fields"] = {}
+        item["review_fields"] = {}
+        return item
+    text = _summary_reason_text(item)
+    validation = any(marker in text for marker in _VALIDATION_REASON_MARKERS)
+    no_usable = "has not returned usable" in text or reason in {
+        "empty_response", "ungrounded_response", "research_incomplete",
+    }
+    if validation:
+        presented = "needs_review"
+    elif reason == "incomplete_result":
+        presented = "partial"
+    elif no_usable or status == "failed":
+        presented = "research_incomplete"
+    else:
+        return item
+    item["status"] = presented
+    item.pop("failure_reason", None)
+    item["missing_fields"] = {}
+    item["blocking_fields"] = {}
+    item["review_fields"] = {}
+    return item
+
+
+def present_discover_result(result: Any) -> dict[str, Any]:
+    """Copy a stored discover result so validation outcomes are not failures.
+
+    Historical job rows are left unchanged. Counts are derived again from the
+    presented per-company summaries.
+    """
+    if not isinstance(result, dict):
+        return {}
+    presented = dict(result)
+    summary = result.get("enrichment_summary")
+    if isinstance(summary, dict):
+        entries = {
+            str(domain): present_enrichment_summary_entry(item)
+            for domain, item in summary.items()
+        }
+        presented["enrichment_summary"] = entries
+        values = list(entries.values())
+        presented["enrich_partial"] = sum(item.get("status") == "partial" for item in values)
+        presented["enrich_needs_review"] = sum(item.get("status") == "needs_review" for item in values)
+        presented["enrich_complete_with_gaps"] = sum(
+            item.get("status") == "complete_with_gaps" for item in values
+        )
+        presented["enrich_research_incomplete"] = sum(
+            item.get("status") == "research_incomplete" for item in values
+        )
+    failures = result.get("enrich_failures")
+    if isinstance(failures, dict):
+        presented["enrich_failures"] = {
+            str(reason): count
+            for reason, count in failures.items()
+            if count and reason in _OPERATIONAL_ENRICHMENT_REASONS
+        }
+        if not summary:
+            # No per-company detail survives (older job rows): keep the
+            # aggregate counts, but only under neutral statuses. Raw
+            # validation reasons never reach the Dashboard summary.
+            neutral: dict[str, int] = {}
+            for reason, count in failures.items():
+                if not count or reason in _OPERATIONAL_ENRICHMENT_REASONS:
+                    continue
+                field = _PRESENTED_FAILURE_COUNT_FIELD.get(
+                    str(reason), "enrich_research_incomplete",
+                )
+                neutral[field] = neutral.get(field, 0) + int(count)
+            for field, count in neutral.items():
+                presented[field] = max(int(presented.get(field) or 0), count)
+    return presented
 
 
 def _is_gemini_transient_rate_limit(exc: Exception) -> bool:
@@ -1543,15 +1689,15 @@ async def enrich_company_firmographics(
                 }
                 missing_fields[field] = reason
             company.research_outcomes["_summary"] = {
-                "status": "failed", "missing_fields": missing_fields,
-                "blocking_fields": missing_fields, "failure_reason": "empty_response",
+                "status": "research_incomplete", "missing_fields": {},
+                "blocking_fields": {}, "review_fields": {},
             }
             log_event(
                 "gemini_empty_response", domain=company.domain, run_id=run_id,
                 reason=reason, **diagnostics,
             )
-            print(f"  [FAILED] Gemini returned no text for {company.domain}")
-            return "empty_response"
+            print(f"  [WARN] Gemini returned no usable research for {company.domain}")
+            return None
 
         data = _extract_json_object(raw_text)
         grounding_started = _time.monotonic()

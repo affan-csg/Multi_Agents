@@ -30,7 +30,9 @@ describe("describeDiscoverResult", () => {
     expect(result.message).toContain("partially researched");
     expect(result.message).toContain("completed with unavailable fields");
     expect(result.message).toContain("needs review");
-    expect(result.message).toContain("Source URL missing");
+    // Field-validation text stays in field-level details/diagnostics, never
+    // in the run summary (see prompt.txt section 3).
+    expect(result.message).not.toContain("Source URL missing");
     expect(result.message).not.toContain("failed");
   });
 
@@ -72,6 +74,31 @@ describe("describeDiscoverResult", () => {
 
     expect(result.tone).toBe("error");
     expect(result.message).toContain("quota limit");
-    expect(result.message).toContain("operation failed");
+    expect(result.message).toContain("Enrichment did not finish");
+  });
+
+  it("presents the reported mixed run without internal validation codes", () => {
+    const result = describeDiscoverResult({
+      discovered: 4,
+      scored: 4,
+      // Shape produced by Research's present_discover_result: field-level
+      // rejection is already needs_review, only a real timeout is failed.
+      enrichment_summary: {
+        "wiz.io": { status: "needs_review", missing_fields: {}, blocking_fields: {}, review_fields: {} },
+        "snyk.io": { status: "needs_review", missing_fields: {}, blocking_fields: {}, review_fields: {} },
+        "acme.io": { status: "needs_review", missing_fields: {}, blocking_fields: {}, review_fields: {} },
+        "slow.io": { status: "failed", failure_reason: "timeout", missing_fields: {}, blocking_fields: {} },
+      },
+      enrich_failures: { timeout: 1 },
+    });
+
+    expect(result.tone).toBe("error");
+    expect(result.message).toContain("4 companies discovered");
+    expect(result.message).toContain("4 scored");
+    expect(result.message).toContain("3 need review");
+    expect(result.message).toContain("request timed out");
+    expect(result.message).not.toContain("ungrounded_response");
+    expect(result.message).not.toContain("supporting URL");
+    expect(result.message).not.toContain("failed;");
   });
 });
