@@ -99,6 +99,35 @@ function flushPromises() {
 afterEach(() => vi.useRealTimers());
 
 describe("JobMonitor", () => {
+  it("binds default timer functions so starting a run cannot throw Illegal invocation", async () => {
+    // Chrome rejects native timers called with a non-window receiver, which is
+    // what `this.setIntervalFn(...)` did before the defaults were bound.
+    const realSetInterval = globalThis.setInterval;
+    const strictSetInterval = vi.fn(function (
+      this: unknown, handler: TimerHandler, timeout?: number,
+    ) {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return realSetInterval(handler, timeout);
+    });
+    const spy = vi.spyOn(globalThis, "setInterval")
+      .mockImplementation(strictSetInterval as unknown as typeof setInterval);
+    const jobStatus = vi.fn(async () => snapshot("running"));
+    const jobSocket = vi.fn(() => new TestSocket() as unknown as WebSocket);
+    const monitor = new JobMonitor(
+      "job-1", { jobStatus, jobSocket }, vi.fn(), new MemoryStorage(),
+      { pollIntervalMs: 60_000 },
+    );
+
+    try {
+      expect(() => monitor.start()).not.toThrow();
+      await flushPromises();
+      expect(strictSetInterval).toHaveBeenCalled();
+    } finally {
+      monitor.stop();
+      spy.mockRestore();
+    }
+  });
+
   it("restores a persisted job after reload and clears it when the API says completed", async () => {
     vi.useFakeTimers();
     const storage = new MemoryStorage();

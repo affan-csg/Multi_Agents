@@ -86,10 +86,13 @@ export class JobMonitor {
     this.pollIntervalMs = options.pollIntervalMs ?? 3000;
     this.reconnectBaseMs = options.reconnectBaseMs ?? 1000;
     this.reconnectMaxMs = options.reconnectMaxMs ?? 30000;
-    this.setTimeoutFn = options.setTimeoutFn ?? setTimeout;
-    this.clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
-    this.setIntervalFn = options.setIntervalFn ?? setInterval;
-    this.clearIntervalFn = options.clearIntervalFn ?? clearInterval;
+    // Native browser timers throw "Illegal invocation" when called with a
+    // non-window receiver, and `this.setIntervalFn(...)` does exactly that.
+    // Bind the defaults; injected test timers are already plain functions.
+    this.setTimeoutFn = options.setTimeoutFn ?? setTimeout.bind(globalThis);
+    this.clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout.bind(globalThis);
+    this.setIntervalFn = options.setIntervalFn ?? setInterval.bind(globalThis);
+    this.clearIntervalFn = options.clearIntervalFn ?? clearInterval.bind(globalThis);
     this.documentRef = options.documentRef ?? (
       typeof document !== "undefined" ? (document as unknown as VisibilityTarget) : null
     );
