@@ -38,7 +38,10 @@ from .config import Config
 from .db import SupabaseConn
 from .discovery import (DiscoveryError, WebSearchProvider, deduplicate_and_resolve,
                         enrich_company_firmographics)
-from .discovery.research import enrichment_completeness
+from .discovery.research import (
+    enrichment_completeness, is_field_level_enrichment_reason,
+    present_stored_enrichment_summary, stored_enrichment_is_terminal,
+)
 from .discovery.base import CompanyCandidate
 from .http import Fetcher
 from .models import Company
@@ -117,6 +120,31 @@ def _enrichment_summaries(companies: list[Company]) -> dict[str, dict[str, Any]]
     }
 
 
+def _is_field_level_enrichment_outcome(reason: Optional[str]) -> bool:
+    return is_field_level_enrichment_reason(reason)
+
+
+def _restore_checkpoint_company(checkpoint: dict[str, Any], fallback: Company) -> Company:
+    saved = checkpoint.get("payload") or {}
+    company = Company.model_validate(saved.get("company") or fallback.model_dump(mode="json"))
+    company.research_outcomes = present_stored_enrichment_summary(company.research_outcomes)
+    return company
+
+
+def _enrichment_checkpoint_is_reusable(checkpoint: Optional[dict[str, Any]]) -> bool:
+    """Finished field research, including older checkpoints mislabeled as failed."""
+    if not checkpoint or checkpoint.get("status") not in {"done", "failed"}:
+        return False
+    payload = checkpoint.get("payload") or {}
+    reason = payload.get("reason")
+    if checkpoint.get("status") == "done" and not reason:
+        return True
+    if is_field_level_enrichment_reason(reason):
+        return True
+    summary = ((payload.get("company") or {}).get("research_outcomes") or {}).get("_summary")
+    return stored_enrichment_is_terminal(summary) and not reason
+
+
 @dataclass
 class DiscoveryStats:
     region: str = ""
@@ -143,6 +171,7 @@ class DiscoveryStats:
     (see db.save_run_matches)."""
     enrich_failures: dict[str, int] = field(default_factory=dict)
     enrich_partial: int = 0
+    enrich_needs_review: int = 0
     enrich_complete_with_gaps: int = 0
     enrichment_summary: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Count of enrichment failures by reason (see enrich_company_firmographics
@@ -168,6 +197,7 @@ class DiscoveryStats:
             "enrich_skipped": self.enrich_skipped,
             "enrich_failures": self.enrich_failures,
             "enrich_partial": self.enrich_partial,
+            "enrich_needs_review": self.enrich_needs_review,
             "enrich_complete_with_gaps": self.enrich_complete_with_gaps,
             "enrichment_summary": self.enrichment_summary,
             "duplicates_existing": self.duplicates_existing,
@@ -212,16 +242,14 @@ def _needs_enrichment(existing: Optional[Company]) -> bool:
     """Enrich unless persisted field outcomes prove the research is terminal."""
     if existing is None:
         return True
-    summary = existing.research_outcomes.get("_summary") or {}
-    return summary.get("status") not in {"complete", "complete_with_gaps"}
+    return not stored_enrichment_is_terminal(existing.research_outcomes.get("_summary"))
 
 
 def _needs_identity_enrichment(existing: Optional[Company]) -> bool:
     """Use the same persisted terminal state for identity and firmographic work."""
     if existing is None:
         return True
-    summary = existing.research_outcomes.get("_summary") or {}
-    return summary.get("status") not in {"complete", "complete_with_gaps"}
+    return not stored_enrichment_is_terminal(existing.research_outcomes.get("_summary"))
 
 
 def _restore_discovery_manifest(
@@ -268,16 +296,13 @@ async def _enrich_all(
             ):
                 setattr(company, field, getattr(existing, field))
         checkpoint = checkpoint_load(f"enrich:{c.domain}") if checkpoint_load else None
-        if checkpoint and checkpoint.get("status") == "done" and not (
-            (checkpoint.get("payload") or {}).get("reason")
-        ):
-            saved = checkpoint.get("payload") or {}
-            company = Company.model_validate(saved.get("company") or company.model_dump(mode="json"))
+        if _enrichment_checkpoint_is_reusable(checkpoint):
+            company = _restore_checkpoint_company(checkpoint or {}, company)
             skipped += 1
             pairs.append((c, company))
             continue
         if checkpoint and (
-            checkpoint.get("status") == "failed"
+            checkpoint.get("status") in {"failed", "queued"}
             or (checkpoint.get("status") == "done" and (checkpoint.get("payload") or {}).get("reason"))
         ):
             saved = checkpoint.get("payload") or {}
@@ -345,24 +370,20 @@ async def _enrich_all(
                 if ensure_owned:
                     ensure_owned()
                 completeness = enrichment_completeness(company)
-                if reason is None and completeness["status"] != "complete":
-                    reason = "incomplete_result"
-                elif reason == "complete_with_gaps" and completeness["status"] != "complete_with_gaps":
-                    reason = "incomplete_result"
-                if reason:
-                    if reason != "complete_with_gaps":
-                        accepted_fields = any(
-                            outcome.get("status") == "accepted_and_mapped"
-                            for outcome in company.research_outcomes.values()
-                            if isinstance(outcome, dict)
+                if _is_field_level_enrichment_outcome(reason):
+                    if reason == "ungrounded_response" and completeness["status"] != "needs_review":
+                        completeness["status"] = "needs_review"
+                        completeness.setdefault("review_fields", {})["grounding"] = (
+                            "One or more claims did not meet the grounding requirements"
                         )
-                        result_status = "partial" if accepted_fields else "failed"
-                        if result_status == "failed":
-                            failures[reason] = failures.get(reason, 0) + 1
-                        company.research_outcomes["_summary"] = {
-                            **completeness, "status": result_status,
-                            "failure_reason": reason,
-                        }
+                    reason = None
+                if reason is None and not company.research_outcomes.get("_summary"):
+                    company.research_outcomes["_summary"] = completeness
+                if reason:
+                    failures[reason] = failures.get(reason, 0) + 1
+                    company.research_outcomes["_summary"] = {
+                        **completeness, "status": "failed", "failure_reason": reason,
+                    }
             except (GeminiQuotaBlocked, GeminiRetryLater) as exc:
                 if checkpoint_save and not checkpoint_save(
                     checkpoint_key, "queued",
@@ -410,14 +431,14 @@ async def _enrich_all(
                 ):
                     raise asyncio.CancelledError()
             else:
-                checkpoint_status = "failed" if reason and reason != "complete_with_gaps" else "done"
+                checkpoint_status = "failed" if reason else "done"
                 payload = {
                     "company": company.model_dump(mode="json"),
-                    "reason": reason if reason != "complete_with_gaps" else None,
+                    "reason": reason,
                     "completeness": company.research_outcomes.get("_summary")
                     or enrichment_completeness(company),
                 }
-                if reason and reason != "complete_with_gaps":
+                if reason:
                     payload["provider_error"] = _enrichment_failure_metadata(reason, run_id)
                 if checkpoint_save and not checkpoint_save(
                     checkpoint_key, checkpoint_status,
@@ -575,6 +596,10 @@ async def run_discovery(
         stats.enrich_failures = enrich_failures
         stats.enrich_partial = sum(
             summary.get("status") == "partial"
+            for summary in stats.enrichment_summary.values()
+        )
+        stats.enrich_needs_review = sum(
+            summary.get("status") == "needs_review"
             for summary in stats.enrichment_summary.values()
         )
 
@@ -753,11 +778,8 @@ async def resume_stalled(
             if ensure_owned:
                 ensure_owned()
             checkpoint = checkpoint_load(f"enrich:{company.domain}") if checkpoint_load else None
-            if checkpoint and checkpoint.get("status") == "done" and not (
-                (checkpoint.get("payload") or {}).get("reason")
-            ):
-                saved = checkpoint.get("payload") or {}
-                companies[index] = Company.model_validate(saved.get("company") or company.model_dump(mode="json"))
+            if _enrichment_checkpoint_is_reusable(checkpoint):
+                companies[index] = _restore_checkpoint_company(checkpoint or {}, company)
                 continue
             if checkpoint and (
                 checkpoint.get("status") in ("failed", "queued")
@@ -804,30 +826,43 @@ async def resume_stalled(
                     if ensure_owned:
                         ensure_owned()
                     completeness = enrichment_completeness(company)
-                    if reason is None and completeness["status"] != "complete":
-                        reason = "incomplete_result"
-                    elif reason == "complete_with_gaps" and completeness["status"] != "complete_with_gaps":
-                        reason = "incomplete_result"
+                    if _is_field_level_enrichment_outcome(reason):
+                        if reason == "ungrounded_response" and completeness["status"] != "needs_review":
+                            completeness["status"] = "needs_review"
+                            completeness.setdefault("review_fields", {})["grounding"] = (
+                                "One or more claims did not meet the grounding requirements"
+                            )
+                        reason = None
+                    if reason is None and not company.research_outcomes.get("_summary"):
+                        company.research_outcomes["_summary"] = completeness
                     if reason:
-                        if reason != "complete_with_gaps":
-                            failures[reason] = failures.get(reason, 0) + 1
-                            company.research_outcomes["_summary"] = {
-                                **completeness, "status": "failed",
-                                "failure_reason": reason,
-                            }
-                    checkpoint_status = "failed" if reason and reason != "complete_with_gaps" else "done"
-                    payload = {"company": company.model_dump(mode="json"), "reason": reason}
+                        failures[reason] = failures.get(reason, 0) + 1
+                        company.research_outcomes["_summary"] = {
+                            **completeness, "status": "failed", "failure_reason": reason,
+                        }
+                    checkpoint_status = "failed" if reason else "done"
+                    payload = {
+                        "company": company.model_dump(mode="json"),
+                        "reason": reason,
+                        "completeness": company.research_outcomes.get("_summary") or completeness,
+                    }
                     if reason:
-                        if reason == "complete_with_gaps":
-                            payload["reason"] = None
-                            payload["completeness"] = company.research_outcomes.get("_summary")
-                        else:
-                            payload["provider_error"] = _enrichment_failure_metadata(reason, rid)
+                        payload["provider_error"] = _enrichment_failure_metadata(reason, rid)
                     if checkpoint_save and not checkpoint_save(
                         checkpoint_key, checkpoint_status,
                         payload,
                     ):
                         raise asyncio.CancelledError()
+                except (GeminiQuotaBlocked, GeminiRetryLater) as exc:
+                    if checkpoint_save and not checkpoint_save(
+                        checkpoint_key, "queued",
+                        {"company": company.model_dump(mode="json"), "reason": str(exc),
+                         "provider_error": _enrichment_failure_metadata(str(exc), rid, exc),
+                         "retry_after_seconds": getattr(exc, "retry_after", None)
+                         or getattr(exc, "delay_seconds", None)},
+                    ):
+                        raise asyncio.CancelledError()
+                    raise
                 except asyncio.TimeoutError:
                     reason = "timeout"
                     failures[reason] = failures.get(reason, 0) + 1
@@ -874,6 +909,14 @@ async def resume_stalled(
         ) - (len(companies) - len(todo)))
         stats.enrich_skipped = len(companies) - len(todo)
         stats.enrich_failures = failures
+        stats.enrich_partial = sum(
+            summary.get("status") == "partial"
+            for summary in stats.enrichment_summary.values()
+        )
+        stats.enrich_needs_review = sum(
+            summary.get("status") == "needs_review"
+            for summary in stats.enrichment_summary.values()
+        )
 
         for c in companies:
             db.upsert_company(conn, c)

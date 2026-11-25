@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -11,23 +13,35 @@ from typing import Any
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
+def _gcloud_command(*args: str) -> list[str]:
+    override = (os.environ.get("CSG_GCLOUD_PYTHON") or "").strip()
+    if override:
+        return ["python", override, *args]
+    if shutil.which("gcloud"):
+        return ["gcloud", *args]
+    return ["python", "C:\\gcloud\\google-cloud-sdk\\lib\\gcloud.py", *args]
+
+
+def _run_json(args: list[str]) -> dict[str, Any]:
+    completed = subprocess.run([*_gcloud_command(*args), "--format=json"], check=True, capture_output=True, text=True)
+    return json.loads(completed.stdout)
+
+
 class ProvenanceError(RuntimeError):
     pass
 
 
-def _run_json(command: list[str]) -> dict[str, Any]:
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
-    return json.loads(completed.stdout)
-
-
 def extract_artifact_digest(artifact: dict[str, Any]) -> str:
     summary = artifact.get("image_summary") or artifact.get("imageSummary") or {}
+    metadata = artifact.get("metadata") or {}
     candidates = (
         artifact.get("digest"),
         summary.get("digest"),
         artifact.get("imageName"),
         artifact.get("name"),
         artifact.get("uri"),
+        metadata.get("name"),
+        artifact.get("version"),
     )
     for candidate in candidates:
         if isinstance(candidate, str):
@@ -127,6 +141,15 @@ def validate_build_provenance(
     }
 
 
+def _list_artifact_images(artifact_path: str) -> list[dict[str, Any]]:
+    """List images in an Artifact Registry repository/image path."""
+    result = _run_json([
+        "artifacts", "docker", "images", "list", artifact_path, "--include-tags",
+    ])
+    images = result.get("dockerImages") if isinstance(result, dict) else result
+    return [image for image in (images or []) if isinstance(image, dict)]
+
+
 def inspect_local_labels(image_ref: str) -> dict[str, str]:
     result = subprocess.run(
         ["docker", "image", "inspect", image_ref],
@@ -158,10 +181,17 @@ def main() -> int:
 
     try:
         artifact_ref = args.artifact_ref
-        described = _run_json([
-            "gcloud", "artifacts", "docker", "images", "describe",
-            artifact_ref, "--format=json",
-        ])
+        artifact_path, image_tag = artifact_ref.split(":", 1)
+        matches = [
+            image
+            for image in _list_artifact_images(artifact_path)
+            if image_tag in (image.get("tags") or [])
+        ]
+        if len(matches) != 1:
+            raise ProvenanceError(
+                f"Artifact Registry lookup for {artifact_tag} in {artifact_path} returned {len(matches)} matches"
+            )
+        described = matches[0]
         image_digest = extract_artifact_digest(described)
         if args.skip_build_metadata:
             result = {
@@ -174,7 +204,7 @@ def main() -> int:
         artifact = described
 
         build = _run_json([
-            "gcloud", "builds", "describe", args.build_id, "--format=json",
+            "builds", "describe", args.build_id, "--format=json",
         ])
         local_labels = inspect_local_labels(args.local_image) if args.local_image else None
         result = validate_build_provenance(

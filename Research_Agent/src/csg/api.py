@@ -27,6 +27,7 @@ from . import export_excel, export_pdf
 from .ats import normalize_domain
 from .config import load_config, update_icp_basics
 from .discovery import DiscoveryError
+from .discovery.research import present_stored_enrichment_summary
 from . import jobs
 from .diagnostics import log_event
 from .gemini_queue import GeminiQuotaBlocked, GeminiRetryLater, resume_global_quota, scheduler_status
@@ -743,8 +744,12 @@ def company_detail(run_id: str, domain: str) -> dict[str, Any]:
         qual_attempt = db.get_qualification_attempt(conn, domain, effective_run_id) if effective_run_id else None
         people = db.get_contacts(conn, domain)
         research_assessment = db.latest_research_assessment(conn, domain)
+        company_payload = company.model_dump()
+        company_payload["research_outcomes"] = present_stored_enrichment_summary(
+            company_payload.get("research_outcomes") or {},
+        )
         return {
-            "company": company.model_dump(),
+            "company": company_payload,
             "score": scores[0] if scores else None,
             "postings": [p.model_dump(mode="json") for p in postings],
             "qualification": qual,

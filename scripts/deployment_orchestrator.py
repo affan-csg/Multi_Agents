@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -59,8 +60,24 @@ def require_digest(image: str) -> str:
     return normalize_digest(digest)
 
 
+def gcloud_command(*args: str) -> list[str]:
+    """Resolve the gcloud CLI invocation.
+
+    Prefers an operator-overridable path via ``CSG_GCLOUD_PYTHON`` (or a
+    ``gcloud`` on PATH), and falls back to the Google Cloud SDK's Python
+    entrypoint so the orchestrator runs on hosts without a shell-script-safe
+    ``gcloud`` binary (CI containers, Windows).
+    """
+    override = (os.environ.get("CSG_GCLOUD_PYTHON") or "").strip()
+    if override:
+        return ["python", override, *args]
+    if shutil.which("gcloud"):
+        return ["gcloud", *args]
+    return ["python", "C:\\gcloud\\google-cloud-sdk\\lib\\gcloud.py", *args]
+
+
 def gcloud_json(args: list[str]) -> dict:
-    result = run(["gcloud", *args, "--format=json"])
+    result = run([*gcloud_command(*args), "--format=json"])
     return json.loads(result.stdout)
 
 
@@ -93,7 +110,7 @@ def mint_identity_token(audience: str) -> str:
     identity that must invoke the private service (it needs
     iam.serviceAccounts.getOpenIdToken on that account).
     """
-    command = ["gcloud", "auth", "print-identity-token", f"--audiences={audience}"]
+    command = list(gcloud_command("auth", "print-identity-token", f"--audiences={audience}"))
     impersonate = (os.environ.get("DEPLOYMENT_INVOKER_SERVICE_ACCOUNT") or "").strip()
     if impersonate:
         command.append(f"--impersonate-service-account={impersonate}")
@@ -305,7 +322,7 @@ def deploy_revision(
             resolved_digest = None
 
     command = [
-        "gcloud", "run", "deploy", service,
+        *gcloud_command("run", "deploy", service),
         "--region", region,
         "--project", project,
         "--image", image,
@@ -324,7 +341,7 @@ def deploy_revision(
 
 def switch_traffic(service: str, revision: str, region: str, project: str) -> None:
     run([
-        "gcloud", "run", "services", "update-traffic", service,
+        *gcloud_command("run", "services", "update-traffic", service),
         "--region", region,
         "--project", project,
         "--to-revisions", f"{revision}=100",

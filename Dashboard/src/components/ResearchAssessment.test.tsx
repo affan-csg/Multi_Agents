@@ -72,6 +72,44 @@ describe("ResearchAssessmentPanel", () => {
     expect(html).toContain("1 unique record");
   });
 
+  it("shows a historical field-level failure as partial research, not a processing failure", () => {
+    const html = renderToStaticMarkup(
+      <ResearchAssessmentPanel
+        assessment={null}
+        outcomes={{
+          employee_range: { status: "accepted_and_mapped", criterion: "automatic_company_size" },
+          funding: { status: "searched_but_not_found", reason: "No reliable information was returned" },
+          _summary: {
+            status: "failed",
+            failure_reason: "incomplete_result",
+            missing_fields: { funding: "No reliable information was returned" },
+            blocking_fields: {},
+          },
+        }}
+      />,
+    );
+
+    expect(html).toContain("Partially researched");
+    expect(html).toContain("Verified and recorded");
+    expect(html).toContain("Not available");
+    expect(html).not.toContain("Failed during research processing");
+    expect(html).not.toContain("incomplete result");
+  });
+
+  it("keeps a quota failure visible and separate from readiness", () => {
+    const html = renderToStaticMarkup(
+      <ResearchAssessmentPanel
+        assessment={{ ...assessment, readiness_status: "unverified_pipeline" }}
+        outcomes={{
+          _summary: { status: "failed", failure_reason: "quota_exhausted", missing_fields: {}, blocking_fields: {} },
+        }}
+      />,
+    );
+
+    expect(html).toContain("Failed during research processing (quota exhausted)");
+    expect(html).toContain("Unverified Pipeline");
+  });
+
   it("shows legacy or missing assessment as unavailable instead of inventing a status", () => {
     const html = renderToStaticMarkup(<ResearchAssessmentPanel assessment={null} />);
     expect(html).toContain("No research assessment is available");

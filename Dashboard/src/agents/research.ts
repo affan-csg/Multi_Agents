@@ -19,9 +19,10 @@ export interface ProvenanceValue<T> {
 }
 
 export interface EnrichmentCompanySummary {
-  status: "complete" | "complete_with_gaps" | "partial" | "failed";
+  status: "complete" | "complete_with_gaps" | "partial" | "needs_review" | "failed";
   missing_fields: Record<string, string>;
   blocking_fields: Record<string, string>;
+  review_fields?: Record<string, string>;
   failure_reason?: string;
 }
 
@@ -68,6 +69,7 @@ export interface RunResult {
   enrich_skipped?: number;
   enrich_failures?: Record<string, number>;
   enrich_partial?: number;
+  enrich_needs_review?: number;
   enrich_complete_with_gaps?: number;
   enrichment_summary?: Record<string, EnrichmentCompanySummary>;
   exports?: Record<string, string>;
@@ -199,6 +201,16 @@ export interface CompanyEvidence {
   unavailable_reason: string | null;
 }
 
+export interface CompanyResearchEvidence {
+  evidence_key?: string;
+  field?: string;
+  claim?: Record<string, unknown>;
+  source_url?: string | null;
+  excerpt?: string | null;
+  evidence_type?: string;
+  confidence?: string;
+}
+
 export interface CompanyResearchAssessmentSummary {
   assessment_id: string;
   domain: string;
@@ -258,13 +270,19 @@ export interface CompanyDetail {
     website?: ProvenanceValue<string> | null;
     headquarters?: ProvenanceValue<{ city?: string; state?: string; country?: string }> | null;
     company_type?: ProvenanceValue<string> | null;
-    research_evidence?: Array<Record<string, unknown>>;
+    research_evidence?: CompanyResearchEvidence[];
     research_outcomes?: Record<string, {
-      status: "not_searched" | "searched_but_not_found" | "found_but_rejected" | "accepted_and_mapped";
-      criterion: string;
+      status?: "not_searched" | "searched_but_not_found" | "found_but_rejected" | "accepted_and_mapped"
+        | "complete" | "complete_with_gaps" | "partial" | "needs_review" | "failed";
+      criterion?: string;
       checked_at?: string;
       reason?: string;
       evidence_keys?: string[];
+      missing_fields?: Record<string, string>;
+      review_fields?: Record<string, string>;
+      blocking_fields?: Record<string, string>;
+      failure_reason?: string;
+      missing?: string[];
     }>;
     employee_count: ProvenanceValue<number> | null;
     revenue: ProvenanceValue<string> | null;

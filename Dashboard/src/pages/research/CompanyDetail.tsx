@@ -34,6 +34,15 @@ function identityValue<T>(p: ProvenanceValue<T> | null | undefined): string | nu
   return null;
 }
 
+function unavailableTitle(field: string, reason?: string, review = false): string {
+  const label = review ? "Needs review" : "Not available";
+  return reason ? `${field}: ${label}. ${reason}` : `${field}: ${label}; no verified value is recorded.`;
+}
+
+function gapLabel(status?: string): string {
+  return status === "found_but_rejected" ? "Needs review" : "Not available";
+}
+
 interface Props {
   runId: string;
   domain: string;
@@ -103,27 +112,27 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
           </div>
           {company.description && <p className="detail-description" style={{ marginTop: 8, color: "var(--text-faint)" }}>{company.description}</p>}
           <div className="detail-meta-row" style={{ marginTop: 12 }}>
-            {company.employee_count && (
-              <span className="meta-chip" title={provenanceTitle(company.employee_count)}>
-                <Icon name="users" size={14} />
-                {company.employee_count.value.toLocaleString()} emp.
-                {estimateMark(company.employee_count)}
-              </span>
-            )}
-            {company.revenue && (
-              <span className="meta-chip" title={provenanceTitle(company.revenue)}>
-                <Icon name="briefcase" size={14} />
-                {company.revenue.value} (Rev)
-                {estimateMark(company.revenue)}
-              </span>
-            )}
-            {company.funding && (
-              <span className="meta-chip" title={provenanceTitle(company.funding)}>
-                <Icon name="chart" size={14} />
-                {company.funding.value} (Fund)
-                {estimateMark(company.funding)}
-              </span>
-            )}
+            <span className="meta-chip" title={company.employee_count
+              ? provenanceTitle(company.employee_count)
+              : unavailableTitle("Employee count", company.research_outcomes?.employee_range?.reason, company.research_outcomes?.employee_range?.status === "found_but_rejected")}>
+              <Icon name="users" size={14} />
+              Employees: {company.employee_count ? company.employee_count.value.toLocaleString() : gapLabel(company.research_outcomes?.employee_range?.status)}
+              {company.employee_count && estimateMark(company.employee_count)}
+            </span>
+            <span className="meta-chip" title={company.revenue
+              ? provenanceTitle(company.revenue)
+              : unavailableTitle("Revenue", company.research_outcomes?.revenue?.reason, company.research_outcomes?.revenue?.status === "found_but_rejected")}>
+              <Icon name="briefcase" size={14} />
+              Revenue: {company.revenue?.value || gapLabel(company.research_outcomes?.revenue?.status)}
+              {company.revenue && estimateMark(company.revenue)}
+            </span>
+            <span className="meta-chip" title={company.funding
+              ? provenanceTitle(company.funding)
+              : unavailableTitle("Funding", company.research_outcomes?.funding?.reason, company.research_outcomes?.funding?.status === "found_but_rejected")}>
+              <Icon name="chart" size={14} />
+              Funding: {company.funding?.value || gapLabel(company.research_outcomes?.funding?.status)}
+              {company.funding && estimateMark(company.funding)}
+            </span>
           </div>
           {(company.website || company.headquarters || company.company_type) && (
             <div className="detail-meta-row" style={{ marginTop: 12 }}>
@@ -170,7 +179,11 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
         </button>
       </div>
 
-      <ResearchAssessmentPanel assessment={detail.research_assessment} outcomes={company.research_outcomes} />
+      <ResearchAssessmentPanel
+        assessment={detail.research_assessment}
+        outcomes={company.research_outcomes}
+        researchEvidence={company.research_evidence}
+      />
 
       <div className="detail-grid">
         <div className="card">

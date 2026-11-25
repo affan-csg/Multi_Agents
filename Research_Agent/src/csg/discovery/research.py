@@ -43,6 +43,14 @@ _GEMINI_RATE_LIMIT_RETRIES = 1
 _GEMINI_RATE_LIMIT_RETRY_DELAY = 2.0
 _ENRICH_RETRY_DELAY_CAP_SECONDS = 30.0
 
+_FIELD_LEVEL_ENRICHMENT_REASONS = frozenset({
+    "complete_with_gaps", "incomplete_result", "ungrounded_response",
+    "partial", "needs_review",
+})
+_TERMINAL_ENRICHMENT_STATUSES = frozenset({
+    "complete", "complete_with_gaps", "partial", "needs_review",
+})
+
 _FIELD_CRITERIA = {
     "official_website": "automatic_website",
     "headquarters": "automatic_headquarters",
@@ -155,6 +163,7 @@ def enrichment_completeness(company: Company) -> dict[str, Any]:
     """Summarize terminal field outcomes without treating unavailable facts as successes."""
     missing: dict[str, str] = {}
     blocking: dict[str, str] = {}
+    review: dict[str, str] = {}
     response_missing_data = company.research_outcomes.get("_missing_response_fields") or {}
     if isinstance(response_missing_data, dict):
         response_missing = response_missing_data.get("missing") or []
@@ -178,14 +187,88 @@ def enrichment_completeness(company: Company) -> dict[str, Any]:
         if status == "searched_but_not_found":
             missing[field] = reason or "No reliable information was returned"
             continue
+        if status == "found_but_rejected":
+            reason = reason or "The returned claim could not be verified"
+            review[field] = reason
+            missing[field] = reason
+            blocking[field] = reason
+            continue
         blocking[field] = reason or {
             "not_returned": "The provider omitted this required field",
             "found_but_rejected": "The returned claim failed validation",
             "not_searched": "The field was not searched",
         }.get(status, f"Research outcome is incomplete ({status or 'missing status'})")
         missing[field] = blocking[field]
-    status = "partial" if blocking else ("complete_with_gaps" if missing else "complete")
-    return {"status": status, "missing_fields": missing, "blocking_fields": blocking}
+    status = (
+        "needs_review" if review else
+        "partial" if blocking else
+        "complete_with_gaps" if missing else "complete"
+    )
+    return {
+        "status": status,
+        "missing_fields": missing,
+        "blocking_fields": blocking,
+        "review_fields": review,
+    }
+
+
+def is_field_level_enrichment_reason(reason: Any) -> bool:
+    """True when a saved reason describes field evidence, not a provider outage."""
+    return reason in _FIELD_LEVEL_ENRICHMENT_REASONS
+
+
+def stored_enrichment_is_terminal(summary: Any) -> bool:
+    """Persisted research that should not be run again.
+
+    Older runs stored useful partial research as ``failed`` with a field-level
+    reason such as ``incomplete_result``. That is finished research. Quota,
+    timeout, parse, and transport failures stay non-terminal.
+    """
+    if not isinstance(summary, dict):
+        return False
+    status = summary.get("status")
+    if status in _TERMINAL_ENRICHMENT_STATUSES:
+        return True
+    return status == "failed" and is_field_level_enrichment_reason(summary.get("failure_reason"))
+
+
+def present_stored_enrichment_summary(outcomes: Any) -> dict[str, Any]:
+    """Copy stored outcomes so a field-level result is not labeled as a failure.
+
+    The input is not mutated. Operational failures keep ``status=failed`` and
+    their ``failure_reason``.
+    """
+    if not isinstance(outcomes, dict):
+        return {}
+    summary = outcomes.get("_summary")
+    if not isinstance(summary, dict):
+        return outcomes
+    status = summary.get("status")
+    reason = summary.get("failure_reason")
+    if status in _TERMINAL_ENRICHMENT_STATUSES:
+        if not is_field_level_enrichment_reason(reason) or "failure_reason" not in summary:
+            return outcomes
+        cleaned = {key: value for key, value in summary.items() if key != "failure_reason"}
+        return {**outcomes, "_summary": cleaned}
+    if status != "failed" or not is_field_level_enrichment_reason(reason):
+        return outcomes
+    field_rows = [name for name in _FIELD_CRITERIA if isinstance(outcomes.get(name), dict)]
+    if not field_rows:
+        mapped = {
+            "incomplete_result": "partial",
+            "ungrounded_response": "needs_review",
+            "complete_with_gaps": "complete_with_gaps",
+            "partial": "partial",
+            "needs_review": "needs_review",
+        }[reason]
+        cleaned = {key: value for key, value in summary.items() if key != "failure_reason"}
+        cleaned["status"] = mapped
+        return {**outcomes, "_summary": cleaned}
+    company = Company(
+        domain="stored.example",
+        research_outcomes={key: value for key, value in outcomes.items() if key != "_summary"},
+    )
+    return {**outcomes, "_summary": enrichment_completeness(company)}
 
 
 def _is_gemini_transient_rate_limit(exc: Exception) -> bool:
@@ -1523,8 +1606,10 @@ async def enrich_company_firmographics(
             if isinstance((outcome := company.research_outcomes.get(field)), dict)
         }
         if grounding_invalid:
-            completeness["status"] = "partial" if accepted_fields else "failed"
-            completeness["failure_reason"] = "ungrounded_response"
+            completeness["status"] = "needs_review"
+            completeness.setdefault("review_fields", {})["grounding"] = (
+                "One or more claims did not meet the grounding requirements"
+            )
         company.research_outcomes["_summary"] = completeness
         log_event(
             "gemini_enrichment_outcomes", domain=company.domain, run_id=run_id,
@@ -1540,17 +1625,14 @@ async def enrich_company_firmographics(
                 rejected_fields=rejected_fields,
                 reason="missing_or_unverified_grounding",
             )
-        if grounding_invalid:
-            return "ungrounded_response"
-        if completeness["status"] == "partial":
-            return "incomplete_result"
         if completeness["status"] == "complete_with_gaps":
             print(f"  [OK] Enriched {company.domain} with documented gaps")
-            return "complete_with_gaps"
-        if completeness["status"] == "failed":
-            print(f"  [FAILED] No grounded firmographic fields accepted for {company.domain}")
-            return "incomplete_result"
-        print(f"  [OK] Enriched {company.domain}")
+        elif completeness["status"] == "needs_review":
+            print(f"  [OK] Researched {company.domain}; some fields need review")
+        elif completeness["status"] == "partial":
+            print(f"  [OK] Partially researched {company.domain}")
+        else:
+            print(f"  [OK] Enriched {company.domain}")
         return None
 
     except json.JSONDecodeError as e:

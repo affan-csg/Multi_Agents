@@ -7,7 +7,6 @@ import {
   type DiscoverRequest,
   type JobSnapshot as ResearchJobSnapshot,
   type RegionOptions,
-  type RunResult,
   type RunSummary,
   type SavedCompany,
   type ScoredCompany,
@@ -38,7 +37,7 @@ import { Analytics as OutreachAnalytics } from "./pages/outreach/Analytics";
 import { Learning as OutreachLearning } from "./pages/outreach/Learning";
 import { useRoute } from "./router";
 import { getStoredActiveResearchJobId, JobMonitor } from "./jobMonitor";
-import { formatCompanyOutcome } from "./discoverOutcome";
+import { describeDiscoverResult } from "./discoverResult";
 import "./App.css";
 
 type PendingAction = { kind: "qualify" | "contacts"; domains?: string[] };
@@ -160,132 +159,6 @@ function App() {
     } catch {
       setSaved(previous);
     }
-  }
-
-  // Builds the toast body for a finished "discover" job -- the run itself
-  // always either fully failed (job.status === "error", handled by the
-  // caller) or fully succeeded, but the optional auto-qualify-top add-on
-  // (qualify + Hunter.io contacts for the top N) can partially fail on its
-  // own without failing the run -- see discover.py's _auto_qualify_and_contact,
-  // which records {"error": ...} on stats.qualify/contacts rather than
-  // raising. Surface that distinction instead of a blanket "success".
-  function describeDiscoverResult(result: RunResult | Record<string, unknown> | null): { tone: ToastData["tone"]; message: string } {
-    const r = (result || {}) as Partial<RunResult>;
-    const parts: string[] = [];
-    const problems: string[] = [];
-
-    if (typeof r.discovered === "number") {
-      parts.push(`${r.discovered} compan${r.discovered === 1 ? "y" : "ies"} discovered`);
-    }
-    if (typeof r.scored === "number") {
-      parts.push(`${r.scored} scored`);
-    }
-    if (typeof r.enrich_partial === "number" && r.enrich_partial > 0) {
-      parts.push(`${r.enrich_partial} partially enriched`);
-    }
-    if (r.tiers) {
-      const ab = (r.tiers.A ?? 0) + (r.tiers.B ?? 0);
-      if (ab > 0) parts.push(`${ab} Tier A/B`);
-    }
-
-    // Enrichment (Gemini firmographics) failing for every company usually means
-    // a missing/exhausted API key -- surface it plainly instead of the run just
-    // silently coming back with no employee/revenue data and no explanation.
-    const ENRICH_FAILURE_LABEL: Record<string, string> = {
-      no_api_key: "no GEMINI_API_KEY configured",
-      quota_exhausted: "A provider quota limit was reached — see provider usage details",
-      rate_limited: "rate limited (429) — retries exhausted",
-      connection_error: "connection/TLS error reaching the API",
-      timeout: "request timed out",
-      parse_error: "enrichment response could not be parsed",
-      request_error: "enrichment request failed",
-    };
-    if (r.enrich_failures && typeof r.enrich_failures === "object") {
-      const total = Object.values(r.enrich_failures).reduce((a, b) => a + (b || 0), 0);
-      if (total > 0) {
-        const reasons = Object.entries(r.enrich_failures)
-          .filter(([, n]) => n > 0)
-          .map(([reason, n]) => `${ENRICH_FAILURE_LABEL[reason] || reason} (${n})`);
-        problems.push(`Enrichment skipped for ${total} compan${total === 1 ? "y" : "ies"}: ${reasons.join(", ")}`);
-      }
-    }
-    const enrichmentSummary = r.enrichment_summary;
-    if (enrichmentSummary && typeof enrichmentSummary === "object") {
-      const entries = Object.entries(enrichmentSummary);
-      const completeCount = entries.filter(([, item]) => item.status === "complete").length;
-      if (completeCount > 0) parts.push(`${completeCount} fully enriched`);
-      const incomplete = entries.filter(([, item]) => item.status !== "complete");
-      if (incomplete.length > 0) {
-        const details = incomplete.slice(0, 8).map(([domain, item]) => {
-          const reasons = Object.entries(item.missing_fields || {})
-            .map(([field, reason]) => `${field}: ${reason}`);
-          return `${domain} (${item.status}${reasons.length ? `; ${reasons.join(", ")}` : ""})`;
-        });
-        if (incomplete.length > details.length) {
-          details.push(`${incomplete.length - details.length} more company result(s) in run details`);
-        }
-        problems.push(`Firmographic completeness: ${details.join(" | ")}`);
-      }
-    }
-
-    const companyOutcomes = Array.isArray(r.company_outcomes) ? r.company_outcomes : [];
-    if (companyOutcomes.length > 0) {
-      for (const outcome of companyOutcomes.slice(0, 5)) {
-        const formatted = formatCompanyOutcome(outcome);
-        (formatted.tone === "error" ? problems : parts).push(formatted.message);
-      }
-      if (companyOutcomes.length > 5) {
-        parts.push(`${companyOutcomes.length - 5} more company outcomes in run details`);
-      }
-    } else if (r.existing_matches?.length) {
-      parts.push(`${r.existing_matches.length} existing compan${r.existing_matches.length === 1 ? "y" : "ies"} matched and not reprocessed`);
-    } else if (r.scored === 0 && (r.discovered ?? 0) > 0) {
-      problems.push("No per-company processing outcomes were returned; inspect the run records for the precise reason.");
-    }
-
-    // Fill Pain / Hiring Need / Buying Signals / CSG Delivery Fit are entirely
-    // job-posting-derived -- a company with no confirmed job signal scores
-    // those at 0 and is capped near D-tier regardless of how good a fit it
-    // actually is. ATS detection is just the first (highest-precision) rung
-    // of a fallback chain -- careers-page scraping and an external web
-    // search are tried before a company is ever marked UNKNOWN -- so
-    // hiring_signal_unknown (every method exhausted), not no_ats (no ATS
-    // board specifically), is what actually means "we have no real job
-    // signal for this company." See Research_Agent's jobs_discovery.py and
-    // WORKFLOW.md's ATS detection section for the full chain.
-    if (typeof r.hiring_signal_unknown === "number" && typeof r.scored === "number" && r.scored > 0) {
-      const total = r.scored + (r.disqualified ?? 0);
-      if (total > 0 && r.hiring_signal_unknown / total >= 0.5) {
-        problems.push(
-          `${r.hiring_signal_unknown} of ${total} compan${total === 1 ? "y" : "ies"} had no confirmed job signal ` +
-          `after checking ATS, their careers page, and an external search -- ` +
-          `their scores are capped low regardless of fit (job-posting signal counts for most of the score). ` +
-          `Not necessarily a sign these are poor-fit companies.`,
-        );
-      }
-    }
-
-    const qualify = r.qualify as { qualified: number; errors: number; error?: string } | undefined;
-    const contacts = r.contacts as { found: number; contacts_saved: number; error?: string } | undefined;
-
-    if (qualify && "error" in qualify && qualify.error) {
-      problems.push(`Qualify step failed: ${qualify.error}`);
-    } else if (qualify && qualify.qualified) {
-      parts.push(`${qualify.qualified} qualified`);
-      if (qualify.errors) problems.push(`${qualify.errors} qualification lookup(s) failed`);
-    }
-
-    if (contacts && "error" in contacts && contacts.error) {
-      problems.push(`Contacts step failed: ${contacts.error}`);
-    } else if (contacts && contacts.contacts_saved) {
-      parts.push(`${contacts.contacts_saved} contact(s) found`);
-    }
-
-    const summary = parts.length ? parts.join(" · ") : "Run completed.";
-    if (problems.length) {
-      return { tone: "error", message: `${summary}\n${problems.join("\n")}` };
-    }
-    return { tone: "success", message: summary };
   }
 
   const watchJob = useCallback((jobId: string) => {

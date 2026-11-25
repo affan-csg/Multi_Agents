@@ -643,12 +643,18 @@ def stalled_companies(conn: SupabaseConn, run_id: str) -> list[str]:
 
     if found_checkpoints:
         failed = []
+        from .discovery.research import is_field_level_enrichment_reason
+
         for domain, (checkpoint, job_status) in latest.items():
             status = checkpoint.get("status")
             reason = (checkpoint.get("payload") or {}).get("reason")
+            # A field-level reason means the research finished. Quota, timeout,
+            # parse, and transport failures stay resumable.
+            operational = bool(reason) and not is_field_level_enrichment_reason(reason)
             if (
-                status in {"failed", "queued"}
-                or (status == "done" and reason)
+                status == "queued"
+                or (status == "failed" and (operational or not reason))
+                or (status == "done" and operational)
                 or (status == "started" and job_status in {"done", "error", "cancelled"})
             ):
                 failed.append(domain)

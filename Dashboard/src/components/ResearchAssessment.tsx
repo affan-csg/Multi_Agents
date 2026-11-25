@@ -1,5 +1,6 @@
 import type {
   CompanyEvidence,
+  CompanyResearchEvidence,
   CompanyResearchAssessment,
   CompanyResearchAssessmentSummary,
 } from "../agents/research";
@@ -59,22 +60,108 @@ const RESEARCH_FIELDS: Array<[string, string]> = [
   ["leadership", "Leadership"],
   ["services", "Services"],
   ["hiring_service_fit", "Hiring and service fit"],
+  ["revenue", "Revenue"],
+  ["funding", "Funding"],
+  ["industry", "Industry"],
+  ["description", "Company description"],
 ];
 
 type ResearchOutcomes = NonNullable<CompanyDetail["company"]["research_outcomes"]>;
 
+const FIELD_STATUS_LABEL: Record<string, string> = {
+  accepted_and_mapped: "Verified and recorded",
+  searched_but_not_found: "Not available",
+  not_searched: "Not researched",
+  not_returned: "Not returned by provider",
+  found_but_rejected: "Needs review",
+};
+
+const ENRICHMENT_STATUS_LABEL: Record<string, string> = {
+  complete: "Completed",
+  complete_with_gaps: "Completed with unavailable fields",
+  partial: "Partially researched",
+  needs_review: "Needs review",
+  failed: "Failed during research processing",
+};
+
+const FIELD_LEVEL_ENRICH_FAILURES: Record<string, string> = {
+  incomplete_result: "partial",
+  ungrounded_response: "needs_review",
+  complete_with_gaps: "complete_with_gaps",
+  partial: "partial",
+  needs_review: "needs_review",
+};
+
+function presentedEnrichmentStatus(status?: string, failureReason?: string): string | undefined {
+  if (status === "failed" && failureReason && FIELD_LEVEL_ENRICH_FAILURES[failureReason]) {
+    return FIELD_LEVEL_ENRICH_FAILURES[failureReason];
+  }
+  return status;
+}
+
+function FieldResearchOutcomes({
+  outcomes,
+  researchEvidence,
+}: {
+  outcomes?: ResearchOutcomes;
+  researchEvidence?: CompanyResearchEvidence[];
+}) {
+  if ((!outcomes || Object.keys(outcomes).length === 0) && !researchEvidence?.length) return null;
+  const overallStatus = presentedEnrichmentStatus(
+    outcomes?._summary?.status,
+    outcomes?._summary?.failure_reason,
+  );
+  const overallReason = overallStatus === "failed" ? outcomes?._summary?.failure_reason : undefined;
+  return (
+    <div className="assessment-block">
+      <h4>Field research outcomes</h4>
+      {overallStatus && <p className="assessment-muted">
+        Firmographic research: {ENRICHMENT_STATUS_LABEL[overallStatus] || formatAssessmentValue(overallStatus)}
+        {overallReason ? ` (${overallReason.replaceAll("_", " ")})` : ""}
+      </p>}
+      <ul className="assessment-criteria">
+        {RESEARCH_FIELDS.map(([field, label]) => {
+          const outcome = outcomes?.[field];
+          const evidence = researchEvidence?.filter((item) => item.field === field) || [];
+          if (!outcome && evidence.length === 0) return null;
+          return <li key={field}>
+            <span>{label}</span>
+            <strong>{outcome?.status ? FIELD_STATUS_LABEL[outcome.status] || formatAssessmentValue(outcome.status) : "Not recorded"}</strong>
+            {outcome?.reason && <small>{outcome.reason}</small>}
+            {evidence.map((item, index) => {
+              const claim = item.claim
+                ? Object.entries(item.claim).map(([key, value]) => `${key.replaceAll("_", " ")}: ${String(value)}`).join("; ")
+                : "";
+              return <small key={`${field}-${index}`}>
+                {claim && <>{claim}{item.excerpt ? " · " : ""}</>}
+                {item.excerpt || "Evidence excerpt not recorded."}
+                {item.source_url
+                  ? <> · <a href={item.source_url} target="_blank" rel="noreferrer">Source</a></>
+                  : " · Source URL unavailable"}
+              </small>;
+            })}
+          </li>;
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export function ResearchAssessmentPanel({
   assessment,
   outcomes,
+  researchEvidence,
 }: {
   assessment: CompanyResearchAssessment | null | undefined;
   outcomes?: ResearchOutcomes;
+  researchEvidence?: CompanyResearchEvidence[];
 }) {
   if (!assessment) {
     return (
       <section className="card research-assessment" aria-label="Company research assessment">
         <h3 className="card-title">Company targeting & research assessment</h3>
         <p className="assessment-muted">No research assessment is available. This may be a legacy company record or an assessment has not been recorded.</p>
+        <FieldResearchOutcomes outcomes={outcomes} researchEvidence={researchEvidence} />
       </section>
     );
   }
@@ -145,22 +232,7 @@ export function ResearchAssessmentPanel({
         </ul>
       </div>
 
-      {outcomes && Object.keys(outcomes).length > 0 && (
-        <div className="assessment-block">
-          <h4>Field research outcomes</h4>
-          <ul className="assessment-criteria">
-            {RESEARCH_FIELDS.map(([field, label]) => {
-              const outcome = outcomes[field];
-              if (!outcome) return null;
-              return <li key={field}>
-                <span>{label}</span>
-                <strong>{formatAssessmentValue(outcome.status)}</strong>
-                {outcome.reason && <small>{outcome.reason}</small>}
-              </li>;
-            })}
-          </ul>
-        </div>
-      )}
+      <FieldResearchOutcomes outcomes={outcomes} researchEvidence={researchEvidence} />
 
       <div className="assessment-block">
         <h4>Evidence records</h4>

@@ -295,12 +295,12 @@ def test_mixed_enrichment_attempts_each_company_and_keeps_distinct_outcomes(monk
 
     assert set(calls) == {"complete.example", "partial.example"}
     assert skipped == 0
-    assert failures == {"incomplete_result": 1}
+    assert failures == {}
     assert checkpoints["enrich:complete.example"]["status"] == "done"
-    assert checkpoints["enrich:partial.example"]["status"] == "failed"
+    assert checkpoints["enrich:partial.example"]["status"] == "done"
     assert pairs[0][1].research_outcomes["_summary"]["status"] == "complete"
-    assert pairs[1][1].research_outcomes["_summary"]["status"] == "failed"
-    assert pairs[1][1].research_outcomes["_summary"]["failure_reason"] == "incomplete_result"
+    assert pairs[1][1].research_outcomes["_summary"]["status"] == "partial"
+    assert "failure_reason" not in pairs[1][1].research_outcomes["_summary"]
 
 
 def test_partial_firmographics_are_checkpointed_and_available_on_retry(monkeypatch):
@@ -328,7 +328,7 @@ def test_partial_firmographics_are_checkpointed_and_available_on_retry(monkeypat
             assert company.employee_count is not None
             assert company.employee_count.value == 500
             assert company.research_evidence[0]["evidence_key"] == "valid-evidence"
-        return "ungrounded_response"
+        return "partial"
 
     monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
 
@@ -345,14 +345,14 @@ def test_partial_firmographics_are_checkpointed_and_available_on_retry(monkeypat
     assert checkpoint_company["employee_count"]["value"] == 500
     assert checkpoint_company["research_evidence"][0]["evidence_key"] == "valid-evidence"
     assert checkpoint_company["research_outcomes"]["_summary"]["status"] == "partial"
-    assert checkpoints["enrich:partial.example"]["status"] == "failed"
+    assert checkpoints["enrich:partial.example"]["status"] == "done"
 
     second = asyncio.run(discover._enrich_all(
         FakeConn(), [candidate], "GA", None,
         checkpoint_load=lambda key: checkpoints.get(key),
         checkpoint_save=save, run_id="partial-resume",
     ))
-    assert calls == ["partial.example", "partial.example"]
+    assert calls == ["partial.example"]
     assert second[0][0][1].employee_count.value == 500
     assert second[0][0][1].research_evidence[0]["evidence_key"] == "valid-evidence"
     assert second[0][0][1].research_outcomes["_summary"]["status"] == "partial"
@@ -390,6 +390,75 @@ def test_resume_selection_uses_latest_failed_checkpoint_independent_of_ats():
     assert db.stalled_companies(CheckpointConn(), "run-1") == [
         "failed-with-ats.example", "failed.example",
     ]
+
+
+def test_historical_partial_checkpoint_is_not_stalled_or_repeated(monkeypatch):
+    from csg import db
+    from csg.discover import _needs_enrichment
+
+    saved = Company(domain="partial.example", name="Partial", region="US")
+    saved.employee_count = ProvenanceValue(
+        value=500, source="gemini_grounded_search", url="https://partial.example/about",
+        method="reported", confidence="high",
+    )
+    saved.research_outcomes = {
+        field: {"status": "accepted_and_mapped", "criterion": criterion}
+        for field, criterion in research._FIELD_CRITERIA.items()
+    }
+    saved.research_outcomes["funding"] = {
+        "status": "searched_but_not_found", "reason": "No reliable information was returned",
+    }
+    saved.research_outcomes["_summary"] = {
+        "status": "failed",
+        "failure_reason": "incomplete_result",
+        "missing_fields": {"funding": "No reliable information was returned"},
+        "blocking_fields": {},
+    }
+    assert not _needs_enrichment(saved)
+
+    jobs = [{"job_id": "original-job", "status": "done", "created_at": "2026-01-01"}]
+    checkpoints = {
+        "original-job": [
+            {"checkpoint_key": "enrich:partial.example", "status": "failed",
+             "payload": {"reason": "incomplete_result", "company": saved.model_dump(mode="json")}},
+            {"checkpoint_key": "enrich:quota.example", "status": "failed",
+             "payload": {"reason": "quota_exhausted"}},
+        ],
+    }
+
+    class CheckpointConn:
+        def select(self, table, **params):
+            if table == "agent_jobs":
+                return jobs
+            if table == "agent_job_checkpoints":
+                return checkpoints[params["job_id"][3:]]
+            raise AssertionError(table)
+
+    assert db.stalled_companies(CheckpointConn(), "run-1") == ["quota.example"]
+
+    calls = []
+
+    async def enrich(company, **_kwargs):
+        calls.append(company.domain)
+        return "quota_exhausted"
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
+    pairs, skipped, failures = asyncio.run(discover._enrich_all(
+        FakeConn(),
+        [CompanyCandidate(domain="partial.example", name="Partial", source="fake", discovered_at=datetime.now())],
+        "US", None,
+        checkpoint_load=lambda key: {
+            "enrich:partial.example": checkpoints["original-job"][0],
+        }.get(key),
+    ))
+
+    assert calls == []
+    assert skipped == 1
+    assert failures == {}
+    summary = pairs[0][1].research_outcomes["_summary"]
+    assert summary["status"] == "complete_with_gaps"
+    assert pairs[0][1].employee_count.value == 500
+    assert "failure_reason" not in summary
 
 
 def test_resume_stalled_retries_failed_only_and_preserves_success(monkeypatch):
@@ -459,6 +528,41 @@ def test_resume_stalled_retries_failed_only_and_preserves_success(monkeypatch):
     assert saved["enrich:failed.example"]["status"] == "done"
     assert "enrich:success.example" not in saved
     assert stats.enriched == 1
+
+
+def test_resume_stalled_keeps_gemini_quota_failure_queued(monkeypatch):
+    company = Company(domain="quota.example", name="Quota", region="US")
+    checkpoints = {
+        "enrich:quota.example": {
+            "status": "failed",
+            "payload": {"company": company.model_dump(mode="json"), "reason": "quota_exhausted"},
+        },
+    }
+    saved = {}
+
+    class ResumeConn:
+        pass
+
+    monkeypatch.setattr(discover.db, "get_company", lambda _conn, _domain: company)
+
+    async def blocked(company, **_kwargs):
+        raise discover.GeminiQuotaBlocked("monthly_quota", retry_after=60)
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", blocked)
+    with pytest.raises(discover.GeminiQuotaBlocked):
+        asyncio.run(discover.resume_stalled(
+            object(), "run-quota", [company.domain],
+            conn=ResumeConn(),
+            checkpoint_load=lambda key: checkpoints.get(key),
+            checkpoint_save=lambda key, status, payload: saved.update(
+                {key: {"status": status, "payload": payload}}
+            ) is None,
+        ))
+
+    queued = saved["enrich:quota.example"]
+    assert queued["status"] == "queued"
+    assert queued["payload"]["provider_error"]["error_kind"] == "monthly_quota"
+    assert queued["payload"]["retry_after_seconds"] == 60
 
 
 # --- run_discovery end to end (network edges faked) --------------------------
@@ -553,6 +657,44 @@ class _Env:
 @pytest.fixture
 def env(monkeypatch):
     return _Env(monkeypatch, FakeConn())
+
+
+def test_discovery_scores_and_persists_company_with_optional_research_gaps(env, monkeypatch):
+    env.found = [("partial.example", "Partial Example")]
+
+    async def enrich(company):
+        company.employee_count = ProvenanceValue(
+            value=500, source="gemini_grounded_search",
+            url="https://partial.example/about", method="reported", confidence="high",
+        )
+        company.research_outcomes = {
+            field: {
+                "status": "searched_but_not_found",
+                "criterion": criterion,
+                "reason": "No reliable information was returned",
+            }
+            for field, criterion in research._FIELD_CRITERIA.items()
+        }
+        company.research_outcomes["employee_range"] = {
+            "status": "accepted_and_mapped",
+            "criterion": research._FIELD_CRITERIA["employee_range"],
+            "evidence_keys": ["employee-evidence"],
+        }
+        return None
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
+
+    stats = env.run("incomplete-facts-run")
+    saved = next(row for row in env.companies if row["domain"] == "partial.example")
+    summary = stats.enrichment_summary["partial.example"]
+
+    assert env.pipeline_domains == [["partial.example"]]
+    assert stats.enrich_failures == {}
+    assert summary["status"] == "complete_with_gaps"
+    assert stats.enrich_complete_with_gaps == 1
+    assert saved["employee_count"]["value"] == 500
+    assert saved["research_outcomes"]["funding"]["status"] == "searched_but_not_found"
+    assert saved["research_outcomes"]["_summary"]["status"] == "complete_with_gaps"
 
 
 def test_same_company_in_two_runs_is_not_duplicated(env):

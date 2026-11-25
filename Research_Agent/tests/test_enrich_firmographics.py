@@ -25,7 +25,7 @@ import pytest
 
 from csg import discover, gemini_queue
 from csg.discovery import research
-from csg.models import Company
+from csg.models import Company, ProvenanceValue
 from csg import usage_tracker
 
 
@@ -312,7 +312,7 @@ def test_gemini_success_never_touches_fallback(gemini_keys, monkeypatch):
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "complete_with_gaps"
+    assert reason is None
     assert company.research_outcomes["_summary"]["status"] == "complete_with_gaps"
     assert "funding" in company.research_outcomes["_summary"]["missing_fields"]
 
@@ -362,7 +362,7 @@ def test_omitted_required_key_is_partial_and_keeps_valid_facts(gemini_keys, monk
 
     reason = asyncio.run(research.enrich_company_firmographics(company, run_id="run-partial"))
 
-    assert reason == "incomplete_result"
+    assert reason is None
     assert company.employee_count.value == 500
     assert company.research_outcomes["_summary"]["status"] == "partial"
     assert company.research_outcomes["_missing_response_fields"] == {
@@ -394,7 +394,7 @@ def test_explicit_null_is_reported_as_terminal_missing_information(gemini_keys, 
 
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "complete_with_gaps"
+    assert reason is None
     assert company.research_outcomes["funding"]["status"] == "searched_but_not_found"
     assert "explicitly returned no reliable information" in company.research_outcomes["funding"]["reason"]
     assert company.research_outcomes["employee_range"]["reason"] == (
@@ -440,7 +440,9 @@ def test_gemini_ungrounded_claim_triggers_fallback(gemini_keys, monkeypatch):
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "ungrounded_response"
+    assert reason is None
+    assert company.research_outcomes["_summary"]["status"] == "needs_review"
+    assert "failure_reason" not in company.research_outcomes["_summary"]
     assert called["count"] == 0
 
 
@@ -893,6 +895,84 @@ def test_opposed_hiring_service_fit_claims_remain_conflicts():
     assert outcome["reason"] == "conflicting claims supplied for the same field"
 
 
+def test_completeness_keeps_missing_and_conflicting_fields_company_local():
+    company = _company()
+    company.employee_count = ProvenanceValue(
+        value=500, source="gemini_grounded_search", url="https://acme.com/about",
+        method="reported", confidence="high",
+    )
+    company.research_outcomes = {
+        field: {"status": "accepted_and_mapped", "criterion": criterion}
+        for field, criterion in research._FIELD_CRITERIA.items()
+    }
+    company.research_outcomes["revenue"] = {
+        "status": "found_but_rejected",
+        "reason": "conflicting claims supplied for the same field",
+    }
+
+    summary = research.enrichment_completeness(company)
+
+    assert summary["status"] == "needs_review"
+    assert "conflicting claims" in summary["review_fields"]["revenue"]
+    assert company.employee_count.value == 500
+
+    company.research_outcomes["revenue"] = {
+        "status": "searched_but_not_found",
+        "reason": "No reliable revenue information was returned",
+    }
+    summary = research.enrichment_completeness(company)
+
+    assert summary["status"] == "complete_with_gaps"
+    assert summary["missing_fields"]["revenue"] == "No reliable revenue information was returned"
+    assert summary["blocking_fields"] == {}
+    assert company.employee_count.value == 500
+
+
+def test_historical_failed_summary_is_presented_from_field_evidence():
+    company = _company()
+    company.employee_count = ProvenanceValue(
+        value=500, source="gemini_grounded_search", url="https://acme.com/about",
+        method="reported", confidence="high",
+    )
+    outcomes = {
+        "employee_range": {"status": "accepted_and_mapped"},
+        "revenue": {"status": "found_but_rejected", "reason": "supporting URL missing"},
+        "funding": {"status": "searched_but_not_found", "reason": "No reliable information was returned"},
+        "_summary": {"status": "failed", "failure_reason": "incomplete_result", "missing_fields": {}, "blocking_fields": {}},
+    }
+
+    presented = research.present_stored_enrichment_summary(outcomes)
+
+    assert presented["_summary"]["status"] == "needs_review"
+    assert "failure_reason" not in presented["_summary"]
+    assert outcomes["_summary"]["status"] == "failed"
+    assert company.employee_count.value == 500
+    quota = research.present_stored_enrichment_summary({
+        "_summary": {"status": "failed", "failure_reason": "quota_exhausted"},
+    })
+    assert quota["_summary"]["status"] == "failed"
+    assert quota["_summary"]["failure_reason"] == "quota_exhausted"
+
+
+def test_missing_supporting_url_is_field_review_not_company_failure():
+    company = _company()
+    research._apply_firmographics(
+        company,
+        {"revenue": "$50M"},
+        source="gemini_grounded_search",
+        allowed_source_urls={"https://acme.com/about"},
+        searched_fields={"revenue"},
+    )
+
+    outcome = company.research_outcomes["revenue"]
+    summary = research.enrichment_completeness(company)
+
+    assert outcome["status"] == "found_but_rejected"
+    assert "supporting URL missing" in outcome["reason"]
+    assert summary["status"] == "needs_review"
+    assert "revenue" in summary["review_fields"]
+
+
 def test_grounding_rejects_model_url_without_metadata(gemini_keys, monkeypatch):
     response = SimpleNamespace(
         text='{"employee_count": 500, "employee_count_source_url": "https://model-only.example/about"}',
@@ -913,7 +993,8 @@ def test_grounding_rejects_model_url_without_metadata(gemini_keys, monkeypatch):
     monkeypatch.setattr("google.genai.Client", FakeClient)
 
     company = _company()
-    assert asyncio.run(research.enrich_company_firmographics(company)) == "ungrounded_response"
+    assert asyncio.run(research.enrich_company_firmographics(company)) is None
+    assert company.research_outcomes["_summary"]["status"] == "needs_review"
     assert company.employee_count is None
 
 
@@ -937,8 +1018,8 @@ def test_grounding_url_without_support_association_is_rejected(gemini_keys, monk
 
     result = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert result == "ungrounded_response"
-    assert company.research_outcomes["_summary"]["status"] == "failed"
+    assert result is None
+    assert company.research_outcomes["_summary"]["status"] == "needs_review"
     assert company.employee_count is None
     assert company.revenue is None
     assert all(
@@ -947,7 +1028,7 @@ def test_grounding_url_without_support_association_is_rejected(gemini_keys, monk
         if field in research._FIELD_CRITERIA
     )
     outcomes = next(fields for event, fields in events if event == "gemini_enrichment_outcomes")
-    assert outcomes["status"] == "failed"
+    assert outcomes["status"] == "needs_review"
     assert len(outcomes["rejected_fields"]) > 0
 
 
@@ -986,14 +1067,14 @@ def test_mixed_grounded_and_ungrounded_claims_are_reported_as_partial(gemini_key
 
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "ungrounded_response"
-    assert company.research_outcomes["_summary"]["status"] == "partial"
+    assert reason is None
+    assert company.research_outcomes["_summary"]["status"] == "needs_review"
     assert company.employee_count.value == 500
     assert company.revenue is None
     assert company.research_outcomes["revenue"]["status"] == "found_but_rejected"
     assert "grounding" in company.research_outcomes["revenue"]["reason"]
     outcomes = next(fields for event, fields in events if event == "gemini_enrichment_outcomes")
-    assert outcomes["status"] == "partial"
+    assert outcomes["status"] == "needs_review"
     assert outcomes["field_outcomes"]["employee_range"]["status"] == "accepted"
     assert outcomes["field_outcomes"]["revenue"]["status"] == "rejected"
     assert "[OK] Enriched" not in capsys.readouterr().out
@@ -1044,7 +1125,7 @@ def test_gemini_grounding_url_is_saved_with_fact_provenance(gemini_keys, monkeyp
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "complete_with_gaps"
+    assert reason is None
     assert company.employee_count.url == source_url
     assert company.employee_count.fetched_at
 
@@ -1078,7 +1159,7 @@ def test_transient_connection_error_retries_same_key_before_fallback(gemini_keys
     company = _company()
     reason = asyncio.run(research.enrich_company_firmographics(company))
 
-    assert reason == "complete_with_gaps"
+    assert reason is None
     assert calls["n"] == 2
     assert company.employee_count.source == "gemini_grounded_search"
 
@@ -1336,7 +1417,7 @@ def test_gemini_transient_429_retries_once_on_same_key(gemini_keys, monkeypatch)
     monkeypatch.setattr(research, "_enrich_via_groq_tavily", lambda *_: pytest.fail("unexpected fallback"))
 
     company = _company()
-    assert asyncio.run(research.enrich_company_firmographics(company)) == "complete_with_gaps"
+    assert asyncio.run(research.enrich_company_firmographics(company)) is None
     assert calls["count"] == 2
     assert company.employee_count.value == 500
 
