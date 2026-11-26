@@ -65,7 +65,7 @@ def worker_version() -> str:
     )
 
 
-def _write_event(row: dict[str, Any]) -> None:
+def _persist_event(row: dict[str, Any]) -> None:
     try:
         from . import db
         conn = db.connect()
@@ -75,6 +75,13 @@ def _write_event(row: dict[str, Any]) -> None:
             conn.close()
     except Exception:
         pass
+
+
+# Indirection point for the write itself (see usage_tracker._write_row). The
+# offline test suite replaces this for the whole session so diagnostic events
+# from tests -- including fire-and-forget threads that outlive their test --
+# cannot reach the live research_diagnostic_events table.
+_write_event = _persist_event
 
 
 def log_event(event: str, **fields: Any) -> None:

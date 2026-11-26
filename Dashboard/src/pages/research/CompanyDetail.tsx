@@ -40,7 +40,10 @@ function unavailableTitle(field: string, reason?: string, review = false): strin
 }
 
 function gapLabel(status?: string): string {
-  return status === "found_but_rejected" ? "Needs review" : "Not available";
+  if (status === "found_but_rejected") return "Needs review";
+  if (status === "carried_forward") return "Stored from an earlier run";
+  if (status === "discovery_hint_unverified") return "Unverified discovery hint";
+  return "Not available";
 }
 
 interface Props {
@@ -85,7 +88,17 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
                 {company.region}
               </span>
             )}
-            {company.industry && <span className="meta-chip">{company.industry}</span>}
+            {company.industry && (
+              <span
+                className="meta-chip"
+                title={company.research_outcomes?.industry?.status === "discovery_hint_unverified"
+                  ? "Discovery-sourced industry hint — not verified by grounded research yet"
+                  : "Industry verified by grounded research"}
+              >
+                {company.industry}
+                {company.research_outcomes?.industry?.status === "discovery_hint_unverified" && " (unverified)"}
+              </span>
+            )}
             {!company.ats_provider && company.hiring_signal === "unknown" ? (
               <span
                 className="meta-chip"
@@ -134,7 +147,7 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
               {company.funding && estimateMark(company.funding)}
             </span>
           </div>
-          {(company.website || company.headquarters || company.company_type) && (
+          {(company.website || company.headquarters || company.company_type || company.business_category) && (
             <div className="detail-meta-row" style={{ marginTop: 12 }}>
               {company.website && identityValue(company.website) && (
                 <a href={identityValue(company.website) || undefined} target="_blank" rel="noreferrer" title={provenanceTitle(company.website)}>
@@ -149,6 +162,11 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
               {company.company_type && identityValue(company.company_type) && (
                 <span className="meta-chip" title={provenanceTitle(company.company_type)}>
                   {identityValue(company.company_type)}
+                </span>
+              )}
+              {company.business_category && identityValue(company.business_category) && (
+                <span className="meta-chip" title={provenanceTitle(company.business_category)}>
+                  <Icon name="target" size={14} /> {identityValue(company.business_category)}
                 </span>
               )}
             </div>

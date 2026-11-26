@@ -124,6 +124,8 @@ def test_every_company_field_is_persisted(conn):
                       "fetched_at": "2026-11-05T12:00:00Z", "method": "reported", "confidence": "high"},
         company_type={"value": "smb", "source": "search", "url": "https://acme.com/about",
                       "fetched_at": "2026-11-05T12:00:00Z", "method": "reported", "confidence": "high"},
+        business_category={"value": "SaaS", "source": "search", "url": "https://acme.com/about",
+                           "fetched_at": "2026-11-05T12:00:00Z", "method": "reported", "confidence": "high"},
         hq_state="GA", description="d", employee_count=400, revenue="$25M",
         funding="$40M", ats_provider="greenhouse", ats_token="acme",
         ats_detected_by="careers_page", careers_url="https://acme.com/careers",

@@ -235,7 +235,7 @@ def _record_async(usage: _Usage, latency_ms: int) -> None:
     threading.Thread(target=_write_row, args=(row,), daemon=True).start()
 
 
-def _write_row(row: dict[str, Any]) -> None:
+def _persist_row(row: dict[str, Any]) -> None:
     try:
         from . import db
         conn = db.connect()
@@ -245,6 +245,14 @@ def _write_row(row: dict[str, Any]) -> None:
             conn.close()
     except Exception:
         pass  # usage logging must never surface an error to anything
+
+
+# Indirection point for the write itself. The offline test suite replaces this
+# for the whole session (tests/conftest.py) so a fire-and-forget daemon thread
+# can never reach the live api_usage table -- including a thread that outlives
+# the test which spawned it and any function-scoped db monkeypatch. Tests that
+# assert the persisted row opt back into `_persist_row` explicitly.
+_write_row = _persist_row
 
 
 def record_usage(

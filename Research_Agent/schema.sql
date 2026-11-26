@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS companies (
     name            TEXT,
     website         JSONB,
     headquarters    JSONB,
-    company_type    JSONB,
+    company_type    JSONB,         -- ownership/maturity (startup, SMB, ...)
+    business_category JSONB,       -- what the company does (Cybersecurity, SaaS, ...)
     employee_count  JSONB,         -- provenance envelope (see above)
     revenue         JSONB,         -- provenance envelope (see above)
     funding         JSONB,         -- provenance envelope (see above)
@@ -199,6 +200,8 @@ ALTER TABLE companies ADD COLUMN IF NOT EXISTS research_evidence JSONB NOT NULL 
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS research_outcomes JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS region      TEXT;
+-- What the company does, kept separate from company_type (ownership/maturity).
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_category JSONB;
 
 -- Req classification feeding the CSG Delivery Fit score.
 ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS delivery_fit  TEXT;

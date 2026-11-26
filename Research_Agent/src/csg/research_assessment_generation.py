@@ -141,8 +141,8 @@ def _company_research_evidence(company: Company) -> list[CompanyEvidence]:
     rows: list[CompanyEvidence] = []
     valid_criteria = {
         "automatic_website", "automatic_headquarters", "automatic_company_size",
-        "automatic_company_type", "company_leadership", "company_services",
-        "company_hiring_fit",
+        "automatic_company_type", "automatic_business_category", "company_leadership",
+        "company_services", "company_hiring_fit",
     }
     for item in company.research_evidence:
         if not isinstance(item, dict):

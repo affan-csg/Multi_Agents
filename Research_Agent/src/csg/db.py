@@ -25,6 +25,7 @@ import httpx
 from dotenv import load_dotenv
 
 from .config import PROJECT_ROOT
+from .diagnostics import log_event
 from .models import Company, JobPosting, ScoreResult
 from .posting_validation import is_current_validated_posting
 from .research_assessment import CompanyResearchAssessment
@@ -218,7 +219,8 @@ def delete_run(conn: SupabaseConn, run_id: str) -> int:
 # --- companies ---------------------------------------------------------------
 
 _COALESCE_FIELDS = (
-    "name", "website", "headquarters", "company_type", "employee_count", "revenue", "funding",
+    "name", "website", "headquarters", "company_type", "business_category",
+    "employee_count", "revenue", "funding",
     "classification_evidence", "research_evidence", "research_outcomes", "description", "region",
     "industry", "hq_state",
     "ats_provider", "ats_token", "ats_detected_by", "careers_url",
@@ -227,7 +229,10 @@ _COALESCE_FIELDS = (
 
 # Researched facts stored as JSONB provenance envelopes (value + source +
 # confidence), not bare scalars -- see models.ProvenanceValue.
-_PROVENANCE_FIELDS = ("website", "headquarters", "company_type", "employee_count", "revenue", "funding")
+_PROVENANCE_FIELDS = (
+    "website", "headquarters", "company_type", "business_category",
+    "employee_count", "revenue", "funding",
+)
 _PENDING_CLASSIFICATION_EVIDENCE: dict[str, list[dict[str, Any]]] = {}
 _EVIDENCE_DEFAULTS: dict[str, Any] = {
     "classification_evidence": [],
@@ -238,6 +243,22 @@ _EVIDENCE_DEFAULTS: dict[str, Any] = {
 
 def _empty_evidence_value(field: str) -> Any:
     return {} if field == "research_outcomes" else []
+
+
+# PostgREST signals a genuinely absent column this way. Any other error that
+# merely mentions a column name (a CHECK constraint on research_outcomes, for
+# example) must never be treated as "column missing": doing that silently
+# dropped the research ledger from an otherwise successful write.
+_MISSING_COLUMN_MARKERS = ("pgrst204", "42703", "does not exist", "could not find the")
+
+
+def _missing_column_from_error(
+    exc: SupabaseError, candidates: tuple[str, ...],
+) -> Optional[str]:
+    text = str(exc).lower()
+    if not any(marker in text for marker in _MISSING_COLUMN_MARKERS):
+        return None
+    return next((field for field in candidates if field.lower() in text), None)
 
 
 def upsert_company(conn: SupabaseConn, c: Company) -> None:
@@ -276,17 +297,27 @@ def upsert_company(conn: SupabaseConn, c: Company) -> None:
 
     _PENDING_CLASSIFICATION_EVIDENCE[c.domain] = row["classification_evidence"]
     optional_fields = ("classification_evidence", "research_evidence", "research_outcomes")
+    last_error: Optional[SupabaseError] = None
     for _ in range(len(optional_fields) + 1):
         try:
             conn.upsert("companies", [row], on_conflict="domain")
-            break
+            return
         except SupabaseError as exc:
             # Older Supabase projects may not have applied the additive JSONB
-            # evidence migrations yet. Keep core company updates working there.
-            missing_field = next((field for field in optional_fields if field in str(exc)), None)
+            # evidence migrations yet. Keep core company updates working there,
+            # but never drop a field for any other reason and never drop it
+            # silently.
+            last_error = exc
+            missing_field = _missing_column_from_error(exc, optional_fields)
             if missing_field is None or missing_field not in row:
                 raise
             row.pop(missing_field)
+            log_event(
+                "company_write_column_unavailable", domain=c.domain,
+                field=missing_field, error=str(exc)[:400],
+            )
+    if last_error is not None:
+        raise last_error
 
 
 def claim_company(conn: SupabaseConn, c: Company) -> bool:
@@ -307,16 +338,24 @@ def claim_company(conn: SupabaseConn, c: Company) -> bool:
             value = _empty_evidence_value(field)
         row[field] = value
     optional_fields = tuple(_EVIDENCE_DEFAULTS)
+    last_error: Optional[SupabaseError] = None
     for _ in range(len(optional_fields) + 1):
         try:
             return bool(conn.insert_if_absent("companies", [row], on_conflict="domain"))
         except SupabaseError as exc:
             # Keep inserts compatible with projects that have not yet applied
             # an additive evidence migration, as upsert_company() does.
-            missing_field = next((field for field in optional_fields if field in str(exc)), None)
+            last_error = exc
+            missing_field = _missing_column_from_error(exc, optional_fields)
             if missing_field is None or missing_field not in row:
                 raise
             row.pop(missing_field)
+            log_event(
+                "company_write_column_unavailable", domain=c.domain,
+                field=missing_field, error=str(exc)[:400],
+            )
+    if last_error is not None:
+        raise last_error
     return False
 
 
@@ -334,6 +373,7 @@ def _row_to_company(row: dict[str, Any]) -> Company:
     return Company(
         domain=row["domain"], name=row.get("name"), website=row.get("website"),
         headquarters=row.get("headquarters"), company_type=row.get("company_type"),
+        business_category=row.get("business_category"),
         employee_count=row.get("employee_count"),
         revenue=row.get("revenue"), funding=row.get("funding"),
         classification_evidence=(row.get("classification_evidence")

@@ -58,6 +58,7 @@ const RESEARCH_FIELDS: Array<[string, string]> = [
   ["headquarters", "Headquarters"],
   ["employee_range", "Employee range"],
   ["company_classification", "Company classification"],
+  ["business_category", "Business category"],
   ["leadership", "Leadership"],
   ["services", "Services"],
   ["hiring_service_fit", "Hiring and service fit"],
@@ -71,6 +72,8 @@ type ResearchOutcomes = NonNullable<CompanyDetail["company"]["research_outcomes"
 
 const FIELD_STATUS_LABEL: Record<string, string> = {
   accepted_and_mapped: "Verified and recorded",
+  carried_forward: "Previously stored (not re-verified in this run)",
+  discovery_hint_unverified: "Discovery hint — unverified",
   searched_but_not_found: "Not available",
   not_searched: "Not researched",
   not_returned: "Not returned by provider",
@@ -122,6 +125,9 @@ function FieldResearchOutcomes({
       {overallStatus && <p className="assessment-muted">
         Firmographic research: {ENRICHMENT_STATUS_LABEL[overallStatus] || formatAssessmentValue(overallStatus)}
         {overallReason ? ` (${OPERATIONAL_REASON_LABEL[overallReason] || "enrichment did not finish"})` : ""}
+      </p>}
+      {outcomes?._summary?.counts && <p className="assessment-muted">
+        {`Verified in this run: ${outcomes._summary.counts.verified ?? 0} · Carried forward: ${outcomes._summary.counts.carried_forward ?? 0} · Discovery hints (unverified): ${outcomes._summary.counts.discovery_hints ?? 0} · Not publicly available: ${outcomes._summary.counts.searched_but_not_found ?? 0} · Needs review: ${outcomes._summary.counts.found_but_rejected ?? 0}`}
       </p>}
       <ul className="assessment-criteria">
         {RESEARCH_FIELDS.map(([field, label]) => {

@@ -148,7 +148,8 @@ def _has_accepted_research(outcomes: Any) -> bool:
     if not isinstance(outcomes, dict):
         return False
     return any(
-        isinstance(value, dict) and value.get("status") == "accepted_and_mapped"
+        isinstance(value, dict)
+        and value.get("status") in {"accepted_and_mapped", "carried_forward"}
         for key, value in outcomes.items()
         if key != "_summary"
     )
@@ -326,9 +327,10 @@ async def _enrich_all(
         )
         if existing is not None:
             for field in (
-                "website", "headquarters", "company_type", "employee_count", "revenue",
-                "funding", "classification_evidence", "research_evidence", "research_outcomes",
-                "description", "industry", "hq_state",
+                "website", "headquarters", "company_type", "business_category",
+                "employee_count", "revenue", "funding", "classification_evidence",
+                "research_evidence", "research_outcomes", "description", "industry",
+                "hq_state",
             ):
                 setattr(company, field, getattr(existing, field))
         checkpoint = checkpoint_load(f"enrich:{c.domain}") if checkpoint_load else None

@@ -22,6 +22,15 @@ from csg import usage_tracker
 from csg.usage_tracker import track
 
 
+@pytest.fixture(autouse=True)
+def _use_real_usage_writer(monkeypatch):
+    # conftest replaces the module-level writer for the whole session so no
+    # offline test can reach the live api_usage table. These tests assert on
+    # the persisted row, so opt back into the real writer (with db.connect
+    # still swapped for the in-memory fake in `captured_rows`).
+    monkeypatch.setattr(usage_tracker, "_write_row", usage_tracker._persist_row)
+
+
 def _join_background_writes(timeout: float = 0.5) -> None:
     """usage_tracker fires a daemon thread per call; give it a moment to run
     before asserting on what it wrote. The fake DB calls in these tests are

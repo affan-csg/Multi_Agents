@@ -85,6 +85,9 @@ class Company(BaseModel):
     website: Optional[ProvenanceValue] = None
     headquarters: Optional[ProvenanceValue] = None
     company_type: Optional[ProvenanceValue] = None
+    # What the company does (Cybersecurity, SaaS, AI/ML, ...) -- deliberately
+    # separate from company_type, which is ownership/maturity.
+    business_category: Optional[ProvenanceValue] = None
     employee_count: Optional[ProvenanceValue] = None
     revenue: Optional[ProvenanceValue] = None
     funding: Optional[ProvenanceValue] = None
@@ -130,7 +133,7 @@ class Company(BaseModel):
             outcomes["_missing_response_fields"] = {"legacy_value": missing_fields}
         return outcomes
 
-    @field_validator("website", "headquarters", "company_type", "employee_count", "revenue", "funding", mode="before")
+    @field_validator("website", "headquarters", "company_type", "business_category", "employee_count", "revenue", "funding", mode="before")
     @classmethod
     def _wrap_provenance(cls, v: Any) -> Any:
         # A bare scalar (hand-entered value, older DB row) is

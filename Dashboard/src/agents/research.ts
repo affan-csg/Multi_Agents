@@ -273,13 +273,30 @@ export interface CompanyDetail {
     website?: ProvenanceValue<string> | null;
     headquarters?: ProvenanceValue<{ city?: string; state?: string; country?: string }> | null;
     company_type?: ProvenanceValue<string> | null;
+    /** What the company does (Cybersecurity, SaaS, AI/ML, ...). Separate from
+     *  company_type, which is ownership/maturity. */
+    business_category?: ProvenanceValue<string> | null;
     research_evidence?: CompanyResearchEvidence[];
     research_outcomes?: Record<string, {
-      status?: "not_searched" | "searched_but_not_found" | "found_but_rejected" | "accepted_and_mapped"
+      status?: "not_searched" | "not_returned" | "searched_but_not_found" | "found_but_rejected"
+        | "accepted_and_mapped" | "carried_forward" | "discovery_hint_unverified"
         | "complete" | "complete_with_gaps" | "partial" | "needs_review" | "failed";
       criterion?: string;
       checked_at?: string;
       reason?: string;
+      note?: string;
+      discovery_hint?: string;
+      verified_fields?: Record<string, string>;
+      carried_fields?: Record<string, string>;
+      hint_fields?: Record<string, string>;
+      counts?: {
+        verified?: number;
+        carried_forward?: number;
+        discovery_hints?: number;
+        searched_but_not_found?: number;
+        found_but_rejected?: number;
+        blocking?: number;
+      };
       evidence_keys?: string[];
       missing_fields?: Record<string, string>;
       review_fields?: Record<string, string>;

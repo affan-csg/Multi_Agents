@@ -13,7 +13,7 @@ import time
 import httpx
 import pytest
 
-from csg import contacts
+from csg import contacts, usage_tracker
 from csg.db import _contact_priority
 from csg.contacts import _parse_emails
 
@@ -167,6 +167,9 @@ def captured_usage_rows(monkeypatch):
 
     monkeypatch.setattr("csg.db.connect", lambda: FakeConn())
     monkeypatch.setattr("csg.db.insert_api_usage", fake_insert)
+    # The session-wide isolation fixture captures writes in memory; these
+    # tests assert on the persisted path, so opt back into the real writer.
+    monkeypatch.setattr(usage_tracker, "_write_row", usage_tracker._persist_row)
     return rows
 
 
