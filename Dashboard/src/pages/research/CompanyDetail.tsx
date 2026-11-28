@@ -384,6 +384,12 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
           <span className="run-badge">{postings.length} total</span>
         </div>
 
+        {company.job_discovery_notes && (
+          <p className="assessment-muted" style={{ marginTop: 0 }}>
+            {company.job_discovery_notes}
+          </p>
+        )}
+
         {postings.length === 0 ? (
           company.hiring_signal === "unknown" ? (
             <EmptyState
@@ -391,7 +397,9 @@ export function CompanyDetail({ runId, domain, busy, onBack, onQualify, onContac
               message="Job data unavailable — every ATS/careers-page/search method was exhausted for this company. This is NOT a confirmed zero; their actual hiring status is unknown."
             />
           ) : (
-            <EmptyState icon="briefcase" message="No open requisitions found (confirmed — a job board or careers page was checked)." />
+            <EmptyState icon="briefcase" message={company.hiring_signal === "none"
+              ? "No open requisitions found — a verified ATS board was read and contained no open postings."
+              : "No open requisitions found (confirmed — a job board or careers page was checked)."} />
           )
         ) : (
           <div className="table-scroll">

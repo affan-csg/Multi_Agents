@@ -179,6 +179,20 @@ Deploy in this order: apply migrations 010-012, deploy the API revision, then de
 
 **Independent rollback**: keep migration 010 applied; it is additive and the previous API does not depend on it. Roll the API back without changing the worker using `gcloud run services update-traffic multi-agents --region asia-northeast1 --to-revisions=KNOWN_GOOD_API_REVISION=100`. Roll the worker back independently with `gcloud run services update-traffic multi-agents-research-worker --region asia-northeast1 --to-revisions=KNOWN_GOOD_WORKER_REVISION=100`. If rolling the API back to a revision that executes jobs in-process, first deploy a worker revision with `RESEARCH_WORKER_ENABLED=false`, route 100% worker traffic to that paused revision (`gcloud run services update-traffic multi-agents-research-worker --region asia-northeast1 --to-latest`), and verify the active revision reports `/readyz` `{"status":"paused"}`, `/healthz` reports `worker_enabled:false`, and `worker_disabled` is logged. Confirm prior worker revisions have 0% traffic and inspect active `agent_jobs` leases before shifting API traffic. To resume worker processing, deploy/update with `RESEARCH_WORKER_ENABLED=true` and verify the enabled revision is receiving traffic. If migration rollback is later required, first roll both services to versions that do not call the RPC and verify no checkpoint reads are in flight; only then should a database owner remove the function/table. Do not drop the migration as part of routine application rollback.
 
+#### Automated deployment from `main`
+
+The root [cloudbuild.yaml](cloudbuild.yaml) builds, verifies and deploys both Cloud Run services. Create a Cloud Build trigger in `csgroup-514114` with:
+
+- Event: **Push to a branch**, branch regex `^main$`.
+- Configuration: **Cloud Build configuration file**, location `cloudbuild.yaml` (repository root).
+- Service account: the Cloud Build service account (or a dedicated deployer) with the permissions listed in [Deployment permissions](#deployment-permissions-and-health-check-authentication).
+
+One build runs these steps in order: build the shared image tagged with `$COMMIT_SHA`, push it, validate the tag → digest record in Artifact Registry, verify the OCI revision/build-id labels in the image, resolve the pushed tag to its immutable `sha256:` digest, then run `scripts/deployment_orchestrator.py` with the digest-pinned reference.
+
+The orchestrator deploys the API revision with `--no-traffic`, verifies it is running the exact digest, that its service account, port, environment-variable names and command/args match the previous revision, and that its `/livez` probe passes. It then deploys the Research Worker the same way — private (`--no-allow-unauthenticated`) with `python -m csg.worker`, verified through the private `/livez` and `/readyz` endpoints using an ID token — and only afterwards switches API and then Worker traffic to the new revisions. If anything fails it exits non-zero and the build fails; a post-switch verification failure restores the previous 100%-traffic revision on both services. `gcloud run deploy` is a partial update, so scaling, CPU, memory, concurrency, timeout, probes, ingress, secrets and other environment variables are inherited from the live service.
+
+Concurrent pushes are built independently. Each build deploys only its own digest-pinned image, but if two builds overlap the one that finishes last moves traffic last. Set the project's **Cloud Build → Build** concurrency quota to `1` (IAM & Admin → Quotas) to guarantee strict push order; otherwise avoid pushing twice within one build's runtime. Do not cancel a build mid-deploy — if a build is interrupted after a traffic switch, use the revision rollback commands above.
+
 **Calendly webhook**: register `https://<backend>/outreach/calendly/webhook` (or the root alias `/calendly/webhook`) and set `CALENDLY_WEBHOOK_SIGNING_KEY`; the signature is verified and unsigned calls are rejected. See [Outreach_Agent/README.md](Outreach_Agent/README.md#calendly-integration).
 
 ### Option 2: Separate backend services

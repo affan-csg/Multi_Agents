@@ -299,6 +299,56 @@ def test_deploy_revision_falls_back_to_wait(monkeypatch):
     assert rev == "new-rev"
 
 
+def _capture_deploy_command(monkeypatch, *, worker: bool):
+    captured = []
+
+    def fake_run(command, check=True):
+        captured.append(command)
+        return type("R", (), {"stdout": "Revision: svc-00001-abc has been deployed", "returncode": 0})()
+
+    monkeypatch.setattr(deploy, "run", fake_run)
+    monkeypatch.setattr(deploy, "gcloud_json", lambda args: {"status": {"latestCreatedRevisionName": "old"}})
+    deploy.deploy_revision(
+        "multi-agents-research-worker", "asia-northeast1", "proj",
+        "repo/img@sha256:" + "a" * 64, worker=worker,
+    )
+    return captured[-1]
+
+
+def test_worker_deploy_is_private_and_receives_no_traffic(monkeypatch):
+    command = _capture_deploy_command(monkeypatch, worker=True)
+    assert "--no-traffic" in command
+    assert "--no-allow-unauthenticated" in command
+    assert command[command.index("--command") + 1] == "python"
+    assert "-m,csg.worker" in command[command.index("--args=-m,csg.worker")]
+    image = command[command.index("--image") + 1]
+    assert "@sha256:" in image
+
+
+def test_api_deploy_keeps_its_existing_authentication(monkeypatch):
+    command = _capture_deploy_command(monkeypatch, worker=False)
+    assert "--no-traffic" in command
+    assert "--no-allow-unauthenticated" not in command
+    assert "--command" not in command
+
+
+def test_deploy_only_sets_the_image_and_worker_command(monkeypatch):
+    # `gcloud run deploy` is a partial update: anything not passed here keeps
+    # the service's existing env, secrets, service account, probes, scaling,
+    # CPU, memory, concurrency, timeout, ingress and instance settings.
+    for worker in (False, True):
+        command = _capture_deploy_command(monkeypatch, worker=worker)
+        flags = [part for part in command if part.startswith("--")]
+        allowed = {
+            "--region", "--project", "--image", "--no-traffic", "--quiet",
+            "--command", "--args=-m,csg.worker", "--no-allow-unauthenticated",
+        }
+        assert set(flags) <= allowed, (worker, set(flags) - allowed)
+        assert "--update-env-vars" not in command
+        assert "--update-secrets" not in command
+        assert "--allow-unauthenticated" not in command
+
+
 def test_mint_identity_token_success(monkeypatch):
     class R:
         stdout = "token-value\n"

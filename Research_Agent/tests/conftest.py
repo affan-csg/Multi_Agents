@@ -55,3 +55,27 @@ def isolated_diagnostic_events():
 def isolate_provider_telemetry(isolated_usage_rows, isolated_diagnostic_events):
     """Offline tests must never write provider telemetry to a live database."""
     return None
+
+
+# --- Official-site profiler isolation ---------------------------------------
+# Enrichment now also runs a deterministic pass over the company's own public
+# pages. Tests are offline by default, so the pass is stubbed out unless the
+# test explicitly opts in; a test that exercises the profiler also injects its
+# own fake fetcher, so even opted-in tests make no real requests.
+
+@pytest.fixture
+def enable_official_site_profile():
+    """Opt in to the real official-site profiler (with a fake fetcher)."""
+    return None
+
+
+@pytest.fixture(autouse=True)
+def disable_official_site_network(request, monkeypatch):
+    if "enable_official_site_profile" in request.fixturenames:
+        return
+    from csg.discovery import site_profile
+
+    async def _disabled(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(site_profile, "profile_official_site", _disabled)

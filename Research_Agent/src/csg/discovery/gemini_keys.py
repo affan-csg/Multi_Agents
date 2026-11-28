@@ -102,6 +102,31 @@ def make_gemini_client(api_key: str):
     )
 
 
+def gemini_client_profile() -> dict:
+    """Non-sensitive fingerprint of the client shape used for grounded calls.
+
+    Grounding behaviour depends on the SDK build, the API surface
+    (``enterprise=True`` selects Agent Platform Express Mode rather than the
+    public Gemini API) and the transport override. Logging this beside each
+    response's grounding shape is what lets a deployed zero-grounding run be
+    compared with a local run without touching credentials or deployment.
+    Never includes the key or any request body.
+    """
+    try:
+        from importlib.metadata import version
+
+        sdk_version = version("google-genai")
+    except Exception:  # metadata can be absent in frozen/zip imports
+        sdk_version = "unknown"
+    return {
+        "gemini_sdk": "google-genai",
+        "gemini_sdk_version": sdk_version,
+        "gemini_api_mode": "enterprise",
+        "gemini_user_project_header": False,
+        "gemini_ipv4_pinned": True,
+    }
+
+
 def is_connection_error(exc: Exception) -> bool:
     """True for a transport-layer failure (DNS, TCP connect, TLS handshake,
     connect/read timeout) as opposed to an application-layer error (bad

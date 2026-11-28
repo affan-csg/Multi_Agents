@@ -15,6 +15,7 @@ are exactly what they were before instrumentation.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from contextlib import contextmanager
@@ -87,6 +88,21 @@ def track(
     usage = _Usage(provider=provider, call_kind=call_kind, run_id=run_id, domain=domain)
     try:
         yield usage
+    except asyncio.CancelledError:
+        # The old to_thread implementation recorded a successful usage row
+        # when its awaiting coroutine was cancelled, even though the provider
+        # result was discarded. A cancelled in-flight call is a failed
+        # attempt for telemetry purposes; the caller still decides whether it
+        # was a timeout, job cancellation, or shutdown.
+        if usage.success:
+            usage.mark_failure(
+                error_kind="timeout",
+                error_details={
+                    "type": "CancelledError",
+                    "message": "provider call was cancelled before a result was applied",
+                },
+            )
+        raise
     except Exception as exc:
         if usage.success:  # not already marked by the caller
             usage.mark_failure(
@@ -176,6 +192,11 @@ def classify_error(exc: Exception) -> str:
             return "timeout"
     except Exception:
         pass
+    if isinstance(exc, ConnectionError):
+        # Builtin/socket connection failures (including provider SDK wrappers
+        # that do not expose httpx's exception classes) are the same
+        # operational condition: the request never reached a usable provider.
+        return "connection_error"
     try:
         from .discovery.gemini_keys import is_connection_error, is_daily_quota_exhausted
         if is_connection_error(exc):

@@ -105,7 +105,7 @@ def test_scored_pipeline_automatically_creates_new_company_assessment(monkeypatc
     monkeypatch.setattr(pipeline.db, "get_owned_postings", lambda _conn, _domain, run_id=None: postings)
     monkeypatch.setattr(pipeline.db, "upsert_postings", lambda _conn, rows: None)
     monkeypatch.setattr(pipeline.db, "save_score", lambda _conn, _run, row: saved_scores.append(row))
-    monkeypatch.setattr(pipeline.ats, "detect", lambda *_args: _async_value(None))
+    monkeypatch.setattr(pipeline.ats, "detect", lambda *_args, **_kwargs: _async_value(None))
     monkeypatch.setattr(pipeline, "discover_jobs", lambda *_args: _async_value(SimpleNamespace(
         ats_provider=None, ats_token=None, ats_detected_by=None, careers_url=None,
         method="careers_page", source="company careers page", hiring_signal="confirmed",
@@ -181,7 +181,7 @@ def test_pipeline_revalidates_cached_ats_and_excludes_unvalidated_posts_from_sco
     monkeypatch.setattr(pipeline.db, "get_postings", lambda *_args: [stale_posting])
     monkeypatch.setattr(pipeline, "refresh_company_assessment_safely", lambda *_args: True)
 
-    async def no_board(*args):
+    async def no_board(*args, **_kwargs):
         detect_calls.append((args[1], args[2]))
         return None
 
@@ -534,7 +534,7 @@ def test_assessment_generation_failure_does_not_interrupt_pipeline(monkeypatch, 
     monkeypatch.setattr(pipeline.db, "get_postings", lambda _conn, _domain: [])
     monkeypatch.setattr(pipeline.db, "upsert_postings", lambda _conn, rows: None)
     monkeypatch.setattr(pipeline.db, "save_score", lambda _conn, _run, row: saved_scores.append(row))
-    monkeypatch.setattr(pipeline.ats, "detect", lambda *_args: _async_value(None))
+    monkeypatch.setattr(pipeline.ats, "detect", lambda *_args, **_kwargs: _async_value(None))
     monkeypatch.setattr(pipeline, "discover_jobs", lambda *_args: _async_value(SimpleNamespace(
         ats_provider=None, ats_token=None, ats_detected_by=None, careers_url=None,
         method="unknown", source=None, hiring_signal="unknown", notes="not found", postings=[],

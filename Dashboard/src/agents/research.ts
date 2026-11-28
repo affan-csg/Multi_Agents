@@ -35,7 +35,7 @@ export interface CompanyRunOutcome {
   job_data_available?: boolean;
   job_data_reason?: string | null;
   job_discovery_method?: "ats" | "careers_page" | "web_search" | "unknown" | null;
-  hiring_signal?: "confirmed" | "unknown" | null;
+  hiring_signal?: "confirmed" | "none" | "unknown" | null;
   posting_count?: number;
 }
 
@@ -173,7 +173,7 @@ export interface ScoredCompany {
    *  discovery method was exhausted without reading anything at all.
    *  'unknown' must never be displayed or treated the same as a confirmed
    *  zero -- see Research_Agent's models.HiringSignal. */
-  hiring_signal?: "confirmed" | "unknown" | null;
+  hiring_signal?: "confirmed" | "none" | "unknown" | null;
   research_assessment?: CompanyResearchAssessmentSummary | null;
 }
 
@@ -212,6 +212,11 @@ export interface CompanyResearchEvidence {
   excerpt?: string | null;
   evidence_type?: string;
   confidence?: string;
+  criterion?: string;
+  informational?: boolean;
+  source_tier?: number;
+  retrieved_at?: string;
+  verification_method?: string;
 }
 
 export interface CompanyResearchAssessmentSummary {
@@ -280,7 +285,8 @@ export interface CompanyDetail {
     research_outcomes?: Record<string, {
       status?: "not_searched" | "not_returned" | "searched_but_not_found" | "found_but_rejected"
         | "accepted_and_mapped" | "carried_forward" | "discovery_hint_unverified"
-        | "complete" | "complete_with_gaps" | "partial" | "needs_review" | "failed";
+        | "complete" | "complete_with_gaps" | "partial" | "needs_review" | "failed"
+        | "ok" | "error" | "timeout";
       criterion?: string;
       checked_at?: string;
       reason?: string;
@@ -303,6 +309,17 @@ export interface CompanyDetail {
       blocking_fields?: Record<string, string>;
       failure_reason?: string;
       missing?: string[];
+      /** Additive operational metadata (official-site profiler/grounding). */
+      extractor?: string;
+      careers_url?: string;
+      job_link_count?: number;
+      technologies?: string[];
+      pages?: Array<{ url: string; status: string | number; kind?: string }>;
+      fields?: Record<string, string>;
+      available?: boolean;
+      source?: string;
+      error?: string;
+      [key: string]: unknown;
     }>;
     employee_count: ProvenanceValue<number> | null;
     revenue: ProvenanceValue<string> | null;
@@ -322,7 +339,7 @@ export interface CompanyDetail {
      *  'unknown' means every method was exhausted, NOT a confirmed zero. */
     job_discovery_method: "ats" | "careers_page" | "web_search" | "unknown" | null;
     job_source: string | null;
-    hiring_signal: "confirmed" | "unknown" | null;
+    hiring_signal: "confirmed" | "none" | "unknown" | null;
     job_discovery_notes: string | null;
   };
   score: ScoredCompany | null;
@@ -422,10 +439,11 @@ export interface Analytics {
     score: number;
     tier: string;
     median_age: number | null;
-    /** 'confirmed' | 'unknown' -- see ScoredCompany.hiring_signal. A point
-     *  at reqs=0 with 'unknown' was never actually confirmed as having zero
-     *  openings; job discovery was simply exhausted for that company. */
-    hiring_signal?: "confirmed" | "unknown" | null;
+    /** 'confirmed' | 'none' | 'unknown' -- see ScoredCompany.hiring_signal.
+     *  A point at reqs=0 with 'unknown' was never confirmed as having zero
+     *  openings; job discovery was simply exhausted for that company. 'none'
+     *  means a valid board was read and had no current postings. */
+    hiring_signal?: "confirmed" | "none" | "unknown" | null;
   }>;
 }
 

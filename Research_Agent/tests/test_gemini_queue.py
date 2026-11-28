@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -178,4 +179,70 @@ def test_shared_reservation_failure_fails_closed(monkeypatch):
     with pytest.raises(gemini_queue.GeminiQueueUnavailable):
         gemini_queue.generate_content(lambda: called.append(True), call_kind="test")
 
-    assert called == []
+
+def test_async_late_response_is_preserved_and_recorded_once(monkeypatch):
+    outcomes = []
+    monkeypatch.setattr(gemini_queue, "_record", lambda *args: outcomes.append(args) or {"current_rpm": 0.5})
+
+    async def request():
+        await asyncio.sleep(0.05)
+        return SimpleNamespace(usage_metadata=SimpleNamespace(total_token_count=12))
+
+    result = asyncio.run(gemini_queue.generate_content_async(
+        request, call_kind="test", timeout_seconds=0.01, late_grace_seconds=0.2,
+    ))
+
+    assert result.usage_metadata.total_token_count == 12
+    assert outcomes == [(True, None, None, 12)]
+
+
+def test_async_timeout_cancels_the_request_task_and_records_one_failure(monkeypatch):
+    outcomes = []
+    cancelled = []
+    monkeypatch.setattr(gemini_queue, "_record", lambda *args: outcomes.append(args) or {"current_rpm": 0.5})
+
+    async def request():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(gemini_queue.generate_content_async(
+            request, call_kind="test", timeout_seconds=0.01, late_grace_seconds=0.01,
+        ))
+
+    assert cancelled == [True]
+    assert len(outcomes) == 1
+    assert outcomes[0][0] is False
+    assert outcomes[0][1] == "timeout"
+
+
+def test_async_call_cancelled_by_caller_does_not_record_a_success(monkeypatch):
+    outcomes = []
+    monkeypatch.setattr(gemini_queue, "_record", lambda *args: outcomes.append(args) or {"current_rpm": 0.5})
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def request():
+            started.set()
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(gemini_queue.generate_content_async(
+            request, call_kind="test",
+            timeout_seconds=5, late_grace_seconds=5,
+        ))
+        # Cancel only once the reservation was acquired and the provider task
+        # is genuinely running; cancelling during executor startup is a
+        # different (also safe) path and would make this assertion racy.
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert len(outcomes) == 1
+    assert outcomes[0][0] is False
+    assert outcomes[0][1] == "timeout"

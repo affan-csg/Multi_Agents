@@ -31,12 +31,14 @@ JobSource = Literal["ats", "careers_page", "web_search"]
 JobDiscoveryMethod = Literal["ats", "careers_page", "web_search", "unknown"]
 
 # Whether the job signal backing a company's score is real evidence or an
-# absence of it. "confirmed" -- a source was actually read (an ATS board, a
-# careers page, or a search result), whether or not it had zero postings.
-# "unknown" -- every discovery method was exhausted without reading anything
-# usable; the true job count could be zero OR nonzero, we simply don't know.
+# absence of it.
+#   "confirmed" -- a source was read and open postings were found.
+#   "none"      -- a valid ATS board/careers page was read and contained no
+#                  open postings (a real zero, not a failed lookup).
+#   "unknown"   -- every discovery method was exhausted without reading
+#                  anything usable; the true count could be zero OR nonzero.
 # Scoring must never treat "unknown" as "confirmed zero" (see scoring.py).
-HiringSignal = Literal["confirmed", "unknown"]
+HiringSignal = Literal["confirmed", "none", "unknown"]
 
 Method = Literal["reported", "estimated", "unknown"]
 

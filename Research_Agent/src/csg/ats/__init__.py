@@ -54,6 +54,7 @@ scope decision, not an oversight -- see workday.py's module docstring.
 
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Optional
 from urllib.parse import urlparse
@@ -198,6 +199,36 @@ def _board_matches_company(provider: str, token: str, domain: str, name: Optiona
     return any(part in owners for part in normalized_parts)
 
 
+def _board_token_related(provider: str, token: str, domain: str, name: Optional[str]) -> bool:
+    """Broader identity check for a link found on the company's own site.
+
+    A board token may be a legal/product variant rather than an exact slug
+    (``pulmicorporation`` beside ``pulumi.com``). Accept a meaningful prefix
+    or containment relationship, never an unrelated tenant. This keeps the
+    homepage-link attribution test while still reading real embedded boards.
+    """
+    if _board_matches_company(provider, token, domain, name):
+        return True
+    owners = _owner_tokens(domain, name)
+    parts = token.split("/") if provider == "workday" else [token]
+    for part in parts:
+        normalized = re.sub(r"[^a-z0-9]", "", part.lower())
+        if len(normalized) < 4:
+            continue
+        for owner in owners:
+            if len(owner) >= 4 and (owner in normalized or normalized in owner):
+                return True
+            # Legal suffixes and brand spellings can change one character
+            # (Pulumi -> "pulmicorporation"); compare the shared prefix rather
+            # than requiring an exact substring. An unrelated tenant (Sophos
+            # beside SecureWorks) scores far below this threshold.
+            if len(owner) >= 4 and difflib.SequenceMatcher(
+                None, owner, normalized[:len(owner) + 4],
+            ).ratio() >= 0.6:
+                return True
+    return False
+
+
 async def _scan_body_for_board(
     fetcher: Fetcher, url: str, body: str, domain: str, name: Optional[str]
 ) -> Optional[tuple[AtsProvider, str, str, Optional[str]]]:
@@ -210,7 +241,12 @@ async def _scan_body_for_board(
                 token = m.group(1)
                 if token.lower() in TOKEN_BLOCKLIST:
                     continue
-                if not _board_matches_company(provider, token, domain, name):
+                # A real embedded board link may use a legal/product token
+                # rather than the marketing-domain slug. Allow a meaningful
+                # prefix/containment relationship, but not an unrelated
+                # tenant linked from the page; the adapter still verifies the
+                # API before acceptance.
+                if not _board_token_related(provider, token, domain, name):
                     continue
                 if await ADAPTERS[provider].verify(fetcher, token):
                     return provider, token, "careers_page", url
@@ -218,7 +254,7 @@ async def _scan_body_for_board(
     for m in workday.LINK_RE.finditer(body):
         tenant, shard, site = m.group(1), m.group(2), m.group(3)
         token = workday.encode_token(tenant, shard, site)
-        if not _board_matches_company("workday", token, domain, name):
+        if not _board_token_related("workday", token, domain, name):
             continue
         if await workday.verify(fetcher, token):
             return "workday", token, "careers_page", url
@@ -249,11 +285,19 @@ async def _scan_urls(
 
 
 async def detect(
-    fetcher: Fetcher, domain: str, name: Optional[str] = None
+    fetcher: Fetcher, domain: str, name: Optional[str] = None,
+    careers_url: Optional[str] = None,
 ) -> Optional[tuple[AtsProvider, str, str, Optional[str]]]:
     """Return (provider, token, detected_by, careers_url) or None."""
     # --- 1. careers page scan, on the apex domain ---
     apex_urls = [f"https://{domain}{path}" for path in CAREERS_PATHS]
+    # The profiler may already know the official careers page. Scan that
+    # exact first-party URL before path guessing; host-check it so a bad or
+    # tampered stored URL can never make detection fetch an unrelated site.
+    if careers_url:
+        host = (urlparse(careers_url).hostname or "").lower().removeprefix("www.")
+        if host == domain or host.endswith(f".{domain}"):
+            apex_urls.insert(0, careers_url)
     found, subpages = await _scan_urls(fetcher, apex_urls, domain, name)
     if found:
         return found

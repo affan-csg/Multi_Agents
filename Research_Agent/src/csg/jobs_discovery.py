@@ -76,7 +76,7 @@ class JobDiscoveryResult:
     postings: list[JobPosting] = field(default_factory=list)
     method: str = "unknown"          # 'ats' | 'careers_page' | 'web_search' | 'unknown'
     source: Optional[str] = None     # ats_provider name, "careers page scrape", "tavily search"
-    hiring_signal: str = "unknown"   # 'confirmed' | 'unknown'
+    hiring_signal: str = "unknown"   # 'confirmed' | 'none' | 'unknown'
     notes: Optional[str] = None      # populated when hiring_signal == 'unknown', or to record a
                                       # skipped/failed stage even on eventual success
     ats_provider: Optional[str] = None
@@ -330,13 +330,15 @@ async def discover_jobs(
             postings = _deduplicate_postings(postings)
             print(f"[jobs_discovery] {domain}: ATS detected ({provider}) -> {len(postings)} jobs found")
             return JobDiscoveryResult(
-                postings=postings, method="ats", source=provider, hiring_signal="confirmed",
+                postings=postings, method="ats", source=provider,
+                hiring_signal="confirmed" if postings else "none",
                 ats_provider=provider, ats_token=token, ats_detected_by=detected_by, careers_url=careers_url,
-                notes=None,
+                notes=(None if postings else
+                       f"ATS board verified ({provider}) but has no open postings"),
             )
         careers_url_for_scrape = careers_url
     else:
-        careers_url_for_scrape = None
+        careers_url_for_scrape = company.careers_url
         notes.append("ATS not detected")
 
     # --- 2. careers-page scrape ---

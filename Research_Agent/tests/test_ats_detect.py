@@ -147,6 +147,28 @@ def test_detect_finds_bamboohr_board_link_on_careers_page():
     assert result == ("bamboohr", "acme", "careers_page", "https://acme.com")
 
 
+def test_detect_uses_exact_official_careers_url_and_related_board_token():
+    careers_url = "https://pulumi.com/careers/"
+    body = '<a href="https://job-boards.greenhouse.io/pulmicorporation">Open roles</a>'
+    fetcher = FakeFetcher(
+        gets={careers_url: (200, body)},
+        posts={
+            "https://boards-api.greenhouse.io/v1/boards/pulmicorporation/jobs":
+                (200, {"jobs": [{"id": 1, "title": "Engineer"}]}),
+            "https://boards-api.greenhouse.io/v1/boards/pulmicorporation/jobs?content=true":
+                (200, {"jobs": [{"id": 1, "title": "Engineer"}]}),
+        },
+    )
+
+    result = asyncio.run(detect(
+        fetcher, "pulumi.com", name="Pulumi", careers_url=careers_url,
+    ))
+
+    assert result == (
+        "greenhouse", "pulmicorporation", "careers_page", careers_url,
+    )
+
+
 def test_detect_finds_bamboohr_via_token_probe():
     # No board link anywhere on the site, but the guessed token ("acme",
     # derived from the domain) resolves against BambooHR directly.

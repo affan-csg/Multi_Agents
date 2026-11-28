@@ -169,6 +169,7 @@ def test_enrichment_timeout_is_counted_and_reports_progress(monkeypatch):
         await asyncio.Event().wait()
 
     monkeypatch.setattr(discover, "ENRICH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(discover, "LATE_RESPONSE_GRACE_SECONDS", 0.01)
     monkeypatch.setattr(discover, "enrich_company_firmographics", never_finishes)
 
     pairs, skipped, failures = asyncio.run(discover._enrich_all(
@@ -192,6 +193,7 @@ def test_enrichment_timeout_cancellation_does_not_mutate_company(monkeypatch):
         await asyncio.Event().wait()
 
     monkeypatch.setattr(discover, "ENRICH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(discover, "LATE_RESPONSE_GRACE_SECONDS", 0.01)
     monkeypatch.setattr(discover, "enrich_company_firmographics", never_finishes)
 
     pairs, _skipped, failures = asyncio.run(discover._enrich_all(
@@ -234,6 +236,179 @@ def test_done_enrichment_checkpoint_recovers_without_api_repeat(monkeypatch):
     assert calls == []
     assert failures == {}
     assert pairs[0][1].domain == "done.example"
+
+
+def test_zero_evidence_needs_review_checkpoint_is_retried_once_per_version():
+    outcomes = {
+        field: {"status": "found_but_rejected", "reason": "grounding unavailable"}
+        for field in research._FIELD_CRITERIA
+    }
+    summary = {"status": "needs_review", "review_fields": {"grounding": "unavailable"}}
+    payload = {"company": Company(domain="empty.example").model_dump(mode="json")}
+    old = {"status": "done", "payload": {**payload, "completeness": summary}}
+    assert discover._enrichment_checkpoint_is_reusable(old) is False
+
+    old_failed = {
+        "status": "failed",
+        "payload": {**payload, "completeness": summary, "reason": "ungrounded_response"},
+    }
+    assert discover._enrichment_checkpoint_is_reusable(old_failed) is False
+
+    retried = {
+        "status": "done",
+        "payload": {
+            **payload, "completeness": summary,
+            "review_recovery_version": discover.ENRICHMENT_RECOVERY_VERSION,
+            "review_recovery_attempted": True,
+        },
+    }
+    assert discover._enrichment_checkpoint_is_reusable(retried) is True
+
+    verified = {
+        "status": "done",
+        "payload": {
+            "company": Company(
+                domain="partial.example",
+                research_outcomes={
+                    "employee_range": {"status": "accepted_and_mapped"},
+                    "_summary": summary,
+                },
+            ).model_dump(mode="json"),
+            "completeness": summary,
+        },
+    }
+    assert discover._enrichment_checkpoint_is_reusable(verified) is True
+
+
+def test_researched_checkpoint_resumes_profiler_without_repeating_gemini(monkeypatch):
+    candidate = CompanyCandidate(
+        domain="resume.example", name="Resume", source="fake", discovered_at=datetime.now(),
+    )
+    cached = Company(
+        domain="resume.example", name="Resume",
+        research_outcomes={
+            "employee_range": {"status": "accepted_and_mapped", "criterion": "automatic_company_size"},
+            "_summary": {"status": "partial"},
+        },
+    )
+    checkpoints = {
+        "enrich:resume.example": {
+            "status": "researched",
+            "payload": {"company": cached.model_dump(mode="json"), "reason": None},
+        }
+    }
+    calls = []
+
+    async def should_not_run(company, **_kwargs):
+        calls.append(company.domain)
+        return None
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", should_not_run)
+
+    pairs, _skipped, failures = asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", None,
+        checkpoint_load=lambda key: checkpoints.get(key),
+        checkpoint_save=lambda key, status, payload: True,
+        run_id="resume-run",
+    ))
+
+    assert calls == []
+    assert failures == {}
+    assert pairs[0][1].domain == "resume.example"
+
+
+def test_site_checkpoint_restores_missing_facts_without_overwriting_stronger_values():
+    live = Company(
+        domain="site.example",
+        employee_count=ProvenanceValue(value=500, source="gemini_grounded_search"),
+        research_evidence=[{"evidence_key": "gemini", "field": "employee_range", "source_tier": 1}],
+    )
+    saved = Company(
+        domain="site.example",
+        website=ProvenanceValue(value="https://site.example", source="official_site"),
+        headquarters=ProvenanceValue(
+            value={"city": "Austin", "state": "TX"}, source="official_site",
+        ),
+        employee_count=ProvenanceValue(value=100, source="official_site"),
+        careers_url="https://site.example/careers",
+        research_evidence=[
+            {"evidence_key": "site", "field": "official_website", "source_tier": 1},
+            {"evidence_key": "other", "field": "industry", "source_tier": 3},
+        ],
+    )
+
+    restored = discover._restore_site_checkpoint(live, {
+        "profile": {"status": "ok", "extractor": "test"},
+        "company": saved.model_dump(mode="json"),
+    })
+
+    assert restored["status"] == "ok"
+    assert live.website.value == "https://site.example"
+    assert live.headquarters.value["city"] == "Austin"
+    assert live.employee_count.value == 500  # stronger Gemini value retained
+    assert live.careers_url == "https://site.example/careers"
+    assert [item["evidence_key"] for item in live.research_evidence] == ["gemini", "site"]
+
+
+def test_profiler_failure_after_successful_gemini_keeps_research_success(monkeypatch):
+    from csg.discovery import site_profile
+
+    candidate = CompanyCandidate(
+        domain="site-down.example", name="Site Down", source="fake", discovered_at=datetime.now(),
+    )
+
+    async def enrich(company, **_kwargs):
+        company.employee_count = ProvenanceValue(value=100, source="gemini_grounded_search")
+        company.research_outcomes["employee_range"] = {
+            "status": "accepted_and_mapped", "criterion": "automatic_company_size",
+        }
+        company.research_outcomes["_summary"] = {"status": "partial"}
+        return "incomplete_result"
+
+    async def broken(_company):
+        return {"status": "error", "error": "robots.txt blocked"}
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", enrich)
+    monkeypatch.setattr(site_profile, "profile_official_site", broken)
+
+    pairs, _skipped, failures = asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", None, run_id="site-failure",
+    ))
+
+    company = pairs[0][1]
+    assert failures == {}
+    assert company.employee_count.value == 100
+    assert company.research_outcomes["_summary"]["status"] == "partial"
+    assert company.research_outcomes["_site_profile"]["status"] == "error"
+
+
+def test_profiler_success_cannot_hide_a_gemini_operational_failure(monkeypatch):
+    from csg.discovery import site_profile
+
+    candidate = CompanyCandidate(
+        domain="provider-down.example", name="Provider Down", source="fake", discovered_at=datetime.now(),
+    )
+
+    async def failed(company, **_kwargs):
+        return "timeout"
+
+    async def profile(company):
+        company.employee_count = ProvenanceValue(value=40, source="gemini_grounded_search")
+        return {"status": "ok", "fields": {"employee_count": "accepted"}}
+
+    monkeypatch.setattr(discover, "enrich_company_firmographics", failed)
+    monkeypatch.setattr(site_profile, "profile_official_site", profile)
+
+    pairs, _skipped, failures = asyncio.run(discover._enrich_all(
+        FakeConn(), [candidate], "GA", None, run_id="provider-failure",
+    ))
+
+    company = pairs[0][1]
+    assert failures == {"timeout": 1}
+    assert company.employee_count.value == 40
+    assert company.research_outcomes["_site_profile"]["status"] == "ok"
+    assert company.research_outcomes["_summary"]["status"] == "failed"
+    assert company.research_outcomes["_summary"]["failure_reason"] == "timeout"
 
 
 def test_nonempty_enrichment_reason_is_saved_as_failed_checkpoint(monkeypatch):

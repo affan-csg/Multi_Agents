@@ -78,7 +78,7 @@ export interface ImportedProspect {
    *  count is simply unknown (see Research_Agent's models.HiringSignal).
    *  Never read an empty `open_reqs` as "not hiring" when this is
    *  'unknown'. */
-  hiring_signal: "confirmed" | "unknown" | null;
+  hiring_signal: "confirmed" | "none" | "unknown" | null;
   /** True when the Research Agent's last qualification attempt for this
    *  domain failed and nothing has succeeded since (see Research_Agent's
    *  qualification_attempts table). Distinguishes "qualification failed,

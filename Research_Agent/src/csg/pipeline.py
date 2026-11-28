@@ -88,7 +88,9 @@ async def _process_one(
     # --- stage 1: detect ATS (unchanged -- cheap, cached, highest precision) ---
     # Stored tokens are hints only: the source page and owner token are
     # revalidated on every run before any board postings are admitted.
-    ats_result: Optional[tuple] = await ats.detect(fetcher, company.domain, company.name)
+    ats_result: Optional[tuple] = await ats.detect(
+        fetcher, company.domain, company.name, careers_url=company.careers_url,
+    )
     if ensure_owned:
         ensure_owned()
 

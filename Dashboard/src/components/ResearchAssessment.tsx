@@ -100,7 +100,73 @@ const OPERATIONAL_REASON_LABEL: Record<string, string> = {
   interrupted: "research was interrupted",
 };
 
-function FieldResearchOutcomes({
+type SiteProfile = NonNullable<ResearchOutcomes["_site_profile"]>;
+
+const SITE_STATUS_LABEL: Record<string, string> = {
+  ok: "Official site read",
+  error: "Official site could not be read",
+  timeout: "Official site read timed out",
+  skipped: "Official site was not checked",
+};
+
+const SITE_FIELD_LABEL: Record<string, string> = {
+  accepted: "Accepted from official site",
+  already_verified: "Already verified by stronger research",
+  missing_on_site: "Not present on official site",
+};
+
+export function OfficialSiteProfile({
+  profile,
+  researchEvidence,
+}: {
+  profile?: SiteProfile;
+  researchEvidence?: CompanyResearchEvidence[];
+}) {
+  if (!profile) return null;
+  const informational = (researchEvidence || []).filter((item) => item.informational);
+  const fields = Object.entries(profile.fields || {});
+  return (
+    <div className="assessment-block">
+      <h4>Official site research</h4>
+      <p className="assessment-muted">
+        {SITE_STATUS_LABEL[String(profile.status)] || formatAssessmentValue(String(profile.status))}
+        {profile.extractor ? ` · extractor ${profile.extractor}` : ""}
+        {profile.job_link_count ? ` · ${profile.job_link_count} job link${profile.job_link_count === 1 ? "" : "s"} observed` : ""}
+      </p>
+      {profile.error && <p className="error-text">Operational detail: {profile.error}</p>}
+      {profile.careers_url && <p className="assessment-muted">Careers page: <a href={profile.careers_url} target="_blank" rel="noreferrer">{profile.careers_url}</a></p>}
+      {fields.length > 0 && <ul className="assessment-evidence-links">
+        {fields.map(([field, state]) => <li key={field}>
+          <strong>{field.replaceAll("_", " ")}</strong> · {SITE_FIELD_LABEL[state] || formatAssessmentValue(state)}
+        </li>)}
+      </ul>}
+      {profile.technologies && profile.technologies.length > 0 && <p className="assessment-muted">
+        Technologies observed: {profile.technologies.join(", ")}
+      </p>}
+      {profile.pages && profile.pages.length > 0 && <details>
+        <summary>Official-site pages checked ({profile.pages.length})</summary>
+        <ul className="assessment-evidence-links">
+          {profile.pages.map((page, index) => <li key={`${page.url}-${index}`}>
+            <a href={page.url} target="_blank" rel="noreferrer">{page.url}</a>
+            {` · ${String(page.status)}${page.kind ? ` · ${page.kind}` : ""}`}
+          </li>)}
+        </ul>
+      </details>}
+      {informational.length > 0 && <details>
+        <summary>Official-site evidence ({informational.length})</summary>
+        <ul className="assessment-evidence-links">
+          {informational.map((item, index) => <li key={`${item.evidence_key || item.field}-${index}`}>
+            <strong>{(item.field || "informational").replaceAll("_", " ")}</strong>
+            {item.excerpt ? ` · ${item.excerpt}` : ""}
+            {item.source_url ? <> · <a href={item.source_url} target="_blank" rel="noreferrer">source</a></> : null}
+          </li>)}
+        </ul>
+      </details>}
+    </div>
+  );
+}
+
+export function FieldResearchOutcomes({
   outcomes,
   researchEvidence,
 }: {
@@ -122,6 +188,13 @@ function FieldResearchOutcomes({
   return (
     <div className="assessment-block">
       <h4>Field research outcomes</h4>
+      {outcomes?._grounding && <p className="assessment-muted">
+        Grounding: {outcomes._grounding.available ? "provider support segments available" : "unavailable — claims were rejected"}
+        {outcomes._grounding.reason ? ` (${outcomes._grounding.reason})` : ""}
+        {typeof outcomes._grounding.grounding_chunk_count === "number"
+          ? ` · ${outcomes._grounding.grounding_chunk_count} source chunks · ${String(outcomes._grounding.grounding_support_segment_count ?? 0)} support segments`
+          : ""}
+      </p>}
       {overallStatus && <p className="assessment-muted">
         Firmographic research: {ENRICHMENT_STATUS_LABEL[overallStatus] || formatAssessmentValue(overallStatus)}
         {overallReason ? ` (${OPERATIONAL_REASON_LABEL[overallReason] || "enrichment did not finish"})` : ""}
@@ -153,6 +226,7 @@ function FieldResearchOutcomes({
           </li>;
         })}
       </ul>
+      <OfficialSiteProfile profile={outcomes?._site_profile} researchEvidence={researchEvidence} />
     </div>
   );
 }

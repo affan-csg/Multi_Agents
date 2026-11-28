@@ -76,6 +76,23 @@ def test_ats_detected_and_jobs_found():
     assert result.postings[0].ats_provider == "greenhouse"
 
 
+def test_verified_empty_ats_board_is_not_confirmed_hiring():
+    """A 200 with an empty BambooHR result is a valid empty board, not proof
+    of active hiring. It must be distinct from both "confirmed open roles"
+    and "provider unavailable/unknown"."""
+    url = "https://acme.bamboohr.com/careers/list"
+    fetcher = FakeFetcher(jsons={url: (200, {"meta": {"totalCount": 0}, "result": []})})
+    ats_result = ("bamboohr", "acme", "careers_page", "https://acme.com/careers")
+
+    result = asyncio.run(discover_jobs(fetcher, _company(), ats_result))
+
+    assert result.method == "ats"
+    assert result.postings == []
+    assert result.hiring_signal == "none"
+    assert result.ats_provider == "bamboohr"
+    assert "no open postings" in (result.notes or "")
+
+
 # --------------------------------------------------------------------------
 # 2. No ATS -> careers page -> jobs found
 # --------------------------------------------------------------------------

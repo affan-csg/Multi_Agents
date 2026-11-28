@@ -330,7 +330,12 @@ def deploy_revision(
         "--quiet",
     ]
     if worker:
-        command.extend(["--command", "python", "--args=-m,csg.worker"])
+        # The Research Worker must never become publicly invokable. Passing the
+        # flag explicitly makes the revision private even if the previous
+        # service configuration was drifted open; `gcloud run deploy` keeps
+        # every other existing setting (env, secrets, probes, scaling, CPU,
+        # memory, timeout, ingress) because only --image/--command/--args are set.
+        command.extend(["--command", "python", "--args=-m,csg.worker", "--no-allow-unauthenticated"])
     result = run(command)
     output = result.stdout or ""
     revision = _parse_revision_from_output(output, service)
@@ -506,6 +511,10 @@ def main() -> int:
         return 0
     except DeploymentError as exc:
         print(f"DEPLOYMENT_FAILED: {exc}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        print(f"DEPLOYMENT_FAILED: {exc}\n{detail}", file=sys.stderr)
         return 1
 
 

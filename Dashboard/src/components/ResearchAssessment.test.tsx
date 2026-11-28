@@ -142,6 +142,42 @@ describe("ResearchAssessmentPanel", () => {
     expect(html).toContain("Nearshore — LATAM talent: Regional Open (Verified) · Staffing Unknown (Unavailable)");
     expect(html).toContain("Offshore — Pakistan talent: Regional Open (Inferred) · Staffing Open (Inferred)");
   });
+
+  it("renders additive official-site and grounding evidence without changing legacy outcomes", () => {
+    const html = renderToStaticMarkup(
+      <ResearchAssessmentPanel
+        assessment={null}
+        outcomes={{
+          employee_range: { status: "accepted_and_mapped", criterion: "automatic_company_size" },
+          _summary: { status: "complete_with_gaps", missing_fields: {}, counts: { verified: 1 } },
+          _grounding: {
+            available: true, source: "grounding_metadata", grounding_chunk_count: 4,
+            grounding_support_segment_count: 6,
+          },
+          _site_profile: {
+            status: "ok", extractor: "official-site-v2", careers_url: "https://example.com/careers",
+            job_link_count: 3, technologies: ["HubSpot"],
+            fields: { official_website: "accepted", headquarters: "already_verified" },
+            pages: [{ url: "https://example.com/about", status: 200, kind: "about" }],
+          },
+        }}
+        researchEvidence={[{
+          evidence_key: "site-careers", field: "careers_page",
+          claim: { careers_page: "https://example.com/careers" },
+          excerpt: "https://example.com/careers", source_url: "https://example.com/careers",
+          source_tier: 1, informational: true,
+        }]}
+      />,
+    );
+
+    expect(html).toContain("Grounding: provider support segments available");
+    expect(html).toContain("4 source chunks");
+    expect(html).toContain("Official site research");
+    expect(html).toContain("Official site read");
+    expect(html).toContain("https://example.com/careers");
+    expect(html).toContain("Official-site evidence");
+    expect(html).toContain("HubSpot");
+  });
 });
 
 describe("matchesAssessmentFilters", () => {

@@ -17,7 +17,8 @@ def test_cloudbuild_parses():
     data = load_cb()
     assert isinstance(data, dict)
     assert "steps" in data
-    assert len(data["steps"]) == 4
+    assert len(data["steps"]) == 5
+    assert [step["id"] for step in data["steps"]][-1] == "Deploy API and Research Worker"
 
 
 def test_no_trigger_id_substitution():
@@ -112,3 +113,51 @@ def test_validate_step_ships_its_own_python():
     # cloud-sdk:slim has no python3 on PATH; the full image bundles one.
     assert ":slim" not in step["name"]
     assert "bundledpythonunix" in "\n".join(step.get("args") or [])
+
+
+def deploy_script() -> str:
+    data = load_cb()
+    step = next(s for s in data["steps"] if s.get("id") == "Deploy API and Research Worker")
+    return "\n".join(step.get("args") or [])
+
+
+def test_deploy_step_runs_the_orchestrator_for_both_services():
+    script = deploy_script()
+    assert "scripts/deployment_orchestrator.py" in script
+    assert "--api-service multi-agents" in script
+    assert "--worker-service multi-agents-research-worker" in script
+
+
+def test_deploy_step_pins_the_image_by_digest():
+    script = deploy_script()
+    # The deployable reference must be <repo>@sha256:<64 hex>, never a tag.
+    assert "image_summary.digest" in script
+    assert 'IMAGE="$$IMAGE_BASE@$$DIGEST"' in script
+    assert "^sha256:[0-9a-f]{64}" in script
+    assert ":latest" not in script
+
+
+def test_deploy_step_rejects_a_missing_digest_before_deploying():
+    script = deploy_script()
+    guard = script.index("Could not resolve an immutable digest")
+    deploy_call = script.index('"$$PYTHON" scripts/deployment_orchestrator.py')
+    assert guard < deploy_call
+    assert "exit 1" in script[guard:deploy_call]
+
+
+def test_deploy_step_passes_service_urls_for_audience():
+    script = deploy_script()
+    assert "run services describe multi-agents " in script
+    assert "run services describe multi-agents-research-worker " in script
+    assert "--worker-url" in script
+    assert "--api-url" in script
+
+
+def test_only_the_deploy_step_issues_cloud_run_changes():
+    data = load_cb()
+    for step in data["steps"]:
+        script = "\n".join(step.get("args") or [])
+        if step.get("id") == "Deploy API and Research Worker":
+            continue
+        assert "run deploy" not in script
+        assert "update-traffic" not in script

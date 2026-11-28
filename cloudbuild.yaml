@@ -70,6 +70,48 @@ steps:
         echo "$$LABELS" | grep -F "\"org.opencontainers.image.revision\":\"$$COMMIT_SHA\""
         echo "$$LABELS" | grep -F "\"com.csg.cloudbuild.id\":\"$$BUILD_ID\""
 
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: Deploy API and Research Worker
+    entrypoint: bash
+    env:
+      - COMMIT_SHA=$COMMIT_SHA
+      - BUILD_ID=$BUILD_ID
+      - DEPLOY_REGION=$_DEPLOY_REGION
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # Deploy the exact image this build pushed, pinned by manifest digest.
+        # scripts/deployment_orchestrator.py owns the ordering: API revision
+        # (no traffic) -> verify digest, runtime config and readiness -> Worker
+        # revision (no traffic, private) -> verify -> switch API traffic ->
+        # switch Worker traffic -> re-verify. Any failure exits non-zero, which
+        # fails this build; a failed post-switch check restores the previous
+        # 100%-traffic revision on both services.
+        export PATH="/usr/lib/google-cloud-sdk/bin:$$PATH"
+        export CLOUDSDK_CORE_PROJECT="$PROJECT_ID"
+        PYTHON=/usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3
+        IMAGE_BASE="$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/multi_agents/multi-agents"
+        DIGEST="$$(gcloud artifacts docker images describe "$$IMAGE_BASE:$$COMMIT_SHA" --format='value(image_summary.digest)')"
+        if ! printf '%s' "$$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$$'; then
+          echo "Could not resolve an immutable digest for $$COMMIT_SHA (got '$$DIGEST')" >&2
+          exit 1
+        fi
+        IMAGE="$$IMAGE_BASE@$$DIGEST"
+        echo "Deploying $$IMAGE (commit $$COMMIT_SHA, build $$BUILD_ID)"
+        API_URL="$$(gcloud run services describe multi-agents --region "$_DEPLOY_REGION" --project "$PROJECT_ID" --format='value(status.url)')"
+        WORKER_URL="$$(gcloud run services describe multi-agents-research-worker --region "$_DEPLOY_REGION" --project "$PROJECT_ID" --format='value(status.url)')"
+        "$$PYTHON" scripts/deployment_orchestrator.py \
+          --project "$PROJECT_ID" \
+          --region "$_DEPLOY_REGION" \
+          --commit "$$COMMIT_SHA" \
+          --build-id "$$BUILD_ID" \
+          --image "$$IMAGE" \
+          --api-service multi-agents \
+          --worker-service multi-agents-research-worker \
+          --api-url "$$API_URL" \
+          --worker-url "$$WORKER_URL"
+
 substitutions:
   _AR_HOSTNAME: asia-northeast1-docker.pkg.dev
   _AR_PROJECT_ID: csgroup-514114

@@ -172,6 +172,7 @@ def test_timed_out_gemini_response_cannot_mutate_company_later(gemini_keys, monk
         "csg.discovery.gemini_keys.make_gemini_client", lambda _key: FakeClient(),
     )
     monkeypatch.setattr(discover, "ENRICH_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(discover, "LATE_RESPONSE_GRACE_SECONDS", 0.01)
 
     async def run_enrichment():
         def release_after_timeout(stage, done, _total, _detail):
@@ -785,9 +786,15 @@ def test_grounding_metadata_accepts_installed_google_genai_response_models():
         "response_type": "GenerateContentResponse",
         "candidate_count": 1,
         "grounding_metadata_count": 1,
+        "grounding_metadata_present": True,
+        "grounding_metadata_empty": False,
         "grounding_metadata_types": ["GroundingMetadata"],
+        "grounding_metadata_keys": ["grounding_chunks", "grounding_supports"],
         "grounding_chunk_count": 1,
         "grounding_support_count": 1,
+        "grounding_support_segment_count": 1,
+        "grounding_supported_url_count": 1,
+        "web_search_query_count": 0,
     }
 
 
@@ -1727,8 +1734,11 @@ def test_legacy_ungrounded_checkpoint_with_usable_research_is_reused():
 
 
 def test_ungrounded_checkpoint_with_classified_summary_is_reused():
-    outcomes = {"revenue": {"status": "found_but_rejected", "reason": "supporting URL missing"},
-                "_summary": {"status": "needs_review"}}
+    outcomes = {
+        "employee_range": {"status": "accepted_and_mapped", "criterion": "automatic_company_size"},
+        "revenue": {"status": "found_but_rejected", "reason": "supporting URL missing"},
+        "_summary": {"status": "needs_review"},
+    }
 
     assert discover._enrichment_checkpoint_is_reusable(
         _legacy_checkpoint("failed", "ungrounded_response", outcomes)

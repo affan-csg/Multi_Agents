@@ -28,7 +28,10 @@ from .gemini_keys import (
     GeminiKeyPool, is_connection_error, is_daily_quota_exhausted,
     make_ipv4_async_httpx_client,
 )
-from ..gemini_queue import GeminiQuotaBlocked, GeminiRetryLater, generate_content
+from ..gemini_queue import (
+    LATE_RESPONSE_GRACE_SECONDS, GeminiQuotaBlocked, GeminiRetryLater,
+    generate_content_async,
+)
 from ..models import Company, ProvenanceValue
 from ..diagnostics import log_event
 from ..usage_tracker import track
@@ -1888,8 +1891,15 @@ def _apply_firmographics(
                     rejection_reasons.setdefault(field, "evidence failed source, excerpt, or criterion validation")
 
     previous_evidence: dict[str, dict[str, Any]] = {}
+    preserved_informational: list[dict[str, Any]] = []
     seen_identities: set[tuple] = set()
     for item in company.research_evidence:
+        if isinstance(item, dict) and item.get("informational") and not item.get("evidence_key"):
+            # Older profiler versions wrote informational careers/technology
+            # evidence without a key. Keep it across a Gemini retry rather than
+            # relying on a key the profiler can no longer re-create.
+            preserved_informational.append(item)
+            continue
         if not isinstance(item, dict) or not item.get("evidence_key"):
             continue
         identity = _evidence_identity(item)
@@ -1904,7 +1914,7 @@ def _apply_firmographics(
             continue
         seen_identities.add(identity)
         previous_evidence.setdefault(item["evidence_key"], item)
-    company.research_evidence = list(previous_evidence.values())
+    company.research_evidence = list(previous_evidence.values()) + preserved_informational
     for field in conflicting_fields:
         accepted_fields.discard(field)
 
@@ -2138,6 +2148,9 @@ def _extract_gemini_grounding_urls(response: Any) -> dict[str, str]:
 def _extract_gemini_grounding_supports(response: Any) -> dict[str, list[str]]:
     """Map grounded source URLs to answer segments Google associates with them."""
     supports_by_url: dict[str, list[str]] = {}
+    response_text = getattr(response, "text", "") or ""
+    if not isinstance(response_text, str):
+        response_text = ""
     candidates = _grounding_value(response, "candidates") or []
     if isinstance(candidates, dict):
         candidates = [candidates]
@@ -2167,6 +2180,15 @@ def _extract_gemini_grounding_supports(response: Any) -> dict[str, list[str]]:
         for support in supports:
             segment = _grounding_value(support, "segment")
             segment_text = _grounding_value(segment, "text")
+            if (not isinstance(segment_text, str) or not segment_text.strip()) and response_text:
+                # Some provider/SDK shapes carry only the segment's character
+                # offsets. Recover the exact text from the response instead of
+                # treating a valid support as absent; no claim comparison is
+                # weakened because the recovered slice must still state it.
+                start = _grounding_value(segment, "start_index", "startIndex")
+                end = _grounding_value(segment, "end_index", "endIndex")
+                if isinstance(start, int) and isinstance(end, int) and 0 <= start < end <= len(response_text):
+                    segment_text = response_text[start:end]
             if not isinstance(segment_text, str) or not segment_text.strip():
                 continue
             chunk_indices = _grounding_value(
@@ -2175,8 +2197,12 @@ def _extract_gemini_grounding_supports(response: Any) -> dict[str, list[str]]:
             if not isinstance(chunk_indices, (list, tuple)):
                 continue
             for index in chunk_indices:
-                if isinstance(index, int) and index in urls_by_index:
-                    supports_by_url.setdefault(urls_by_index[index], []).append(segment_text.strip())
+                try:
+                    numeric_index = int(index)
+                except (TypeError, ValueError):
+                    continue
+                if numeric_index in urls_by_index:
+                    supports_by_url.setdefault(urls_by_index[numeric_index], []).append(segment_text.strip())
     return supports_by_url
 
 
@@ -2364,19 +2390,78 @@ def _gemini_grounding_shape(response: Any) -> dict[str, Any]:
     metadata_values = [metadata for metadata in metadata_values if metadata is not None]
     chunk_count = 0
     support_count = 0
+    support_segment_count = 0
+    query_count = 0
+    metadata_keys: set[str] = set()
     for metadata in metadata_values:
         chunks = _grounding_value(metadata, "grounding_chunks", "groundingChunks") or []
         supports = _grounding_value(metadata, "grounding_supports", "groundingSupports") or []
+        queries = _grounding_value(metadata, "web_search_queries", "webSearchQueries") or []
         chunk_count += len(chunks) if isinstance(chunks, (list, tuple, dict)) else 0
         support_count += len(supports) if isinstance(supports, (list, tuple, dict)) else 0
+        if isinstance(supports, dict):
+            supports = [supports]
+        if isinstance(supports, (list, tuple)):
+            for support in supports:
+                segment = _grounding_value(support, "segment")
+                text = _grounding_value(segment, "text") if segment is not None else None
+                if isinstance(text, str) and text.strip():
+                    support_segment_count += 1
+        query_count += len(queries) if isinstance(queries, (list, tuple)) else 0
+        if isinstance(metadata, dict):
+            metadata_keys.update(str(key) for key in metadata)
+        else:
+            # The SDK returns pydantic models. Dumping only set fields shows
+            # which signals the provider actually emitted (only
+            # web_search_queries, say), which separates "provider ran a search
+            # but sent no chunks" from "provider omitted metadata".
+            dump = getattr(metadata, "model_dump", None)
+            if callable(dump):
+                try:
+                    metadata_keys.update(
+                        str(key) for key in dump(exclude_none=True)
+                    )
+                except TypeError:
+                    pass
+            else:
+                metadata_keys.update(str(key) for key in vars(metadata))
     return {
         "response_type": type(response).__name__,
         "candidate_count": len(candidates),
         "grounding_metadata_count": len(metadata_values),
+        "grounding_metadata_present": bool(metadata_values),
+        # Present-but-empty is the deployed signature we are diagnosing: the
+        # object arrives, but carries no chunks and no supports.
+        "grounding_metadata_empty": bool(metadata_values) and chunk_count == 0 and support_count == 0,
         "grounding_metadata_types": sorted({type(value).__name__ for value in metadata_values}),
+        "grounding_metadata_keys": sorted(metadata_keys),
         "grounding_chunk_count": chunk_count,
         "grounding_support_count": support_count,
+        "grounding_support_segment_count": support_segment_count,
+        "grounding_supported_url_count": len(_extract_gemini_grounding_supports(response)),
+        "web_search_query_count": query_count,
     }
+
+
+def _gemini_grounding_unavailable_reason(shape: dict[str, Any]) -> str:
+    """Name the exact shape failure so absent and empty metadata are not conflated."""
+    if not shape.get("grounding_metadata_present"):
+        return "grounding metadata absent from response"
+    if shape.get("grounding_metadata_empty"):
+        return (
+            "grounding metadata present but empty "
+            f"(chunks={shape.get('grounding_chunk_count', 0)}, "
+            f"supports={shape.get('grounding_support_count', 0)}, "
+            f"queries={shape.get('web_search_query_count', 0)})"
+        )
+    if shape.get("grounding_support_count", 0) and not shape.get("grounding_supported_url_count", 0):
+        return (
+            "grounding supports present but no usable segment/chunk mapping "
+            f"(supports={shape.get('grounding_support_count', 0)}, "
+            f"segments={shape.get('grounding_support_segment_count', 0)}, "
+            f"chunks={shape.get('grounding_chunk_count', 0)})"
+        )
+    return "grounding metadata present without support segments"
 
 
 def _gemini_response_diagnostics(response: Any) -> dict[str, Any]:
@@ -2797,6 +2882,8 @@ async def _enrich_via_groq_tavily(
 async def enrich_company_firmographics(
     company: Company,
     run_id: Optional[str] = None,
+    timeout_seconds: float = 180.0,
+    late_grace_seconds: float | None = None,
 ) -> Optional[str]:
     """Enrich a company with real firmographic data via Gemini API.
 
@@ -2818,23 +2905,59 @@ async def enrich_company_firmographics(
     )
 
     try:
-        from .gemini_keys import make_gemini_client
+        from .gemini_keys import gemini_client_profile, make_gemini_client
 
-        def _call_with_connection_retry(key: str):
+        async def _close_client(client: Any) -> None:
+            """Close both SDK transports without masking the provider result."""
+            async_client = getattr(client, "aio", None)
+            if async_client is not None and hasattr(async_client, "aclose"):
+                try:
+                    await async_client.aclose()
+                except Exception:
+                    pass
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        async def _generate(client: Any):
+            async_models = getattr(getattr(client, "aio", None), "models", None)
+            if async_models is not None and hasattr(async_models, "generate_content"):
+                return await async_models.generate_content(
+                    model=_GEMINI_MODEL,
+                    contents=prompt,
+                    config={"temperature": 0.1, "tools": [{"google_search": {}}]},
+                )
+            # Compatibility for test doubles and older SDK shims that only
+            # expose the synchronous surface. Production always takes the
+            # cancellable async branch above.
+            return await asyncio.to_thread(
+                client.models.generate_content,
+                model=_GEMINI_MODEL,
+                contents=prompt,
+                config={"temperature": 0.1, "tools": [{"google_search": {}}]},
+            )
+
+        async def _call_with_connection_retry(key: str):
             with track("gemini", "enrich_firmographics", run_id=run_id, domain=company.domain) as u:
                 connection_retries = 0
                 while True:
+                    client = None
                     try:
                         client = make_gemini_client(key)
-                        response = generate_content(
-                            lambda: client.models.generate_content(
-                                model=_GEMINI_MODEL,
-                                contents=prompt,
-                                config={"temperature": 0.1, "tools": [{"google_search": {}}]},
-                            ),
+                        response = await generate_content_async(
+                            lambda: _generate(client),
                             call_kind="enrich_firmographics",
                             run_id=run_id,
                             domain=company.domain,
+                            timeout_seconds=timeout_seconds,
+                            late_grace_seconds=(
+                                late_grace_seconds
+                                if late_grace_seconds is not None
+                                else LATE_RESPONSE_GRACE_SECONDS
+                            ),
                         )
                         meta = getattr(response, "usage_metadata", None)
                         if meta is not None:
@@ -2850,15 +2973,18 @@ async def enrich_company_firmographics(
                             print(f"  [WARN] transient connection error reaching Gemini for "
                                   f"{company.domain} ({type(exc).__name__}), retrying once")
                             connection_retries += 1
-                            _time.sleep(_CONNECTION_ERROR_RETRY_DELAY)
+                            await asyncio.sleep(_CONNECTION_ERROR_RETRY_DELAY)
                             continue
                         raise
+                    finally:
+                        if client is not None:
+                            await _close_client(client)
 
         response = None
         last_exc: Exception | None = None
         for attempt in pool.attempts():
             try:
-                response = await asyncio.to_thread(_call_with_connection_retry, attempt.key)
+                response = await _call_with_connection_retry(attempt.key)
                 break
             except Exception as exc:
                 last_exc = exc
@@ -2920,13 +3046,28 @@ async def enrich_company_firmographics(
         # generated text and cannot establish which source supports which
         # claim; when the metadata is absent, nothing in this response can be
         # verified and every non-null claim is recorded as needing review.
+        grounding_shape = _gemini_grounding_shape(response)
         grounding_available = bool(grounding_supports)
         grounding_source = "grounding_metadata" if grounding_available else "unavailable"
+        grounding_unavailable_reason = (
+            None if grounding_available else _gemini_grounding_unavailable_reason(grounding_shape)
+        )
+        # Persist the non-sensitive shape with the company record. A later
+        # reviewer can then tell "provider sent no chunks" apart from a parser
+        # regression without replaying a live provider call.
+        company.research_outcomes["_grounding"] = {
+            "available": grounding_available,
+            "source": grounding_source,
+            "reason": grounding_unavailable_reason,
+            **grounding_shape,
+        }
         if not grounding_available:
             log_event(
                 "gemini_grounding_unavailable", domain=company.domain, run_id=run_id,
                 grounding_url_count=len(grounding_urls),
-                reason="grounding metadata or support segments missing",
+                reason=grounding_unavailable_reason,
+                **grounding_shape,
+                **gemini_client_profile(),
             )
         # Google's chunk URLs are opaque redirects; resolve them so a claim that
         # cites the real page URL can be tied to the chunk that grounded it and
@@ -2939,7 +3080,6 @@ async def enrich_company_firmographics(
         grounding_redirects = await asyncio.to_thread(
             _resolve_cited_redirects, data, grounding_redirects,
         )
-        grounding_shape = _gemini_grounding_shape(response)
         log_event(
             "gemini_response_processing",
             domain=company.domain,
@@ -2948,7 +3088,9 @@ async def enrich_company_firmographics(
             grounding_resolved_count=len(grounding_redirects),
             grounding_source=grounding_source,
             grounding_available=grounding_available,
+            grounding_unavailable_reason=grounding_unavailable_reason,
             **grounding_shape,
+            **gemini_client_profile(),
             processing_ms=int((_time.monotonic() - grounding_started) * 1000),
         )
 

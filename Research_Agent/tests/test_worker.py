@@ -507,7 +507,7 @@ def test_pipeline_aborts_before_writes_when_ownership_is_lost(monkeypatch):
     writes = []
     ownership_checks = 0
 
-    async def detect(*_args):
+    async def detect(*_args, **_kwargs):
         return None
 
     async def discover_jobs(*_args):
