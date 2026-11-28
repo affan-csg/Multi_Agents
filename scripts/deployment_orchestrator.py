@@ -16,6 +16,7 @@ from typing import Callable
 DIGEST_PREFIX = "sha256:"
 DEFAULT_HEALTH_CHECK_TIMEOUT = float(os.environ.get("DEPLOYMENT_HEALTH_CHECK_TIMEOUT", "30"))
 DEFAULT_REVISION_URL_TIMEOUT = float(os.environ.get("DEPLOYMENT_REVISION_URL_TIMEOUT", "180"))
+DEFAULT_REVISION_TAG = (os.environ.get("DEPLOYMENT_REVISION_TAG") or "deploy-check").strip()
 _TERMINAL_REVISION_REASONS = {
     "RevisionFailed",
     "ContainerFailed",
@@ -32,55 +33,73 @@ def _ready_condition(data: dict) -> dict | None:
     return None
 
 
-def revision_url(service: str, revision: str, region: str, project: str) -> str:
-    """Return the exact new revision's URL, waiting for Cloud Run readiness.
+def _terminal_revision_failure(data: dict) -> str | None:
+    ready = _ready_condition(data)
+    if ready is None or ready.get("status") != "False":
+        return None
+    reason = ready.get("reason") or ""
+    if reason not in _TERMINAL_REVISION_REASONS:
+        return None
+    return f"{reason}: {ready.get('message', '')}".rstrip()
 
-    A freshly created no-traffic revision may not expose ``status.url`` (or a
-    successful ``Ready`` condition) until its container has started. Polling
-    here avoids treating that normal startup delay as a deployment failure.
+
+def revision_url(service: str, revision: str, tag: str, region: str, project: str) -> str:
+    """Return the routable URL for the candidate revision carrying ``tag``.
+
+    A revision deployed with ``--no-traffic`` has no servable ``status.url``
+    until it owns a traffic tag, so the tag entry in the service's traffic
+    status is the only reliable address for it. Polling also covers the short
+    window before Cloud Run records the tag on the service. The returned URL
+    is guaranteed to point at ``revision`` and not at an older tagged
+    revision.
     """
     deadline = time.monotonic() + DEFAULT_REVISION_URL_TIMEOUT
     last_error: Exception | None = None
     while True:
+        service_data: dict | None = None
         try:
-            data = gcloud_json([
-                "run", "revisions", "describe", revision,
+            service_data = gcloud_json([
+                "run", "services", "describe", service,
                 "--region", region,
                 "--project", project,
             ])
             last_error = None
         except Exception as exc:  # pragma: no cover - network/CLI failures are retried
             last_error = exc
-            data = None
 
-        if isinstance(data, dict):
-            status = data.get("status") or {}
-            url = status.get("url")
-            ready = _ready_condition(data)
-            if isinstance(url, str) and url:
-                if ready is None or ready.get("status") == "True":
+        if isinstance(service_data, dict):
+            for entry in (service_data.get("status") or {}).get("traffic") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("tag") != tag or entry.get("revisionName") != revision:
+                    continue
+                url = entry.get("url")
+                if isinstance(url, str) and url:
                     return url
-                if ready.get("status") == "False":
-                    reason = ready.get("reason") or ""
-                    if reason in _TERMINAL_REVISION_REASONS:
-                        raise DeploymentError(
-                            f"Revision {revision} failed to become ready: "
-                            f"{reason}: {ready.get('message', '')}".rstrip()
-                        )
-            elif ready is not None and ready.get("status") == "False":
-                reason = ready.get("reason") or ""
-                if reason in _TERMINAL_REVISION_REASONS:
+
+            # Surface a revision that will never become servable instead of
+            # polling until the timeout expires.
+            try:
+                revision_data = gcloud_json([
+                    "run", "revisions", "describe", revision,
+                    "--region", region,
+                    "--project", project,
+                ])
+            except Exception:
+                revision_data = None
+            if isinstance(revision_data, dict):
+                failure = _terminal_revision_failure(revision_data)
+                if failure:
                     raise DeploymentError(
-                        f"Revision {revision} failed to become ready: "
-                        f"{reason}: {ready.get('message', '')}".rstrip()
+                        f"Revision {revision} failed to become ready: {failure}"
                     )
 
         if time.monotonic() >= deadline:
-            if last_error is not None:
-                raise DeploymentError(
-                    f"Could not determine URL for revision {revision}: {last_error}"
-                ) from last_error
-            raise DeploymentError(f"Could not determine URL for revision {revision}")
+            detail = f": {last_error}" if last_error is not None else ""
+            raise DeploymentError(
+                f"Could not determine URL for tagged revision {revision} "
+                f"(tag {tag!r}){detail}"
+            )
         time.sleep(2.0)
 
 
@@ -368,6 +387,7 @@ def deploy_revision(
     *,
     worker: bool = False,
     digest: str | None = None,
+    tag: str | None = DEFAULT_REVISION_TAG,
 ) -> str:
     # Capture the pre-deploy latest created revision so we can detect the new one.
     previous_revision = None
@@ -396,6 +416,12 @@ def deploy_revision(
         "--no-traffic",
         "--quiet",
     ]
+    if tag:
+        # A traffic tag gives the candidate revision a routable URL while it
+        # still receives no traffic, which is what makes pre-switch health
+        # checks possible. Reusing one tag per service moves it to the newest
+        # candidate instead of accumulating tags on old revisions.
+        command.extend(["--tag", tag])
     if worker:
         # The Research Worker must never become publicly invokable. Passing the
         # flag explicitly makes the revision private even if the previous
@@ -460,8 +486,13 @@ def orchestrate_deployment(
     worker_switched = False
 
     try:
-        api_new = deploy_fn(api_service, region, project, image, worker=False, digest=digest)
-        api_revision_url = revision_url_fn(api_service, api_new, region, project)
+        api_new = deploy_fn(
+            api_service, region, project, image,
+            worker=False, digest=digest, tag=DEFAULT_REVISION_TAG,
+        )
+        api_revision_url = revision_url_fn(
+            api_service, api_new, DEFAULT_REVISION_TAG, region, project,
+        )
 
         actual_api_digest = normalize_digest(revision_image_digest_fn(api_service, api_new, region, project))
         if actual_api_digest != digest:
@@ -479,8 +510,13 @@ def orchestrate_deployment(
         if not verify_api_fn(api_revision_url, audience=api_url or None):
             raise DeploymentError(f"API revision {api_new} failed /healthz verification")
 
-        worker_new = deploy_fn(worker_service, region, project, image, worker=True, digest=digest)
-        worker_revision_url = revision_url_fn(worker_service, worker_new, region, project)
+        worker_new = deploy_fn(
+            worker_service, region, project, image,
+            worker=True, digest=digest, tag=DEFAULT_REVISION_TAG,
+        )
+        worker_revision_url = revision_url_fn(
+            worker_service, worker_new, DEFAULT_REVISION_TAG, region, project,
+        )
 
         actual_worker_digest = normalize_digest(revision_image_digest_fn(worker_service, worker_new, region, project))
         if actual_worker_digest != digest:
@@ -504,6 +540,8 @@ def orchestrate_deployment(
         worker_switched = True
         switch_fn(worker_service, worker_new, region, project)
 
+        # The traffic tag keeps working after the switch, so the post-switch
+        # check still targets exactly this revision.
         if not verify_api_fn(api_revision_url, audience=api_url or None):
             raise DeploymentError("API verification failed after traffic switch")
         if not verify_worker_fn(worker_revision_url, audience=worker_url or None):

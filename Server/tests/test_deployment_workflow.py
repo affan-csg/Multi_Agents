@@ -40,7 +40,7 @@ def base_kwargs():
         "deploy_fn": lambda *args, **kwargs: "api-new" if kwargs.get("worker") is False else "worker-new",
         "switch_fn": lambda *args: None,
         "rollback_fn": lambda *args: None,
-        "revision_url_fn": lambda service, revision, region, project: f"https://{revision}",
+        "revision_url_fn": lambda service, revision, tag, region, project: f"https://{revision}",
         "revision_image_digest_fn": lambda service, revision, region, project: VALID_DIGEST,
         "revision_config_fn": lambda service, revision, region, project: {"service_account": "sa", "port": 8080, "env": [], "command": [], "args": []},
     }
@@ -204,7 +204,7 @@ def test_revision_url_used_for_health_checks(monkeypatch):
     checked = []
     kwargs["verify_api_fn"] = lambda url, audience=None: checked.append(("api", url)) or True
     kwargs["verify_worker_fn"] = lambda url, audience=None: checked.append(("worker", url)) or True
-    kwargs["revision_url_fn"] = lambda service, revision, region, project: f"https://{revision}.example"
+    kwargs["revision_url_fn"] = lambda service, revision, tag, region, project: f"https://{revision}.example"
     deploy.orchestrate_deployment(**kwargs)
     assert ("api", "https://api-new.example") in checked
     assert ("worker", "https://worker-new.example") in checked
@@ -342,6 +342,7 @@ def test_deploy_only_sets_the_image_and_worker_command(monkeypatch):
         allowed = {
             "--region", "--project", "--image", "--no-traffic", "--quiet",
             "--command", "--args=-m,csg.worker", "--no-allow-unauthenticated",
+            "--tag", "deploy-check",
         }
         assert set(flags) <= allowed, (worker, set(flags) - allowed)
         assert "--update-env-vars" not in command
@@ -533,7 +534,7 @@ def test_orchestrate_passes_worker_url_as_audience(monkeypatch):
         "deploy_fn": lambda *a, **k: "api-new" if k.get("worker") is False else "worker-new",
         "switch_fn": lambda *a: None,
         "rollback_fn": lambda *a: None,
-        "revision_url_fn": lambda service, revision, region, project: f"https://{revision}",
+        "revision_url_fn": lambda service, revision, tag, region, project: f"https://{revision}",
         "revision_image_digest_fn": lambda *a, **k: "sha256:" + "a" * 64,
         "revision_config_fn": lambda *a, **k: {"service_account": "sa", "port": 8080, "env": [], "command": [], "args": []},
     }
@@ -618,3 +619,103 @@ def test_runtime_config_drift_aborts_before_traffic_switch(monkeypatch):
     with pytest.raises(deploy.DeploymentError, match="did not preserve"):
         deploy.orchestrate_deployment(**kwargs)
     assert switched == []
+
+def _service_with_tag(tag, revision, url, *, extra=None):
+    traffic = [{"revisionName": "old-rev", "percent": 100}]
+    if extra:
+        traffic.extend(extra)
+    traffic.append({"revisionName": revision, "percent": 0, "tag": tag, "url": url})
+    return {"status": {"traffic": traffic}}
+
+
+def test_revision_url_uses_tag_url_for_untagged_revision(monkeypatch):
+    # A --no-traffic revision has no servable status.url; only the traffic
+    # tag entry is routable, which is what broke the earlier build.
+    monkeypatch.setattr(deploy, "gcloud_json", lambda args: _service_with_tag(
+        "deploy-check", "rev-new", "https://deploy-check---svc-hash.example",
+    ))
+    assert deploy.revision_url("svc", "rev-new", "deploy-check", "reg", "proj") == (
+        "https://deploy-check---svc-hash.example"
+    )
+
+
+def test_revision_url_ignores_tag_on_older_revision(monkeypatch):
+    calls = {"n": 0, "polls": 0}
+
+    def fake(args):
+        calls["n"] += 1
+        if args[:2] == ["run", "services"]:
+            calls["polls"] += 1
+            if calls["polls"] == 1:
+                return _service_with_tag("deploy-check", "rev-old", "https://deploy-check---svc-old.example")
+            return _service_with_tag("deploy-check", "rev-new", "https://deploy-check---svc-new.example")
+        return {"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}}
+
+    monkeypatch.setattr(deploy, "gcloud_json", fake)
+    monkeypatch.setattr(deploy, "time", time)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0 if calls["polls"] < 2 else 999.0)
+    assert deploy.revision_url("svc", "rev-new", "deploy-check", "reg", "proj") == (
+        "https://deploy-check---svc-new.example"
+    )
+
+
+def test_revision_url_times_out_without_matching_tag(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_gcloud(args):
+        calls["n"] += 1
+        if args[:2] == ["run", "services"]:
+            return _service_with_tag("deploy-check", "rev-other", "https://deploy-check---svc.example")
+        return {"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}}
+
+    monkeypatch.setattr(deploy, "gcloud_json", fake_gcloud)
+    monkeypatch.setattr(deploy, "DEFAULT_REVISION_URL_TIMEOUT", 1.0)
+    monkeypatch.setattr(deploy, "time", time)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0 if calls["n"] < 2 else 999.0)
+    with pytest.raises(deploy.DeploymentError, match="Could not determine URL for tagged revision"):
+        deploy.revision_url("svc", "rev-new", "deploy-check", "reg", "proj")
+
+
+def test_revision_url_aborts_on_terminal_revision_failure(monkeypatch):
+    def fake(args):
+        if args[:2] == ["run", "services"]:
+            return {"status": {"traffic": [{"revisionName": "old-rev", "percent": 100}]}}
+        return {"status": {"conditions": [
+            {"type": "Ready", "status": "False", "reason": "RevisionFailed", "message": "container crashed"},
+        ]}}
+
+    monkeypatch.setattr(deploy, "gcloud_json", fake)
+    monkeypatch.setattr(deploy, "time", time)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(time, "monotonic", lambda: 0)
+    with pytest.raises(deploy.DeploymentError, match="failed to become ready"):
+        deploy.revision_url("svc", "rev-new", "deploy-check", "reg", "proj")
+
+
+def test_deploy_assigns_candidate_tag(monkeypatch):
+    for worker in (False, True):
+        command = _capture_deploy_command(monkeypatch, worker=worker)
+        tag_index = command.index("--tag")
+        assert command[tag_index + 1] == "deploy-check"
+        assert "--no-traffic" in command
+
+
+def test_orchestrate_keeps_service_url_as_worker_audience(monkeypatch):
+    # Cloud Run ID tokens keep the service URL as audience even when the
+    # request goes to a traffic-tag URL.
+    monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
+    kwargs = base_kwargs()
+    seen = []
+
+    def verify(url, audience=None):
+        seen.append((url, audience))
+        return True
+
+    kwargs["verify_worker_fn"] = verify
+    kwargs["revision_url_fn"] = lambda service, revision, tag, region, project: (
+        f"https://{tag}---{service}.example"
+    )
+    deploy.orchestrate_deployment(**kwargs)
+    assert seen[0] == ("https://deploy-check---worker.example", "https://worker")
