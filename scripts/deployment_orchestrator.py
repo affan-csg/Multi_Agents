@@ -15,6 +15,73 @@ from typing import Callable
 
 DIGEST_PREFIX = "sha256:"
 DEFAULT_HEALTH_CHECK_TIMEOUT = float(os.environ.get("DEPLOYMENT_HEALTH_CHECK_TIMEOUT", "30"))
+DEFAULT_REVISION_URL_TIMEOUT = float(os.environ.get("DEPLOYMENT_REVISION_URL_TIMEOUT", "180"))
+_TERMINAL_REVISION_REASONS = {
+    "RevisionFailed",
+    "ContainerFailed",
+    "HealthCheckContainerError",
+    "ImagePullFailed",
+    "Internal",
+}
+
+
+def _ready_condition(data: dict) -> dict | None:
+    for condition in (data.get("status") or {}).get("conditions") or []:
+        if isinstance(condition, dict) and condition.get("type") == "Ready":
+            return condition
+    return None
+
+
+def revision_url(service: str, revision: str, region: str, project: str) -> str:
+    """Return the exact new revision's URL, waiting for Cloud Run readiness.
+
+    A freshly created no-traffic revision may not expose ``status.url`` (or a
+    successful ``Ready`` condition) until its container has started. Polling
+    here avoids treating that normal startup delay as a deployment failure.
+    """
+    deadline = time.monotonic() + DEFAULT_REVISION_URL_TIMEOUT
+    last_error: Exception | None = None
+    while True:
+        try:
+            data = gcloud_json([
+                "run", "revisions", "describe", revision,
+                "--region", region,
+                "--project", project,
+            ])
+            last_error = None
+        except Exception as exc:  # pragma: no cover - network/CLI failures are retried
+            last_error = exc
+            data = None
+
+        if isinstance(data, dict):
+            status = data.get("status") or {}
+            url = status.get("url")
+            ready = _ready_condition(data)
+            if isinstance(url, str) and url:
+                if ready is None or ready.get("status") == "True":
+                    return url
+                if ready.get("status") == "False":
+                    reason = ready.get("reason") or ""
+                    if reason in _TERMINAL_REVISION_REASONS:
+                        raise DeploymentError(
+                            f"Revision {revision} failed to become ready: "
+                            f"{reason}: {ready.get('message', '')}".rstrip()
+                        )
+            elif ready is not None and ready.get("status") == "False":
+                reason = ready.get("reason") or ""
+                if reason in _TERMINAL_REVISION_REASONS:
+                    raise DeploymentError(
+                        f"Revision {revision} failed to become ready: "
+                        f"{reason}: {ready.get('message', '')}".rstrip()
+                    )
+
+        if time.monotonic() >= deadline:
+            if last_error is not None:
+                raise DeploymentError(
+                    f"Could not determine URL for revision {revision}: {last_error}"
+                ) from last_error
+            raise DeploymentError(f"Could not determine URL for revision {revision}")
+        time.sleep(2.0)
 
 
 class DeploymentError(RuntimeError):
@@ -358,16 +425,6 @@ def rollback(service: str, revision: str, region: str, project: str) -> None:
     switch_traffic(service, revision, region, project)
 
 
-def revision_url(service: str, revision: str, region: str, project: str) -> str:
-    data = gcloud_json([
-        "run", "revisions", "describe", revision,
-        "--region", region,
-        "--project", project,
-    ])
-    url = data.get("status", {}).get("url")
-    if not isinstance(url, str) or not url:
-        raise DeploymentError(f"Could not determine URL for revision {revision}")
-    return url
 
 
 def orchestrate_deployment(
