@@ -378,6 +378,7 @@ def test_full_research_campaign_persists_and_serves_complete_company_records(mon
     monkeypatch.setattr(export, "to_jsonl", lambda *_a, **_k: tmp_path / "companies.jsonl")
     monkeypatch.setattr(db, "connect", lambda: conn)
     monkeypatch.setenv("OUTREACH_API_BASE", "https://outreach.example")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
 
     async def fake_contacts(_conn, domains, **_kwargs):
         for domain in domains:

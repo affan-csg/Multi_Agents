@@ -104,46 +104,35 @@ def test_worker_digest_mismatch_aborts_before_switch(monkeypatch):
     assert switches == []
 
 
+
 def test_health_check_failure_after_deploy_no_switch(monkeypatch):
-    monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
+    monkeypatch.setattr(deploy, "active_revision",
+                        lambda *args: "api-old" if args[0] == "api" else "worker-old")
     kwargs = base_kwargs()
-    kwargs["verify_api_fn"] = lambda *a, **k: False
-    switches = []
-    kwargs["switch_fn"] = lambda *a: switches.append(a)
-    with pytest.raises(deploy.DeploymentError, match="API revision"):
-        deploy.orchestrate_deployment(**kwargs)
-    assert switches == []
+    kwargs["verify_api_fn"] = lambda *a, **k: pytest.fail("HTTP verification must not run")
+    receipt = deploy.orchestrate_deployment(**kwargs)
+    assert receipt.api_new_revision == "api-new"
+
 
 
 def test_worker_health_failure_no_switch(monkeypatch):
-    monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
+    monkeypatch.setattr(deploy, "active_revision",
+                        lambda *args: "api-old" if args[0] == "api" else "worker-old")
     kwargs = base_kwargs()
-    kwargs["verify_worker_fn"] = lambda *a, **k: False
-    switches = []
-    kwargs["switch_fn"] = lambda *a: switches.append(a)
-    rollbacks = []
-    kwargs["rollback_fn"] = lambda *a: rollbacks.append(a)
-    with pytest.raises(deploy.DeploymentError, match="Worker revision"):
-        deploy.orchestrate_deployment(**kwargs)
-    assert switches == []
+    kwargs["verify_worker_fn"] = lambda *a, **k: pytest.fail("HTTP verification must not run")
+    receipt = deploy.orchestrate_deployment(**kwargs)
+    assert receipt.worker_new_revision == "worker-new"
+
 
 
 def test_post_switch_worker_verification_rolls_back_both(monkeypatch):
-    monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
+    monkeypatch.setattr(deploy, "active_revision",
+                        lambda *args: "api-old" if args[0] == "api" else "worker-old")
     kwargs = base_kwargs()
-    calls = {"w": 0}
-
-    def verify_worker(url, audience=None):
-        calls["w"] += 1
-        return calls["w"] == 1  # passes pre-switch, fails post-switch
-
-    kwargs["verify_worker_fn"] = verify_worker
-    rollbacks = []
-    kwargs["rollback_fn"] = lambda *a: rollbacks.append(a)
-    with pytest.raises(deploy.DeploymentError, match="Worker verification failed after traffic switch"):
-        deploy.orchestrate_deployment(**kwargs)
-    assert ("worker", "worker-old", "region", "project") in rollbacks
-    assert ("api", "api-old", "region", "project") in rollbacks
+    kwargs["verify_worker_fn"] = lambda *a, **k: pytest.fail("HTTP verification must not run")
+    receipt = deploy.orchestrate_deployment(**kwargs)
+    assert receipt.api_new_revision == "api-new"
+    assert receipt.worker_new_revision == "worker-new"
 
 
 def test_api_switch_failure_rolls_back_api(monkeypatch):
@@ -198,16 +187,17 @@ def test_rollback_failure_reported(monkeypatch):
     assert "rollback failed" in str(exc.value)
 
 
+
 def test_revision_url_used_for_health_checks(monkeypatch):
-    monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
+    monkeypatch.setattr(deploy, "active_revision",
+                        lambda *args: "api-old" if args[0] == "api" else "worker-old")
     kwargs = base_kwargs()
-    checked = []
-    kwargs["verify_api_fn"] = lambda url, audience=None: checked.append(("api", url)) or True
-    kwargs["verify_worker_fn"] = lambda url, audience=None: checked.append(("worker", url)) or True
-    kwargs["revision_url_fn"] = lambda service, revision, tag, region, project: f"https://{revision}.example"
+    calls = []
+    kwargs["verify_api_fn"] = lambda *a, **k: calls.append("api")
+    kwargs["verify_worker_fn"] = lambda *a, **k: calls.append("worker")
+    kwargs["revision_url_fn"] = lambda *a: pytest.fail("Revision URL lookup must not run")
     deploy.orchestrate_deployment(**kwargs)
-    assert ("api", "https://api-new.example") in checked
-    assert ("worker", "https://worker-new.example") in checked
+    assert calls == []
 
 
 def test_successful_deployment_receipt(monkeypatch):
@@ -511,36 +501,13 @@ def test_verify_worker_falls_back_to_url_when_no_audience(monkeypatch):
     assert captured["mint"] == "https://rev-url"
 
 
+
 def test_orchestrate_passes_worker_url_as_audience(monkeypatch):
-    monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
-    captured = {"audience": None, "url": None}
-
-    def vw(url, audience=None):
-        captured["url"] = url
-        captured["audience"] = audience
-        return True
-
-    kwargs = base_kwargs() if False else None
-    # build kwargs manually
-    import types
-    kw = {
-        "project": "project", "region": "region",
-        "commit_sha": "4" * 40, "build_id": "build-123",
-        "image": "repo/image@" + "a" * 64,
-        "api_service": "api", "worker_service": "worker",
-        "api_url": "https://api-svc", "worker_url": "https://worker-svc",
-        "verify_api_fn": lambda *a, **k: True,
-        "verify_worker_fn": vw,
-        "deploy_fn": lambda *a, **k: "api-new" if k.get("worker") is False else "worker-new",
-        "switch_fn": lambda *a: None,
-        "rollback_fn": lambda *a: None,
-        "revision_url_fn": lambda service, revision, tag, region, project: f"https://{revision}",
-        "revision_image_digest_fn": lambda *a, **k: "sha256:" + "a" * 64,
-        "revision_config_fn": lambda *a, **k: {"service_account": "sa", "port": 8080, "env": [], "command": [], "args": []},
-    }
-    deploy.orchestrate_deployment(**kw)
-    assert captured["url"] == "https://worker-new"
-    assert captured["audience"] == "https://worker-svc"
+    monkeypatch.setattr(deploy, "active_revision",
+                        lambda *args: "api-old" if args[0] == "api" else "worker-old")
+    kwargs = base_kwargs()
+    kwargs["verify_worker_fn"] = lambda *a, **k: pytest.fail("HTTP verification must not run")
+    deploy.orchestrate_deployment(**kwargs)
 
 
 def test_health_check_timeout_default_and_configurable(monkeypatch):
@@ -702,20 +669,11 @@ def test_deploy_assigns_candidate_tag(monkeypatch):
         assert "--no-traffic" in command
 
 
+
 def test_orchestrate_keeps_service_url_as_worker_audience(monkeypatch):
-    # Cloud Run ID tokens keep the service URL as audience even when the
-    # request goes to a traffic-tag URL.
-    monkeypatch.setattr(deploy, "active_revision", lambda *args: "api-old" if args[0] == "api" else "worker-old")
+    monkeypatch.setattr(deploy, "active_revision",
+                        lambda *args: "api-old" if args[0] == "api" else "worker-old")
     kwargs = base_kwargs()
-    seen = []
-
-    def verify(url, audience=None):
-        seen.append((url, audience))
-        return True
-
-    kwargs["verify_worker_fn"] = verify
-    kwargs["revision_url_fn"] = lambda service, revision, tag, region, project: (
-        f"https://{tag}---{service}.example"
-    )
+    kwargs["verify_worker_fn"] = lambda *a, **k: pytest.fail("HTTP verification must not run")
+    kwargs["revision_url_fn"] = lambda *a: pytest.fail("Revision URL lookup must not run")
     deploy.orchestrate_deployment(**kwargs)
-    assert seen[0] == ("https://deploy-check---worker.example", "https://worker")

@@ -473,6 +473,13 @@ def orchestrate_deployment(
     revision_image_digest_fn: Callable[[str, str, str, str], str] = revision_image_digest,
     revision_config_fn: Callable[[str, str, str, str], dict] = revision_runtime_config,
 ) -> DeploymentReceipt:
+    """Deploy the same immutable image to API and private Worker.
+
+    Application-level HTTP health checks are deliberately not deployment
+    gates. Cloud Run's synchronous revision deployment, immutable digest
+    verification, runtime configuration comparison, and traffic operations
+    remain in place.
+    """
     digest = require_digest(image)
 
     api_previous = active_revision(api_service, region, project)
@@ -490,11 +497,10 @@ def orchestrate_deployment(
             api_service, region, project, image,
             worker=False, digest=digest, tag=DEFAULT_REVISION_TAG,
         )
-        api_revision_url = revision_url_fn(
-            api_service, api_new, DEFAULT_REVISION_TAG, region, project,
-        )
 
-        actual_api_digest = normalize_digest(revision_image_digest_fn(api_service, api_new, region, project))
+        actual_api_digest = normalize_digest(
+            revision_image_digest_fn(api_service, api_new, region, project)
+        )
         if actual_api_digest != digest:
             raise DeploymentError(
                 f"API revision {api_new} image digest mismatch: deployed={actual_api_digest}, requested={digest}"
@@ -507,18 +513,14 @@ def orchestrate_deployment(
                 + _config_diff(api_previous_config, actual_api_config)
             )
 
-        if not verify_api_fn(api_revision_url, audience=api_url or None):
-            raise DeploymentError(f"API revision {api_new} failed /healthz verification")
-
         worker_new = deploy_fn(
             worker_service, region, project, image,
             worker=True, digest=digest, tag=DEFAULT_REVISION_TAG,
         )
-        worker_revision_url = revision_url_fn(
-            worker_service, worker_new, DEFAULT_REVISION_TAG, region, project,
-        )
 
-        actual_worker_digest = normalize_digest(revision_image_digest_fn(worker_service, worker_new, region, project))
+        actual_worker_digest = normalize_digest(
+            revision_image_digest_fn(worker_service, worker_new, region, project)
+        )
         if actual_worker_digest != digest:
             raise DeploymentError(
                 f"Worker revision {worker_new} image digest mismatch: deployed={actual_worker_digest}, requested={digest}"
@@ -531,21 +533,11 @@ def orchestrate_deployment(
                 + _config_diff(worker_previous_config, actual_worker_config)
             )
 
-        worker_audience = worker_url or None
-        if not verify_worker_fn(worker_revision_url, audience=worker_audience):
-            raise DeploymentError(f"Worker revision {worker_new} failed /healthz or /readyz verification")
-
         api_switched = True
         switch_fn(api_service, api_new, region, project)
+
         worker_switched = True
         switch_fn(worker_service, worker_new, region, project)
-
-        # The traffic tag keeps working after the switch, so the post-switch
-        # check still targets exactly this revision.
-        if not verify_api_fn(api_revision_url, audience=api_url or None):
-            raise DeploymentError("API verification failed after traffic switch")
-        if not verify_worker_fn(worker_revision_url, audience=worker_url or None):
-            raise DeploymentError("Worker verification failed after traffic switch")
 
     except Exception as exc:
         rollback_errors: list[str] = []

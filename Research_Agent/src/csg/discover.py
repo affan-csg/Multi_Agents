@@ -206,7 +206,11 @@ def _enrichment_checkpoint_is_reusable(checkpoint: Optional[dict[str, Any]]) -> 
         # record: an empty review is a grounding outage, not finished research.
         # One retry per recovery version, then keep the result for a human.
         version, attempted = _checkpoint_recovery_marker(payload)
-        return attempted and version == ENRICHMENT_RECOVERY_VERSION
+        # Legacy zero-evidence checkpoints may predate recovery markers.
+        # Allow one recovery attempt under the current worker version.
+        if not attempted:
+            return False
+        return version == ENRICHMENT_RECOVERY_VERSION
     if checkpoint.get("status") == "done" and not reason:
         return True
     if is_field_level_enrichment_reason(reason):
@@ -534,9 +538,24 @@ async def _enrich_all(
             skipped += 1
             pairs.append((c, company))
             continue
+        checkpoint_payload = (checkpoint or {}).get("payload") or {}
+        checkpoint_company = checkpoint_payload.get("company") or {}
+        checkpoint_outcomes = checkpoint_company.get("research_outcomes") or {}
+        checkpoint_summary = (
+            checkpoint_outcomes.get("_summary")
+            or checkpoint_payload.get("completeness")
+            or {}
+        )
+
         if checkpoint and (
             checkpoint.get("status") in {"failed", "queued"}
-            or (checkpoint.get("status") == "done" and (checkpoint.get("payload") or {}).get("reason"))
+            or (
+                checkpoint.get("status") == "done"
+                and (
+                    checkpoint_payload.get("reason")
+                    or _zero_evidence_review(checkpoint_summary, checkpoint_outcomes)
+                )
+            )
             or checkpoint.get("status") == "researched"
         ):
             saved = checkpoint.get("payload") or {}

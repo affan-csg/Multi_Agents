@@ -55,6 +55,10 @@ def _stub_both_dbs(monkeypatch):
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    monkeypatch.setenv("RESEARCH_SUPABASE_URL", "https://research.example")
+    monkeypatch.setenv("RESEARCH_SUPABASE_SERVICE_KEY", "research-test-key")
+    monkeypatch.setenv("OUTREACH_SUPABASE_URL", "https://outreach.example")
+    monkeypatch.setenv("OUTREACH_SUPABASE_SERVICE_KEY", "outreach-test-key")
     # `with` form is required for the lifespan (and therefore _MAIN_LOOP on
     # both sub-apps) to actually run -- bare TestClient(app) does not invoke
     # lifespan, same caveat as each agent's own API test suite documents.

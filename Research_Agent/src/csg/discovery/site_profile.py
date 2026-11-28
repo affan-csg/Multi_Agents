@@ -255,7 +255,11 @@ def _validated_target(url: str, domain: str = "") -> tuple[str, str, list[str]]:
     except ValueError:
         literal = None
     if literal is not None:
-        if not _ip_is_public(str(literal)):
+        # IPv4-mapped IPv6 addresses inherit the safety classification
+        # of their embedded IPv4 address.
+        mapped = literal.ipv4_mapped if isinstance(literal, ipaddress.IPv6Address) else None
+        checked_ip = mapped if mapped is not None else literal
+        if not _ip_is_public(str(checked_ip)):
             raise UnsafeURLError(f"non_public_address: {host}")
         ips = [str(literal)]
     else:
